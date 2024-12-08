@@ -94,6 +94,7 @@ class OmniGenTF(tf.keras.Model):
     
     def get_timestep_embedding(self, timesteps, dim=320, max_period=10000):
         """Create sinusoidal timestep embeddings"""
+        max_period = tf.cast(max_period, tf.float32)  # Ensure max_period is float32
         half = dim // 2
         freqs = tf.exp(
             -tf.math.log(max_period) * tf.range(0, half, dtype=tf.float32) / half
