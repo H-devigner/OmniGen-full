@@ -5,6 +5,7 @@ import numpy as np
 from transformers import AutoTokenizer
 from PIL import Image
 import logging
+from .model import OmniGenTF  # Importing OmniGenTF
 
 logger = logging.getLogger(__name__)
 
