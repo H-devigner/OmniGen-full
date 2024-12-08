@@ -12,7 +12,14 @@ logger = logging.getLogger(__name__)
 class OmniGenPipeline:
     def __init__(self, model, tokenizer=None):
         self.model = model
-        self.tokenizer = tokenizer or AutoTokenizer.from_pretrained("microsoft/phi-2")
+        if tokenizer is None:
+            # Initialize the tokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained("microsoft/phi-2")
+            # Set the padding token if not already defined
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token  # Use eos_token as pad_token
+        else:
+            self.tokenizer = tokenizer
     
     @classmethod
     def from_pretrained(cls, model_name_or_path, local_files_only=False):
