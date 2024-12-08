@@ -54,7 +54,8 @@ class OmniGenPipeline:
         # Create position IDs
         batch_size = tf.shape(input_ids)[0]
         seq_length = tf.shape(input_ids)[1]
-        position_ids = tf.range(seq_length)[None].repeat(batch_size, axis=0)
+        position_ids = tf.range(seq_length)
+        position_ids = tf.repeat(position_ids[None], batch_size, axis=0)
         
         return {
             "input_ids": input_ids,
