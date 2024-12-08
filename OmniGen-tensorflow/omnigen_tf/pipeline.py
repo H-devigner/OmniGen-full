@@ -13,6 +13,16 @@ class OmniGenPipeline:
         self.model = model
         self.tokenizer = tokenizer or AutoTokenizer.from_pretrained("microsoft/phi-2")
     
+    @classmethod
+    def from_pretrained(cls, model_name_or_path, local_files_only=False):
+        """Load the pipeline from a pretrained model."""
+        logger.info(f"Loading pipeline from {model_name_or_path}")
+        
+        # Load the model
+        model = OmniGenTF.from_pretrained(model_name_or_path, local_files_only=local_files_only)
+        
+        return cls(model=model)
+    
     @staticmethod
     def prepare_image_tensor(batch_size=1, channels=4, height=64, width=64):
         """Prepare initial image tensor"""
@@ -98,8 +108,7 @@ class OmniGenPipeline:
         
         return image
     
-    def __call__(
-        self,
+    def __call__(self,
         prompt,
         num_inference_steps=50,
         guidance_scale=7.5,
