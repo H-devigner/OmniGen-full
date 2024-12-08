@@ -92,6 +92,7 @@ class OmniGenTF(tf.keras.Model):
         if image_features.shape[-1] != text_features.shape[-1]:
             # Adjust text_features to match image_features shape
             text_features = tf.reshape(text_features, (tf.shape(text_features)[0], -1))
+            logger.debug(f"Adjusted Text features shape: {text_features.shape}")
 
         features = image_features + text_features
         
