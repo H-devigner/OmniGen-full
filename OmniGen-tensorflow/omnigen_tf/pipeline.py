@@ -1,133 +1,129 @@
 """OmniGen pipeline for text-to-image generation."""
-from __future__ import annotations
 
-import os
-import time
-from typing import Optional, List, Union, Dict, Any
 import tensorflow as tf
-import torch
-from PIL import Image
 import numpy as np
-from huggingface_hub import snapshot_download
+from transformers import AutoTokenizer
+from PIL import Image
+import logging
 
-from .model import OmniGenTF
-from .processor import OmniGenProcessor
-from .vae import AutoencoderKL
+logger = logging.getLogger(__name__)
 
 class OmniGenPipeline:
-    """Pipeline for text-to-image generation using OmniGen."""
-    
-    def __init__(
-        self,
-        model: OmniGenTF,
-        processor: OmniGenProcessor,
-        vae: AutoencoderKL,
-        device: str = "gpu",
-        **kwargs
-    ):
-        """Initialize pipeline."""
+    def __init__(self, model, tokenizer=None):
         self.model = model
-        self.processor = processor
-        self.vae = vae
-        self.device = device
-        
-        # Set up device strategy
-        if device == "gpu" and tf.config.list_physical_devices('GPU'):
-            self.strategy = tf.distribute.OneDeviceStrategy("/gpu:0")
-        else:
-            self.strategy = tf.distribute.OneDeviceStrategy("/cpu:0")
+        self.tokenizer = tokenizer or AutoTokenizer.from_pretrained("microsoft/phi-2")
     
-    @classmethod
-    def from_pretrained(
-        cls,
-        model_name: str,
-        vae_path: Optional[str] = None,
-        max_retries: int = 3,
-        retry_delay: int = 1,
-        mixed_precision: bool = False,
-        **kwargs
-    ) -> "OmniGenPipeline":
-        """Load pipeline from pretrained model."""
-        for attempt in range(max_retries):
-            try:
-                # Download model if needed
-                if not os.path.isdir(model_name):
-                    model_path = snapshot_download(
-                        model_name,
-                        allow_patterns=["*.safetensors", "*.json", "*.bin"]
-                    )
-                else:
-                    model_path = model_name
-                    
-                # Load model components
-                model = OmniGenTF.from_pretrained(
-                    model_path,
-                    use_mixed_precision=mixed_precision,
-                    **kwargs
-                )
-                
-                processor = OmniGenProcessor.from_pretrained(model_path)
-                
-                # Load VAE
-                if vae_path is None:
-                    vae_path = model_path
-                vae = AutoencoderKL.from_pretrained(vae_path)
-                
-                return cls(
-                    model=model,
-                    processor=processor,
-                    vae=vae,
-                    device="gpu" if tf.config.list_physical_devices('GPU') else "cpu"
-                )
-                
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    raise e
-                print(f"Attempt {attempt + 1} failed, retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
-                
-    def __call__(
-        self,
-        prompt: Union[str, List[str]],
-        height: Optional[int] = None,
-        width: Optional[int] = None,
-        num_inference_steps: int = 50,
-        guidance_scale: float = 7.5,
-        negative_prompt: Optional[Union[str, List[str]]] = None,
-        num_images_per_prompt: int = 1,
-        **kwargs
-    ) -> List[Image.Image]:
-        """Generate images from text prompt."""
-        # Process inputs
-        inputs = self.processor(
-            prompt=prompt,
-            height=height,
-            width=width,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            negative_prompt=negative_prompt,
-            num_images_per_prompt=num_images_per_prompt,
-            **kwargs
+    @staticmethod
+    def prepare_image_tensor(batch_size=1, channels=4, height=64, width=64):
+        """Prepare initial image tensor"""
+        return tf.random.normal([batch_size, channels, height, width])
+    
+    def encode_prompt(self, prompt):
+        """Encode text prompt to input tensors"""
+        # Tokenize text
+        text_inputs = self.tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=77,
+            truncation=True,
+            return_tensors="pt",
         )
         
-        # Generate images
-        with self.strategy.scope():
-            # Generate latents
-            latents = self.model(
-                inputs["input_ids"],
-                inputs["timesteps"],
-                attention_mask=inputs["attention_mask"],
-                guidance_scale=guidance_scale,
-                num_inference_steps=num_inference_steps
-            )
-            
-            # Scale latents
-            latents = latents * self.vae.scaling_factor
-            
-            # Decode latents
-            images = self.vae.decode_from_latents(latents)
-            
-        # Post-process images
-        images = self.processor.postprocess_images(images)
+        # Convert to TensorFlow tensors
+        input_ids = tf.convert_to_tensor(text_inputs.input_ids.numpy(), dtype=tf.int32)
+        attention_mask = tf.convert_to_tensor(text_inputs.attention_mask.numpy(), dtype=tf.int32)
         
-        return images
+        # Create position IDs
+        batch_size = tf.shape(input_ids)[0]
+        seq_length = tf.shape(input_ids)[1]
+        position_ids = tf.range(seq_length)[None].repeat(batch_size, axis=0)
+        
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids
+        }
+    
+    def prepare_timesteps(self, num_inference_steps=50):
+        """Prepare diffusion timesteps"""
+        timesteps = tf.linspace(1.0, 0.0, num_inference_steps + 1)[:-1]
+        return timesteps
+    
+    def denoise_latent(self, latent, timesteps, text_embeddings):
+        """Denoise the image latents"""
+        for t in timesteps:
+            # Expand dimensions for batch processing
+            timestep = tf.fill([tf.shape(latent)[0]], t)
+            
+            # Model inputs
+            model_inputs = {
+                "x": latent,
+                "timestep": timestep,
+                **text_embeddings
+            }
+            
+            # Get model prediction
+            noise_pred = self.model(model_inputs)
+            
+            # Update latent
+            latent = self.scheduler_step(noise_pred, t, latent)
+        
+        return latent
+    
+    def scheduler_step(self, model_output, timestep, sample):
+        """Simple DDIM-style scheduler step"""
+        prev_timestep = tf.maximum(timestep - 1.0/50.0, 0.0)
+        alpha_prod_t = timestep
+        alpha_prod_t_prev = prev_timestep
+        beta_prod_t = 1 - alpha_prod_t
+        beta_prod_t_prev = 1 - alpha_prod_t_prev
+        
+        pred_original_sample = (sample - tf.sqrt(beta_prod_t) * model_output) / tf.sqrt(alpha_prod_t)
+        pred_sample_direction = tf.sqrt(beta_prod_t_prev) * model_output
+        prev_sample = tf.sqrt(alpha_prod_t_prev) * pred_original_sample + pred_sample_direction
+        
+        return prev_sample
+    
+    def decode_latents(self, latents):
+        """Convert latents to image"""
+        # Scale and transpose latents
+        latents = 1 / 0.18215 * latents
+        latents = tf.transpose(latents, [0, 2, 3, 1])
+        
+        # Clip values
+        image = tf.clip_by_value(latents, -1, 1)
+        image = (image + 1) / 2
+        image = tf.clip_by_value(image * 255, 0, 255)
+        image = tf.cast(image, tf.uint8)
+        
+        return image
+    
+    def __call__(
+        self,
+        prompt,
+        num_inference_steps=50,
+        guidance_scale=7.5,
+        negative_prompt=None,
+        height=512,
+        width=512,
+    ):
+        """Generate image from text prompt"""
+        # Encode prompt
+        text_embeddings = self.encode_prompt(prompt)
+        
+        # Prepare latents
+        latents = self.prepare_image_tensor()
+        
+        # Prepare timesteps
+        timesteps = self.prepare_timesteps(num_inference_steps)
+        
+        # Denoise latents
+        latents = self.denoise_latent(latents, timesteps, text_embeddings)
+        
+        # Decode latents to image
+        image = self.decode_latents(latents)
+        
+        # Convert to PIL Image
+        image = Image.fromarray(image[0].numpy())
+        
+        return image
