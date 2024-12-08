@@ -6,12 +6,7 @@ from tensorflow.keras import layers, initializers
 from typing import Optional, Tuple, Dict, Any
 import json
 import os
-from safetensors import safe_open
 from huggingface_hub import snapshot_download
-import onnx
-from onnx_tf.backend import prepare
-
-from .utils import convert_torch_to_tf
 
 class AutoencoderKL(tf.keras.Model):
     """VAE model with KL regularization."""
@@ -279,10 +274,10 @@ class AutoencoderKL(tf.keras.Model):
             raise ValueError(f"No safetensors weights found in {pretrained_model_name_or_path}")
             
         weight_file = os.path.join(pretrained_model_name_or_path, weight_files[0])
-        with safe_open(weight_file, framework="pt") as f:
+        with open(weight_file, 'rb') as f:
             for key in f.keys():
                 tensor = f.get_tensor(key)
-                tf_tensor = convert_torch_to_tf(tensor.detach().cpu().numpy())
+                tf_tensor = tf.convert_to_tensor(tensor.detach().cpu().numpy())
                 
                 # Find corresponding layer and weight
                 layer_name, weight_type = key.rsplit(".", 1)
@@ -293,9 +288,4 @@ class AutoencoderKL(tf.keras.Model):
                 elif weight_type == "bias":
                     layer.bias.assign(tf_tensor)
                     
-        # Load the ONNX model
-        onnx_model = onnx.load('your_model.onnx')
-        tf_rep = prepare(onnx_model)
-        tf_rep.export_graph('your_model_tf')
-        
         return model
