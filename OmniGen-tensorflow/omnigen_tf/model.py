@@ -81,7 +81,14 @@ class OmniGenTF(tf.keras.Model):
         image_features = self.image_encoder(x)
         
         # Combine features
-        features = image_features + text_features[:, None, None]
+        logger.debug(f"Image features shape: {image_features.shape}")
+        logger.debug(f"Text features shape before addition: {text_features.shape}")
+
+        # Ensure text_features has the correct shape for addition
+        text_features = tf.expand_dims(text_features, axis=1)  # Add a dimension
+        text_features = tf.expand_dims(text_features, axis=1)  # Add another dimension
+
+        features = image_features + text_features
         
         # Apply transformer layers
         for layer in self.transformer_layers:
