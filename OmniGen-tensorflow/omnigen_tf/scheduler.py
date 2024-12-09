@@ -43,7 +43,7 @@ class TensorFlowCache:
             self.value_cache[layer_idx] = tf.convert_to_tensor(self.value_cache[layer_idx])
 
 
-class TensorFlowScheduler:
+class OmniGenScheduler:
     def __init__(self, num_steps=50, time_shifting_factor=1):
         self.num_steps = num_steps
         t = np.linspace(0, 1, num_steps + 1)
