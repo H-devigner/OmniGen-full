@@ -7,7 +7,7 @@ from transformers import AutoTokenizer
 from huggingface_hub import snapshot_download
 from typing import Dict, List
 
-class OmniGenProcessorTF:
+class OmniGenProcessor:
     def __init__(self, text_tokenizer, max_image_size: int = 1024):
         self.text_tokenizer = text_tokenizer
         self.max_image_size = max_image_size
