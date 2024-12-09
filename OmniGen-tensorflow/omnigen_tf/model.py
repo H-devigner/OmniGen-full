@@ -168,7 +168,14 @@ class OmniGenTF(tf.keras.Model):
         config_path = os.path.join(model_path, "config.json")
         with open(config_path) as f:
             config = json.load(f)
-        
+
+        # Set default values if keys are missing
+        config.setdefault('patch_size', 2)
+        config.setdefault('in_channels', 4)
+        config.setdefault('hidden_size', 768)
+        config.setdefault('num_hidden_layers', 12)
+        config.setdefault('num_attention_heads', 12)
+
         # Create model
         model = cls(config=config)
         
