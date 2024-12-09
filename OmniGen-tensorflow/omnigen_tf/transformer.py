@@ -6,7 +6,8 @@ class Phi3Transformer(Model):
     def __init__(self, config, **kwargs):
         super(Phi3Transformer, self).__init__(**kwargs)
         self.config = config
-        self.layers = [Phi3DecoderLayer(config) for _ in range(config.num_hidden_layers)]
+        # Renamed `layers` to `decoder_layers` to avoid conflict with TensorFlow's reserved `Model.layers`
+        self.decoder_layers = [Phi3DecoderLayer(config) for _ in range(config.num_hidden_layers)]
         self.norm = layers.LayerNormalization(epsilon=1e-5)
         self.use_cache = config.use_cache
 
@@ -20,7 +21,7 @@ class Phi3Transformer(Model):
 
     def get_offload_layer(self, layer_idx: int, device: str):
         self.evict_previous_layer(layer_idx - 1)
-        self.prefetch_layer((layer_idx + 1) % len(self.layers), device)
+        self.prefetch_layer((layer_idx + 1) % len(self.decoder_layers), device)
 
     def call(
         self,
@@ -43,7 +44,7 @@ class Phi3Transformer(Model):
         all_self_attentions = [] if output_attentions else None
         next_decoder_cache = None
 
-        for layer_idx, decoder_layer in enumerate(self.layers):
+        for layer_idx, decoder_layer in enumerate(self.decoder_layers):  # Use renamed `decoder_layers`
             if output_hidden_states:
                 all_hidden_states.append(hidden_states)
 
@@ -72,6 +73,7 @@ class Phi3Transformer(Model):
             all_hidden_states.append(hidden_states)
 
         return hidden_states, next_decoder_cache
+
 
 class Phi3DecoderLayer(layers.Layer):
     def __init__(self, config, **kwargs):
@@ -110,6 +112,7 @@ class Phi3DecoderLayer(layers.Layer):
         hidden_states = self.norm2(hidden_states + ff_output)
 
         return hidden_states, None  # Cache support not implemented in this basic example
+
 
 # Example config for demonstration
 class Config:
