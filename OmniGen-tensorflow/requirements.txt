@@ -1,5 +1,5 @@
-tensorflow>=2.13.0,<2.16.0
-torch>=2.0.0
+tensorflow
+torch
 safetensors
 huggingface_hub
 numpy
