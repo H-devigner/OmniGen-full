@@ -167,7 +167,7 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         self.llm.config.use_cache = False
     
     @classmethod
-    def from_pretrained(cls, model_name):
+    def from_pretrained(cls, model_name, **args):
         if not os.path.exists(model_name):
             cache_folder = os.getenv('HF_HUB_CACHE')
             model_name = snapshot_download(repo_id=model_name, cache_dir=cache_folder, ignore_patterns=['flax_model.msgpack', 'rust_model.ot', 'tf_model.h5'])
