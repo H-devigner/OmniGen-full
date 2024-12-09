@@ -1,7 +1,7 @@
 import os
 import tensorflow as tf
 import numpy as np
-from OmniGen.transformer import Phi3Config, Phi3Transformer
+from .transformer import Phi3Transformer
 from typing import Optional, List, Tuple
 
 # Helper function to modulate tensor values
