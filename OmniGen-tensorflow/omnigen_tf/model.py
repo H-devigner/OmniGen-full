@@ -12,6 +12,27 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+class PatchEmbedMR(tf.keras.layers.Layer):
+    """Patch Embedding layer"""
+    
+    def __init__(self, patch_size, in_chans, embed_dim, bias=True):
+        super().__init__()
+        self.patch_size = patch_size
+        self.in_chans = in_chans
+        self.embed_dim = embed_dim
+        self.bias = bias
+        
+        self.proj = tf.keras.layers.Conv2D(embed_dim, kernel_size=patch_size, strides=patch_size)
+        if self.bias:
+            self.bias_layer = tf.keras.layers.Dense(embed_dim)
+    
+    def call(self, x):
+        """Forward pass"""
+        x = self.proj(x)
+        if self.bias:
+            x = x + self.bias_layer(x)
+        return x
+
 class OmniGenTF(tf.keras.Model):
     """TensorFlow implementation of OmniGen"""
     
@@ -33,26 +54,32 @@ class OmniGenTF(tf.keras.Model):
         self.text_encoder = tf.keras.Sequential([
             tf.keras.layers.Dense(self.config["hidden_size"]),
             tf.keras.layers.LayerNormalization(),
-            tf.keras.layers.Activation('gelu')
+            tf.keras.layers.Activation('gelu'),
+            # Add additional layers as needed to match PyTorch architecture
         ], name='text_encoder')
         
         # Image encoder
-        self.image_encoder = tf.keras.Sequential([
-            tf.keras.layers.Conv2D(self.config["hidden_size"], 3, padding='same'),
-            tf.keras.layers.LayerNormalization(),
-            tf.keras.layers.Activation('gelu')
-        ], name='image_encoder')
+        self.image_encoder = PatchEmbedMR(patch_size=self.config["patch_size"],
+                                    in_chans=self.config["in_channels"],
+                                    embed_dim=self.config["hidden_size"],
+                                    bias=True)
         
         # Transformer layers
         self.transformer_layers = []
-        for i in range(self.config["num_hidden_layers"]):
-            self.transformer_layers.append(
-                tf.keras.layers.MultiHeadAttention(
-                    num_heads=self.config["num_attention_heads"],
-                    key_dim=self.config["hidden_size"] // self.config["num_attention_heads"],
-                    name=f'transformer_layer_{i}'
-                )
+        for i in range(self.config['num_hidden_layers']):
+            layer = tf.keras.layers.MultiHeadAttention(
+                num_heads=self.config['num_attention_heads'],
+                key_dim=self.config['hidden_size'] // self.config['num_attention_heads'],
+                name=f'transformer_layer_{i}'
             )
+            self.transformer_layers.append(layer)
+        
+        # Final layer
+        self.final_layer = tf.keras.Sequential([
+            tf.keras.layers.LayerNormalization(epsilon=1e-6),
+            tf.keras.layers.Dense(self.config['patch_size'] * self.config['patch_size'] * self.config['in_channels']),
+            # Add any additional layers or modifications as needed
+        ], name='final_layer')
         
         # Decoder
         self.decoder = tf.keras.Sequential([
@@ -94,11 +121,18 @@ class OmniGenTF(tf.keras.Model):
             text_features = tf.reshape(text_features, (tf.shape(text_features)[0], -1))
             logger.debug(f"Adjusted Text features shape: {text_features.shape}")
 
+        # Ensure the shapes are compatible for addition
+        if image_features.shape[1:] != text_features.shape[1:]:
+            raise ValueError(f"Incompatible shapes for addition: {image_features.shape} + {text_features.shape}")
+
         features = image_features + text_features
         
         # Apply transformer layers
         for layer in self.transformer_layers:
             features = layer(features, features)
+        
+        # Apply final layer
+        features = self.final_layer(features)
         
         # Decode
         output = self.decoder(features)
@@ -140,12 +174,11 @@ class OmniGenTF(tf.keras.Model):
         
         # Load weights
         try:
-            # Try safetensors first
+            # Load weights from safetensors or PyTorch
             weights_path = os.path.join(model_path, "model.safetensors")
             if os.path.exists(weights_path):
                 state_dict = load_file(weights_path)
             else:
-                # Fall back to PyTorch weights
                 weights_path = os.path.join(model_path, "pytorch_model.bin")
                 state_dict = torch.load(weights_path)
             
@@ -170,7 +203,7 @@ class OmniGenTF(tf.keras.Model):
                     layer.set_weights([weight])
                 except Exception as e:
                     logger.warning(f"Could not set weights for {name}: {str(e)}")
-        
+    
         except Exception as e:
             logger.error(f"Error loading weights: {str(e)}")
             raise
