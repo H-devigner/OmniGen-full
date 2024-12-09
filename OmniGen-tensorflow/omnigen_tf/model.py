@@ -7,7 +7,7 @@ from diffusers.loaders import PeftAdapterMixin
 from huggingface_hub import snapshot_download
 from safetensors.tensorflow import load_file
 
-from OmniGen.transformer import Phi3Config, Phi3Transformer
+from .transformer import Phi3Config, Phi3Transformer
 
 
 def modulate(x, shift, scale):
