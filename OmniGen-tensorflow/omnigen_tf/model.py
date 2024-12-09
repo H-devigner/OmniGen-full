@@ -1,217 +1,154 @@
-"""TensorFlow implementation of OmniGen"""
-
 import os
-import json
-import logging
-from pathlib import Path
 import tensorflow as tf
 import numpy as np
-from huggingface_hub import snapshot_download
-from safetensors.torch import load_file
-import torch
+from transformers import Phi3Transformer
+from typing import Optional, List, Tuple
 
-logger = logging.getLogger(__name__)
+# Helper function to modulate tensor values
+def modulate(x, shift, scale):
+    return x * (1 + tf.expand_dims(scale, 1)) + tf.expand_dims(shift, 1)
 
-class PatchEmbedMR(tf.keras.layers.Layer):
-    """Patch Embedding layer"""
-    
-    def __init__(self, patch_size, in_chans, embed_dim, bias=True):
-        super().__init__()
-        self.patch_size = patch_size
-        self.in_chans = in_chans
-        self.embed_dim = embed_dim
-        self.bias = bias
-        
-        self.proj = tf.keras.layers.Conv2D(embed_dim, kernel_size=patch_size, strides=patch_size)
-        if self.bias:
-            self.bias_layer = tf.keras.layers.Dense(embed_dim)
-    
-    def call(self, x):
-        """Forward pass"""
-        x = self.proj(x)
-        if self.bias:
-            x = x + self.bias_layer(x)
-        return x
+# Timestep embedding
+class TimestepEmbedder(tf.keras.layers.Layer):
+    def __init__(self, hidden_size, frequency_embedding_size=256, **kwargs):
+        super().__init__(**kwargs)
+        self.mlp = tf.keras.Sequential([
+            tf.keras.layers.Dense(hidden_size, activation='silu'),
+            tf.keras.layers.Dense(hidden_size)
+        ])
+        self.frequency_embedding_size = frequency_embedding_size
 
-class OmniGenTF(tf.keras.Model):
-    """TensorFlow implementation of OmniGen"""
-    
-    def __init__(self, config=None, model_path=None):
-        super().__init__()
-        self.config = config or self._load_config(model_path)
-        self._build_model()
-    
     @staticmethod
-    def _load_config(model_path):
-        """Load model config from path"""
-        config_path = os.path.join(model_path, "config.json")
-        with open(config_path, "r") as f:
-            return json.load(f)
-    
-    def _build_model(self):
-        """Build the model architecture"""
-        # Text encoder
-        self.text_encoder = tf.keras.Sequential([
-            tf.keras.layers.Dense(self.config["hidden_size"]),
-            tf.keras.layers.LayerNormalization(),
-            tf.keras.layers.Activation('gelu'),
-            # Add additional layers as needed to match PyTorch architecture
-        ], name='text_encoder')
-        
-        # Image encoder
-        self.image_encoder = PatchEmbedMR(patch_size=self.config["patch_size"],
-                                    in_chans=self.config["in_channels"],
-                                    embed_dim=self.config["hidden_size"],
-                                    bias=True)
-        
-        # Transformer layers
-        self.transformer_layers = []
-        for i in range(self.config['num_hidden_layers']):
-            layer = tf.keras.layers.MultiHeadAttention(
-                num_heads=self.config['num_attention_heads'],
-                key_dim=self.config['hidden_size'] // self.config['num_attention_heads'],
-                name=f'transformer_layer_{i}'
-            )
-            self.transformer_layers.append(layer)
-        
-        # Final layer
-        self.final_layer = tf.keras.Sequential([
-            tf.keras.layers.LayerNormalization(epsilon=1e-6),
-            tf.keras.layers.Dense(self.config['patch_size'] * self.config['patch_size'] * self.config['in_channels']),
-            # Add any additional layers or modifications as needed
-        ], name='final_layer')
-        
-        # Decoder
-        self.decoder = tf.keras.Sequential([
-            tf.keras.layers.Conv2DTranspose(4, 3, padding='same'),
-            tf.keras.layers.LayerNormalization()
-        ], name='decoder')
-    
-    def call(self, inputs):
-        """Forward pass"""
-        # Unpack inputs
-        x = inputs['x']
-        timestep = inputs['timestep']
-        input_ids = inputs['input_ids']
-        attention_mask = inputs['attention_mask']
-        position_ids = inputs['position_ids']
-        
-        # Process timestep embedding
-        timestep = tf.cast(timestep, tf.float32)[:, None]
-        timestep_emb = self.get_timestep_embedding(timestep)
-        
-        # Process text
-        text_features = self.text_encoder(input_ids)
-        text_features = text_features * tf.cast(attention_mask[:, :, None], tf.float32)
-        
-        # Process image
-        image_features = self.image_encoder(x)
-        
-        # Combine features
-        logger.debug(f"Image features shape: {image_features.shape}")
-        logger.debug(f"Text features shape before addition: {text_features.shape}")
-
-        # Adjust the reshaping logic for text_features to align with image_features
-        # Ensure text_features has the correct shape for addition
-        text_features = tf.expand_dims(text_features, axis=1)  # Add a dimension
-        text_features = tf.expand_dims(text_features, axis=1)  # Add another dimension
-
-        # Adjust text_features to match the shape of image_features
-        text_features = tf.reshape(text_features, (tf.shape(text_features)[0], -1, self.config['hidden_size']))
-        logger.debug(f"Adjusted Text features shape: {text_features.shape}")
-
-        # Ensure the shapes are compatible for addition
-        if image_features.shape[1:] != text_features.shape[1:]:
-            raise ValueError(f"Incompatible shapes for addition: {image_features.shape} + {text_features.shape}")
-
-        features = image_features + text_features
-        
-        # Apply transformer layers
-        for layer in self.transformer_layers:
-            features = layer(features, features)
-        
-        # Apply final layer
-        features = self.final_layer(features)
-        
-        # Decode
-        output = self.decoder(features)
-        
-        return output
-    
-    def get_timestep_embedding(self, timesteps, dim=320, max_period=10000):
-        """Create sinusoidal timestep embeddings"""
-        max_period = tf.cast(max_period, tf.float32)  # Ensure max_period is float32
+    def timestep_embedding(t, dim, max_period=10000):
         half = dim // 2
         freqs = tf.exp(
-            -tf.math.log(max_period) * tf.range(0, half, dtype=tf.float32) / half
+            -tf.math.log(float(max_period)) * tf.range(half, dtype=tf.float32) / half
         )
-        args = timesteps * freqs[None]
+        args = tf.cast(t[:, None], tf.float32) * freqs[None]
         embedding = tf.concat([tf.cos(args), tf.sin(args)], axis=-1)
         if dim % 2:
-            embedding = tf.pad(embedding, [[0, 0], [0, 1]])
+            embedding = tf.concat([embedding, tf.zeros_like(embedding[:, :1])], axis=-1)
         return embedding
-    
-    @classmethod
-    def from_pretrained(cls, model_name_or_path, local_files_only=False):
-        """Load pretrained model"""
-        if not os.path.exists(model_name_or_path):
-            logger.info(f"Downloading model {model_name_or_path}")
-            model_path = snapshot_download(
-                model_name_or_path,
-                local_files_only=local_files_only
-            )
-        else:
-            model_path = model_name_or_path
-        
-        # Load config
-        config_path = os.path.join(model_path, "config.json")
-        with open(config_path) as f:
-            config = json.load(f)
 
-        # Set default values if keys are missing
-        config.setdefault('patch_size', 2)
-        config.setdefault('in_channels', 4)
-        config.setdefault('hidden_size', 768)
-        config.setdefault('num_hidden_layers', 12)
-        config.setdefault('num_attention_heads', 12)
+    def call(self, t):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        return self.mlp(t_freq)
 
-        # Create model
-        model = cls(config=config)
-        
-        # Load weights
-        try:
-            # Load weights from safetensors or PyTorch
-            weights_path = os.path.join(model_path, "model.safetensors")
-            if os.path.exists(weights_path):
-                state_dict = load_file(weights_path)
-            else:
-                weights_path = os.path.join(model_path, "pytorch_model.bin")
-                state_dict = torch.load(weights_path)
-            
-            # Convert weights
-            tf_weights = {}
-            for name, param in state_dict.items():
-                weight = param.cpu().numpy()
-                
-                # Handle convolution weights
-                if 'conv' in name and 'weight' in name:
-                    weight = np.transpose(weight, (2, 3, 1, 0))
-                # Handle linear/dense weights
-                elif 'weight' in name and len(param.shape) == 2:
-                    weight = np.transpose(weight)
-                
-                tf_weights[name] = weight
-            
-            # Set weights
-            for name, weight in tf_weights.items():
-                try:
-                    layer = model.get_layer(name.split('.')[0])
-                    layer.set_weights([weight])
-                except Exception as e:
-                    logger.warning(f"Could not set weights for {name}: {str(e)}")
-    
-        except Exception as e:
-            logger.error(f"Error loading weights: {str(e)}")
-            raise
-        
-        return model
+# Final processing layer
+class FinalLayer(tf.keras.layers.Layer):
+    def __init__(self, hidden_size, patch_size, out_channels, **kwargs):
+        super().__init__(**kwargs)
+        self.norm_final = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.linear = tf.keras.layers.Dense(patch_size * patch_size * out_channels)
+        self.adaLN_modulation = tf.keras.Sequential([
+            tf.keras.layers.Activation('silu'),
+            tf.keras.layers.Dense(2 * hidden_size)
+        ])
+
+    def call(self, x, c):
+        shift, scale = tf.split(self.adaLN_modulation(c), 2, axis=1)
+        x = modulate(self.norm_final(x), shift, scale)
+        return self.linear(x)
+
+# Patch embedder for multi-resolution processing
+class PatchEmbedMR(tf.keras.layers.Layer):
+    def __init__(self, patch_size: int, in_chans: int, embed_dim: int, **kwargs):
+        super().__init__(**kwargs)
+        self.proj = tf.keras.layers.Conv2D(embed_dim, kernel_size=patch_size, strides=patch_size, use_bias=True)
+
+    def call(self, x):
+        x = self.proj(x)
+        x = tf.reshape(x, [x.shape[0], -1, x.shape[-1]])
+        return x
+
+# Main model class
+class OmniGen(tf.keras.Model):
+    def __init__(self, transformer_config, patch_size=2, in_channels=4, pos_embed_max_size=192, **kwargs):
+        super().__init__(**kwargs)
+        self.in_channels = in_channels
+        self.out_channels = in_channels
+        self.patch_size = patch_size
+        self.pos_embed_max_size = pos_embed_max_size
+
+        hidden_size = transformer_config.hidden_size
+
+        # Embedding layers
+        self.x_embedder = PatchEmbedMR(patch_size, in_channels, hidden_size)
+        self.input_x_embedder = PatchEmbedMR(patch_size, in_channels, hidden_size)
+        self.time_token = TimestepEmbedder(hidden_size)
+
+        # Positional embeddings
+        self.pos_embed = tf.Variable(
+            tf.random.uniform([1, pos_embed_max_size * pos_embed_max_size, hidden_size], dtype=tf.float32),
+            trainable=False
+        )
+
+        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+
+        # Load pre-trained transformer model
+        self.llm = Phi3Transformer.from_pretrained(transformer_config.name_or_path)
+
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        initializer = tf.keras.initializers.GlorotUniform()
+
+        # Initialize patch embedders
+        for embedder in [self.x_embedder, self.input_x_embedder]:
+            embedder.proj.kernel.assign(initializer(embedder.proj.kernel.shape))
+            embedder.proj.bias.assign(tf.zeros_like(embedder.proj.bias))
+
+    def cropped_pos_embed(self, height, width):
+        h, w = height // self.patch_size, width // self.patch_size
+        pos_embed = self.pos_embed[:, :h * w, :]
+        return pos_embed
+
+    def call(
+        self,
+        x,
+        timestep,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        training=False
+    ):
+        B, C, H, W = x.shape
+        x_embed = self.x_embedder(x)
+
+        # Timestep embedding
+        t_embed = self.time_token(timestep)
+
+        # Positional embeddings
+        pos_embed = self.cropped_pos_embed(H, W)
+
+        # Combine embeddings and pass through the transformer
+        transformer_input = x_embed + pos_embed
+        outputs = self.llm(
+            inputs_embeds=transformer_input,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            training=training
+        )
+        transformer_out = outputs.last_hidden_state
+
+        # Process through the final layer
+        final_out = self.final_layer(transformer_out, t_embed)
+        return final_out
+
+# Usage Example
+if __name__ == "__main__":
+    # Define a mock transformer configuration
+    from transformers import AutoConfig
+
+    transformer_config = AutoConfig.from_pretrained("EleutherAI/phi-1_5")
+    model = OmniGen(transformer_config)
+
+    # Mock data
+    batch_size = 2
+    num_channels = 4
+    img_height, img_width = 64, 64
+    x = tf.random.normal([batch_size, img_height, img_width, num_channels])
+    timestep = tf.random.uniform([batch_size], minval=0, maxval=1000, dtype=tf.int32)
+
+    output = model(x, timestep)
+    print("Output shape:", output.shape)

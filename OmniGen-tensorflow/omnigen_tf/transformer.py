@@ -1,228 +1,129 @@
-"""Phi3 Transformer implementation in TensorFlow."""
-from __future__ import annotations
-
 import tensorflow as tf
-from tensorflow.keras import layers, initializers
-import numpy as np
-from typing import Optional, Dict, Any, List, Union, Tuple
+from tensorflow.keras import layers, Model
+from typing import Optional, Tuple, List, Union
 
-class MultiHeadAttention(layers.Layer):
-    """Multi-head attention layer."""
-    def __init__(self, config: Dict[str, Any]):
-        super().__init__()
-        self.num_attention_heads = config.get('num_attention_heads', 32)
-        self.hidden_size = config.get('hidden_size', 2048)
-        self.attention_head_size = self.hidden_size // self.num_attention_heads
-        self.scale = 1.0 / tf.math.sqrt(tf.cast(self.attention_head_size, tf.float32))
-        
-        # Initialize with truncated normal
-        kernel_init = initializers.TruncatedNormal(stddev=0.02)
-        
-        self.query = layers.Dense(
-            self.hidden_size,
-            use_bias=True,
-            kernel_initializer=kernel_init,
-            bias_initializer='zeros',
-            name='q_proj'
-        )
-        self.key = layers.Dense(
-            self.hidden_size,
-            use_bias=True,
-            kernel_initializer=kernel_init,
-            bias_initializer='zeros',
-            name='k_proj'
-        )
-        self.value = layers.Dense(
-            self.hidden_size,
-            use_bias=True,
-            kernel_initializer=kernel_init,
-            bias_initializer='zeros',
-            name='v_proj'
-        )
-        self.out = layers.Dense(
-            self.hidden_size,
-            use_bias=True,
-            kernel_initializer=kernel_init,
-            bias_initializer='zeros',
-            name='out_proj'
-        )
-        
-    def transpose_for_scores(self, x: tf.Tensor) -> tf.Tensor:
-        """Transpose and reshape tensor for attention computation."""
-        batch_size = tf.shape(x)[0]
-        seq_length = tf.shape(x)[1]
-        
-        # [batch_size, seq_length, hidden_size] -> [batch_size, seq_length, num_heads, head_size]
-        x = tf.reshape(x, (batch_size, seq_length, self.num_attention_heads, self.attention_head_size))
-        
-        # [batch_size, seq_length, num_heads, head_size] -> [batch_size, num_heads, seq_length, head_size]
-        return tf.transpose(x, [0, 2, 1, 3])
-        
-    def call(
-        self,
-        hidden_states: tf.Tensor,
-        attention_mask: Optional[tf.Tensor] = None,
-        past_key_value: Optional[Tuple[tf.Tensor, tf.Tensor]] = None,
-        use_cache: bool = False
-    ) -> Union[Tuple[tf.Tensor, Tuple[tf.Tensor, tf.Tensor]], tf.Tensor]:
-        """Forward pass."""
-        batch_size = tf.shape(hidden_states)[0]
-        
-        # Project queries, keys, and values
-        query_states = self.transpose_for_scores(self.query(hidden_states))
-        key_states = self.transpose_for_scores(self.key(hidden_states))
-        value_states = self.transpose_for_scores(self.value(hidden_states))
-        
-        # Use cached key/value states if provided
-        if past_key_value is not None:
-            past_key, past_value = past_key_value
-            key_states = tf.concat([past_key, key_states], axis=2)
-            value_states = tf.concat([past_value, value_states], axis=2)
-            
-        # Cache current key/value states if requested
-        if use_cache:
-            current_key_value = (key_states, value_states)
-            
-        # Compute attention scores
-        attention_scores = tf.matmul(query_states, key_states, transpose_b=True)
-        attention_scores = attention_scores * self.scale
-        
-        # Apply attention mask if provided
-        if attention_mask is not None:
-            attention_scores = attention_scores + attention_mask
-            
-        # Normalize attention scores
-        attention_probs = tf.nn.softmax(attention_scores, axis=-1)
-        
-        # Compute context layer
-        context_layer = tf.matmul(attention_probs, value_states)
-        context_layer = tf.transpose(context_layer, [0, 2, 1, 3])
-        context_layer = tf.reshape(context_layer, (batch_size, -1, self.hidden_size))
-        
-        # Project output
-        attention_output = self.out(context_layer)
-        
-        if use_cache:
-            return attention_output, current_key_value
-        return attention_output
-
-class Phi3Block(layers.Layer):
-    """Transformer block for Phi3."""
-    def __init__(self, config: Dict[str, Any]):
-        super().__init__()
-        self.attention = MultiHeadAttention(config)
-        
-        # Initialize MLP with proper initializers
-        kernel_init = initializers.TruncatedNormal(stddev=0.02)
-        self.mlp = tf.keras.Sequential([
-            layers.Dense(
-                config.get('intermediate_size', 8192),
-                activation='gelu',
-                kernel_initializer=kernel_init,
-                bias_initializer='zeros',
-                name='fc1'
-            ),
-            layers.Dense(
-                config.get('hidden_size', 2048),
-                kernel_initializer=kernel_init,
-                bias_initializer='zeros',
-                name='fc2'
-            )
-        ])
-        
-        # Layer norms
-        self.input_layernorm = layers.LayerNormalization(epsilon=1e-5, name='input_layernorm')
-        self.post_attention_layernorm = layers.LayerNormalization(epsilon=1e-5, name='post_attention_layernorm')
-        
-    def call(
-        self,
-        hidden_states: tf.Tensor,
-        attention_mask: Optional[tf.Tensor] = None,
-        past_key_value: Optional[Tuple[tf.Tensor]] = None,
-        use_cache: bool = False
-    ) -> Union[Tuple[tf.Tensor, Tuple[tf.Tensor]], tf.Tensor]:
-        """Forward pass."""
-        # Pre-attention norm
-        norm_states = self.input_layernorm(hidden_states)
-        
-        # Self-attention
-        attention_output = self.attention(
-            norm_states,
-            attention_mask=attention_mask,
-            past_key_value=past_key_value,
-            use_cache=use_cache
-        )
-        
-        # Handle cached key/values
-        if use_cache:
-            attention_output, present_key_value = attention_output
-            
-        # First residual connection
-        hidden_states = attention_output + hidden_states
-        
-        # MLP
-        mlp_output = self.mlp(self.post_attention_layernorm(hidden_states))
-        
-        # Second residual connection
-        hidden_states = mlp_output + hidden_states
-        
-        if use_cache:
-            return hidden_states, present_key_value
-        return hidden_states
-
-class Phi3TransformerTF(layers.Layer):
-    """Phi3 Transformer model."""
-    def __init__(self, config: Dict[str, Any]):
-        super().__init__()
+class Phi3Transformer(Model):
+    def __init__(self, config, **kwargs):
+        super(Phi3Transformer, self).__init__(**kwargs)
         self.config = config
-        self.hidden_size = config.get('hidden_size', 2048)
-        self.num_hidden_layers = config.get('num_hidden_layers', 32)
-        
-        # Transformer blocks
-        self.blocks = [Phi3Block(config) for _ in range(self.num_hidden_layers)]
-        
-        # Final layer norm
-        self.final_layernorm = layers.LayerNormalization(epsilon=1e-5, name='final_layernorm')
-        
-        # Cache for key/value states
-        self.use_cache = False
-        
+        self.layers = [Phi3DecoderLayer(config) for _ in range(config.num_hidden_layers)]
+        self.norm = layers.LayerNormalization(epsilon=1e-5)
+        self.use_cache = config.use_cache
+
+    def prefetch_layer(self, layer_idx: int, device: str):
+        # Prefetch logic is adapted since TensorFlow GPU memory management is automatic
+        print(f"Prefetching layer {layer_idx} to device {device} (handled by TensorFlow)")
+
+    def evict_previous_layer(self, layer_idx: int):
+        # TensorFlow manages memory automatically; this is a no-op placeholder
+        print(f"Evicting layer {layer_idx} (not explicitly required in TensorFlow)")
+
+    def get_offload_layer(self, layer_idx: int, device: str):
+        self.evict_previous_layer(layer_idx - 1)
+        self.prefetch_layer((layer_idx + 1) % len(self.layers), device)
+
+    def call(
+        self,
+        inputs_embeds: tf.Tensor,
+        attention_mask: Optional[tf.Tensor] = None,
+        position_ids: Optional[tf.Tensor] = None,
+        past_key_values: Optional[List[tf.Tensor]] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        offload_model: Optional[bool] = False,
+    ) -> Tuple[tf.Tensor, Optional[tf.Tensor]]:
+        # Default values
+        output_attentions = output_attentions or self.config.output_attentions
+        output_hidden_states = output_hidden_states or self.config.output_hidden_states
+        use_cache = use_cache or self.config.use_cache
+
+        hidden_states = inputs_embeds
+        all_hidden_states = [] if output_hidden_states else None
+        all_self_attentions = [] if output_attentions else None
+        next_decoder_cache = None
+
+        for layer_idx, decoder_layer in enumerate(self.layers):
+            if output_hidden_states:
+                all_hidden_states.append(hidden_states)
+
+            if offload_model:
+                self.get_offload_layer(layer_idx, device="GPU")
+
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values[layer_idx] if past_key_values else None,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+            )
+
+            hidden_states = layer_outputs[0]
+            if use_cache:
+                next_decoder_cache = layer_outputs[1]
+
+            if output_attentions:
+                all_self_attentions.append(layer_outputs[1])
+
+        hidden_states = self.norm(hidden_states)
+
+        if output_hidden_states:
+            all_hidden_states.append(hidden_states)
+
+        return hidden_states, next_decoder_cache
+
+class Phi3DecoderLayer(layers.Layer):
+    def __init__(self, config, **kwargs):
+        super(Phi3DecoderLayer, self).__init__(**kwargs)
+        self.self_attention = layers.MultiHeadAttention(
+            num_heads=config.num_attention_heads,
+            key_dim=config.hidden_size // config.num_attention_heads,
+        )
+        self.feed_forward = tf.keras.Sequential([
+            layers.Dense(config.intermediate_size, activation="gelu"),
+            layers.Dense(config.hidden_size),
+        ])
+        self.norm1 = layers.LayerNormalization(epsilon=1e-5)
+        self.norm2 = layers.LayerNormalization(epsilon=1e-5)
+
     def call(
         self,
         hidden_states: tf.Tensor,
         attention_mask: Optional[tf.Tensor] = None,
-        past_key_values: Optional[List[Tuple[tf.Tensor]]] = None,
-        use_cache: Optional[bool] = None
-    ) -> Union[Tuple[tf.Tensor, List[Tuple[tf.Tensor]]], tf.Tensor]:
-        """Forward pass."""
-        use_cache = use_cache if use_cache is not None else self.use_cache
-        
-        # Initialize present key/values list if caching
-        presents = [] if use_cache else None
-        
-        # Process through transformer blocks
-        for i, block in enumerate(self.blocks):
-            past_key_value = past_key_values[i] if past_key_values is not None else None
-            
-            if use_cache:
-                hidden_states, present_key_value = block(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    past_key_value=past_key_value,
-                    use_cache=use_cache
-                )
-                presents.append(present_key_value)
-            else:
-                hidden_states = block(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    past_key_value=past_key_value,
-                    use_cache=use_cache
-                )
-                
-        # Final layer norm
-        hidden_states = self.final_layernorm(hidden_states)
-        
-        if use_cache:
-            return hidden_states, presents
-        return hidden_states
+        position_ids: Optional[tf.Tensor] = None,
+        past_key_value: Optional[tf.Tensor] = None,
+        use_cache: bool = False,
+        output_attentions: bool = False,
+    ) -> Tuple[tf.Tensor, Optional[tf.Tensor]]:
+        # Self-attention
+        attn_output = self.self_attention(
+            hidden_states,
+            hidden_states,
+            hidden_states,
+            attention_mask=attention_mask,
+        )
+        hidden_states = self.norm1(hidden_states + attn_output)
+
+        # Feed-forward
+        ff_output = self.feed_forward(hidden_states)
+        hidden_states = self.norm2(hidden_states + ff_output)
+
+        return hidden_states, None  # Cache support not implemented in this basic example
+
+# Example config for demonstration
+class Config:
+    def __init__(self):
+        self.num_hidden_layers = 4
+        self.num_attention_heads = 8
+        self.hidden_size = 512
+        self.intermediate_size = 2048
+        self.use_cache = True
+        self.output_hidden_states = True
+        self.output_attentions = True
+
+# Initialize and use the model
+config = Config()
+model = Phi3Transformer(config)
+inputs = tf.random.uniform((2, 10, config.hidden_size))  # Batch size of 2, sequence length of 10
+outputs = model(inputs)

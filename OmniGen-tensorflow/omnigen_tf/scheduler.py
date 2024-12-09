@@ -1,127 +1,84 @@
 import tensorflow as tf
+import numpy as np
+from tqdm import tqdm
 
-class OmniGenScheduler:
-    """Scheduler for OmniGen model."""
-    
-    def __init__(
-        self,
-        num_train_timesteps: int = 1000,
-        beta_start: float = 0.00085,
-        beta_end: float = 0.012,
-        beta_schedule: str = "scaled_linear",
-        clip_sample: bool = False,
-        set_alpha_to_one: bool = False,
-        steps_offset: int = 0,
-        prediction_type: str = "epsilon",
-        timestep_spacing: str = "leading",
-    ):
-        """Initialize scheduler."""
-        if beta_schedule == "linear":
-            betas = tf.linspace(beta_start, beta_end, num_train_timesteps)
-        elif beta_schedule == "scaled_linear":
-            # Glide paper
-            betas = tf.linspace(beta_start ** 0.5, beta_end ** 0.5, num_train_timesteps) ** 2
+
+class TensorFlowCache:
+    def __init__(self, num_tokens_for_img, offload_to_cpu=False):
+        self.key_cache = []
+        self.value_cache = []
+        self.original_device = []
+        self.num_tokens_for_img = num_tokens_for_img
+        self.offload_to_cpu = offload_to_cpu
+
+    def update(self, key_states, value_states, layer_idx):
+        if len(self.key_cache) <= layer_idx:
+            # Initialize cache for the new layer
+            self.key_cache.append(key_states[..., :-(self.num_tokens_for_img + 1), :])
+            self.value_cache.append(value_states[..., :-(self.num_tokens_for_img + 1), :])
+            self.original_device.append(key_states.device)
         else:
-            raise NotImplementedError(f"{beta_schedule} does is not implemented for {self.__class__}")
-            
-        alphas = 1.0 - betas
-        alphas_cumprod = tf.math.cumprod(alphas, axis=0)
-        alphas_cumprod_prev = tf.pad(alphas_cumprod[:-1], [[1, 0]], constant_values=1.0)
-        
-        self.num_train_timesteps = num_train_timesteps
-        self.alphas_cumprod = alphas_cumprod
-        self.alphas_cumprod_prev = alphas_cumprod_prev
-        self.betas = betas
-        self.alphas = alphas
-        
-        # Offset for deterministic sampling
-        self.steps_offset = steps_offset
-        
-        # Clip sample for numerical stability
-        self.clip_sample = clip_sample
-        
-        # Type of prediction
-        self.prediction_type = prediction_type
-        
-        # For backwards compatibility
-        self.set_alpha_to_one = set_alpha_to_one
-        self.timestep_spacing = timestep_spacing
-        
-    def scale_model_input(self, sample: tf.Tensor, timestep: tf.Tensor) -> tf.Tensor:
-        """Scale the denoising model input."""
-        step_index = timestep
-        sigma = tf.gather(self.sigmas, step_index)
-        sigma = tf.cast(sigma, sample.dtype)
-        
-        # Expand sigma for proper broadcasting
-        while len(sigma.shape) < len(sample.shape):
-            sigma = tf.expand_dims(sigma, -1)
-            
-        scaled = sample / ((sigma**2 + 1) ** 0.5)
-        return scaled
-        
-    def set_timesteps(self, num_inference_steps: int):
-        """Set timesteps for inference."""
-        if self.timestep_spacing == "leading":
-            timesteps = tf.linspace(0, self.num_train_timesteps - 1, num_inference_steps)
-            timesteps = tf.cast(timesteps, tf.int32)
-        else:
-            raise ValueError(f"Unsupported timestep spacing: {self.timestep_spacing}")
-            
-        sigmas = tf.sqrt(1 / self.alphas_cumprod - 1)
-        sigmas = tf.concat([sigmas, tf.zeros([1], dtype=sigmas.dtype)], axis=0)
-        
-        self.timesteps = timesteps
-        self.sigmas = sigmas
-        self.num_inference_steps = num_inference_steps
-        
-    def step(
-        self,
-        model_output: tf.Tensor,
-        timestep: tf.Tensor,
-        sample: tf.Tensor,
-        eta: float = 0.0,
-        use_clipped_model_output: bool = False,
-        generator=None,
-        return_dict: bool = True,
-    ):
-        """Predict the sample at the previous timestep."""
-        step_index = timestep
-        sigma = tf.gather(self.sigmas, step_index)
-        sigma = tf.cast(sigma, sample.dtype)
-        
-        # 1. compute predicted original sample from predicted noise also called "predicted x_0"
-        if self.prediction_type == "epsilon":
-            pred_original_sample = sample - sigma * model_output
-        elif self.prediction_type == "v_prediction":
-            pred_original_sample = model_output
-        else:
-            raise ValueError(f"Prediction type {self.prediction_type} not supported")
-            
-        # 2. clip predicted x_0
-        if self.clip_sample:
-            pred_original_sample = tf.clip_by_value(pred_original_sample, -1, 1)
-            
-        # 3. Get next step value
-        step_index = step_index + 1
-        sigma_next = tf.gather(self.sigmas, step_index)
-        sigma_next = tf.cast(sigma_next, sample.dtype)
-        
-        # 4. compute variance
-        sigma_up = tf.minimum(sigma_next, tf.sqrt(sigma_next**2 * (sigma**2 - sigma_next**2) / sigma**2))
-        sigma_up = tf.cast(sigma_up, sample.dtype)
-        
-        # 5. compute noise
-        noise = tf.random.normal(
-            sample.shape,
-            dtype=sample.dtype,
-            seed=generator.seed() if generator is not None else None
-        )
-        
-        # 6. compute previous sample
-        prev_sample = pred_original_sample + sigma_next * noise
-        
-        if not return_dict:
-            return (prev_sample,)
-            
-        return {"prev_sample": prev_sample, "pred_original_sample": pred_original_sample}
+            # Append to existing cache
+            self.key_cache[layer_idx] = tf.concat(
+                [self.key_cache[layer_idx], key_states], axis=-2
+            )
+            self.value_cache[layer_idx] = tf.concat(
+                [self.value_cache[layer_idx], value_states], axis=-2
+            )
+
+    def get_cache(self, layer_idx):
+        if layer_idx >= len(self.key_cache):
+            raise ValueError("Invalid layer index for cache retrieval.")
+        return self.key_cache[layer_idx], self.value_cache[layer_idx]
+
+    def evict_previous_layer(self, layer_idx):
+        if self.offload_to_cpu and layer_idx > 0:
+            prev_idx = layer_idx - 1
+            self.key_cache[prev_idx] = tf.identity(self.key_cache[prev_idx].numpy())
+            self.value_cache[prev_idx] = tf.identity(self.value_cache[prev_idx].numpy())
+
+    def prefetch_layer(self, layer_idx):
+        if layer_idx < len(self.key_cache):
+            self.key_cache[layer_idx] = tf.convert_to_tensor(self.key_cache[layer_idx])
+            self.value_cache[layer_idx] = tf.convert_to_tensor(self.value_cache[layer_idx])
+
+
+class TensorFlowScheduler:
+    def __init__(self, num_steps=50, time_shifting_factor=1):
+        self.num_steps = num_steps
+        t = np.linspace(0, 1, num_steps + 1)
+        t = t / (t + time_shifting_factor - time_shifting_factor * t)
+        self.sigma = tf.constant(t, dtype=tf.float32)
+
+    def crop_cache(self, cache, num_tokens_for_img):
+        for i in range(len(cache.key_cache)):
+            cache.key_cache[i] = cache.key_cache[i][..., :-(num_tokens_for_img + 1), :]
+            cache.value_cache[i] = cache.value_cache[i][..., :-(num_tokens_for_img + 1), :]
+        return cache
+
+    def crop_position_ids_for_cache(self, position_ids, num_tokens_for_img):
+        return position_ids[:, -(num_tokens_for_img + 1):]
+
+    def crop_attention_mask_for_cache(self, attention_mask, num_tokens_for_img):
+        return attention_mask[..., -(num_tokens_for_img + 1):, :]
+
+    def __call__(self, z, func, model_kwargs, use_kv_cache=True, offload_kv_cache=True):
+        num_tokens_for_img = z.shape[-1] * z.shape[-2] // 4
+        cache = TensorFlowCache(num_tokens_for_img, offload_to_cpu=offload_kv_cache) if use_kv_cache else None
+
+        for i in tqdm(range(self.num_steps)):
+            timesteps = tf.fill([tf.shape(z)[0]], self.sigma[i])
+            pred, cache = func(z, timesteps, cache=cache, **model_kwargs)
+            sigma_next = self.sigma[i + 1]
+            sigma = self.sigma[i]
+            z += (sigma_next - sigma) * pred
+
+            if i == 0 and use_kv_cache:
+                model_kwargs["position_ids"] = self.crop_position_ids_for_cache(
+                    model_kwargs["position_ids"], num_tokens_for_img
+                )
+                model_kwargs["attention_mask"] = self.crop_attention_mask_for_cache(
+                    model_kwargs["attention_mask"], num_tokens_for_img
+                )
+
+        return z
