@@ -1,21 +1,17 @@
 """OmniGen TensorFlow Implementation"""
 
-from .model import OmniGenTF
+from .model import OmniGen
 from .pipeline import OmniGenPipeline
 from .processor import OmniGenProcessor
 from .scheduler import OmniGenScheduler
-from .vae import AutoencoderKL
 from .converter import WeightConverter
-from .transformer import Phi3TransformerTF
-
-__version__ = "0.1.0"
+from .transformer import Phi3Transformer
 
 __all__ = [
-    "OmniGenTF",
+    "OmniGen",
     "OmniGenPipeline",
     "OmniGenProcessor",
     "OmniGenScheduler",
-    "AutoencoderKL",
     "WeightConverter",
-    "Phi3TransformerTF",
+    "Phi3Transformer"
 ]
