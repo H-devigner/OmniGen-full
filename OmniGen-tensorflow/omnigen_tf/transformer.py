@@ -1,6 +1,7 @@
 import tensorflow as tf
 from tensorflow.keras import layers, Model
 from typing import Optional, Tuple, List, Union
+from transformers import Phi3Config
 
 class Phi3Transformer(Model):
     def __init__(self, config, **kwargs):
