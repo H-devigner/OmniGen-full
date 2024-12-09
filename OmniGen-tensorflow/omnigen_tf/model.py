@@ -111,15 +111,14 @@ class OmniGenTF(tf.keras.Model):
         logger.debug(f"Image features shape: {image_features.shape}")
         logger.debug(f"Text features shape before addition: {text_features.shape}")
 
+        # Adjust the reshaping logic for text_features to align with image_features
         # Ensure text_features has the correct shape for addition
         text_features = tf.expand_dims(text_features, axis=1)  # Add a dimension
         text_features = tf.expand_dims(text_features, axis=1)  # Add another dimension
 
-        # Check if the shapes are compatible for addition
-        if image_features.shape[-1] != text_features.shape[-1]:
-            # Adjust text_features to match image_features shape
-            text_features = tf.reshape(text_features, (tf.shape(text_features)[0], -1))
-            logger.debug(f"Adjusted Text features shape: {text_features.shape}")
+        # Adjust text_features to match the shape of image_features
+        text_features = tf.reshape(text_features, (tf.shape(text_features)[0], -1, self.config['hidden_size']))
+        logger.debug(f"Adjusted Text features shape: {text_features.shape}")
 
         # Ensure the shapes are compatible for addition
         if image_features.shape[1:] != text_features.shape[1:]:
