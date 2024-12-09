@@ -5,7 +5,7 @@ import numpy as np
 from transformers import AutoTokenizer
 from PIL import Image
 import logging
-from .model import OmniGen  # Importing OmniGenTF
+from .model import OmniGen  # Importing OmniGen
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ class OmniGenPipeline:
         logger.info(f"Loading pipeline from {model_name_or_path}")
         
         # Load the model
-        model = OmniGenTF.from_pretrained(model_name_or_path, local_files_only=local_files_only)
+        model = OmniGen.from_pretrained(model_name_or_path, local_files_only=local_files_only)
         
         return cls(model=model)
     
