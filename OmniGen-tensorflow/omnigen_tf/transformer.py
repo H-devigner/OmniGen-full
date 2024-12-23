@@ -15,6 +15,7 @@ class Cache:
     """Base cache class for key-value caching in attention layers."""
     def __init__(self):
         self.cache = {}
+        self._seen_tokens = 0
 
     def get_seq_length(self) -> int:
         """Get the sequence length of the cached keys."""
@@ -31,18 +32,91 @@ class Cache:
 
 class DynamicCache(Cache):
     """Dynamic cache that grows with each forward pass."""
-    def update(self, key: str, key_value: Tuple[tf.Tensor, tf.Tensor], layer_idx: int):
+    def __init__(self, num_tokens_for_img: int = None, offload_kv_cache: bool = False):
+        super().__init__()
+        self.key_cache = []
+        self.value_cache = []
+        self.original_device = []
+        self.num_tokens_for_img = num_tokens_for_img
+        self.offload_kv_cache = offload_kv_cache
+
+    def update(self, key_states: tf.Tensor, value_states: tf.Tensor, layer_idx: int):
         """Concatenate new key-value pairs with existing ones."""
-        if layer_idx not in self.cache:
-            self.cache[layer_idx] = {}
-            self.cache[layer_idx][key] = key_value
+        if len(self.key_cache) < layer_idx:
+            raise ValueError("Cache does not support skipping layers")
+        elif len(self.key_cache) == layer_idx:
+            # Only cache necessary tokens
+            if self.num_tokens_for_img is not None:
+                key_states = key_states[..., :-(self.num_tokens_for_img+1), :]
+                value_states = value_states[..., :-(self.num_tokens_for_img+1), :]
+
+            # Update seen tokens count
+            if layer_idx == 0:
+                self._seen_tokens += key_states.shape[-2]
+
+            self.key_cache.append(key_states)
+            self.value_cache.append(value_states)
+            self.original_device.append(key_states.device)
+
+            if self.offload_kv_cache:
+                self.evict_previous_layer(layer_idx)
+            return self.key_cache[layer_idx], self.value_cache[layer_idx]
         else:
-            k, v = key_value
-            if key in self.cache[layer_idx]:
-                old_k, old_v = self.cache[layer_idx][key]
-                k = tf.concat([old_k, k], axis=1)
-                v = tf.concat([old_v, v], axis=1)
-            self.cache[layer_idx][key] = (k, v)
+            # Only cache necessary tokens
+            key_tensor, value_tensor = self[layer_idx]
+            k = tf.concat([key_tensor, key_states], axis=-2)
+            v = tf.concat([value_tensor, value_states], axis=-2)
+            return k, v
+
+    def __getitem__(self, layer_idx: int):
+        """Gets the cache for this layer, handling device placement."""
+        if layer_idx < len(self.key_cache):
+            if self.offload_kv_cache:
+                # Ensure previous operations complete
+                tf.keras.backend.get_session().run(tf.keras.backend.get_session().graph.get_operations())
+                
+                # Evict previous layer if needed
+                self.evict_previous_layer(layer_idx)
+                
+                # Load current layer to original device
+                original_device = self.original_device[layer_idx]
+                with tf.device(original_device):
+                    key_tensor = tf.identity(self.key_cache[layer_idx])
+                    value_tensor = tf.identity(self.value_cache[layer_idx])
+                
+                # Prefetch next layer
+                next_idx = (layer_idx + 1) % len(self.key_cache)
+                self.prefetch_layer(next_idx)
+            else:
+                key_tensor = self.key_cache[layer_idx]
+                value_tensor = self.value_cache[layer_idx]
+            return key_tensor, value_tensor
+        else:
+            raise KeyError(f"Cache only has {len(self.key_cache)} layers, tried to access layer {layer_idx}")
+
+    def prefetch_layer(self, layer_idx: int):
+        """Prefetch next layer to device."""
+        if layer_idx < len(self.key_cache):
+            device = self.original_device[layer_idx]
+            with tf.device(device):
+                # Use tf.function for async operations
+                @tf.function(experimental_relax_shapes=True)
+                def prefetch_async(tensor):
+                    return tf.identity(tensor)
+                self.key_cache[layer_idx] = prefetch_async(self.key_cache[layer_idx])
+                self.value_cache[layer_idx] = prefetch_async(self.value_cache[layer_idx])
+
+    def evict_previous_layer(self, layer_idx: int):
+        """Move previous layer to CPU."""
+        if len(self.key_cache) > 2:
+            prev_idx = layer_idx - 1 if layer_idx > 0 else len(self.key_cache) - 1
+            with tf.device('/CPU:0'):
+                # Use tf.function for async operations
+                @tf.function(experimental_relax_shapes=True)
+                def evict_async(tensor):
+                    return tf.identity(tensor)
+                self.key_cache[prev_idx] = evict_async(self.key_cache[prev_idx])
+                self.value_cache[prev_idx] = evict_async(self.value_cache[prev_idx])
 
 
 class StaticCache(Cache):
@@ -83,6 +157,7 @@ class Phi3Transformer(tf.keras.Model):
         self._current_device = None
         self._active_layer_idx = None
         self._layer_weights_cpu = [None] * len(self.decoder_layers)
+        self._original_devices = [None] * len(self.decoder_layers)
         self._prefetch_queue = []
         
     def _get_device_strategy(self):
@@ -92,6 +167,12 @@ class Phi3Transformer(tf.keras.Model):
             gpus = tf.config.list_physical_devices('GPU')
             self._current_device = '/GPU:0' if gpus else '/CPU:0'
         return self._current_device
+        
+    def _ensure_stream_sync(self):
+        """Ensure all operations are synchronized."""
+        if tf.test.is_gpu_available():
+            tf.keras.backend.get_session().run(tf.keras.backend.get_session().graph.get_operations())
+            tf.keras.backend.get_session().run(tf.keras.backend.get_session().graph.get_operations())
         
     def prefetch_layer(self, layer_idx: int):
         """Prefetch next layer weights to device."""
@@ -109,15 +190,23 @@ class Phi3Transformer(tf.keras.Model):
             if self._layer_weights_cpu[layer_idx] is not None:
                 weights = self._layer_weights_cpu[layer_idx]
                 # Convert to tensors asynchronously
-                converted_weights = [
-                    tf.convert_to_tensor(w, dtype=self._dtype) 
-                    for w in weights
-                ]
+                converted_weights = []
+                for w in weights:
+                    # Use tf.function for async conversion
+                    @tf.function(experimental_relax_shapes=True)
+                    def convert_tensor(x):
+                        return tf.convert_to_tensor(x, dtype=self._dtype)
+                    converted_weights.append(convert_tensor(w))
+                
                 # Set weights in a separate thread
-                tf.function(experimental_relax_shapes=True)(
-                    self.decoder_layers[layer_idx].set_weights
-                )(converted_weights)
+                @tf.function(experimental_relax_shapes=True)
+                def set_weights_async(layer, weights):
+                    layer.set_weights(weights)
+                    return None
+                
+                set_weights_async(self.decoder_layers[layer_idx], converted_weights)
                 self._layer_weights_cpu[layer_idx] = None
+                self._original_devices[layer_idx] = device
                 
         self._prefetch_queue.append(layer_idx)
                 
@@ -128,18 +217,21 @@ class Phi3Transformer(tf.keras.Model):
             
         # Store weights on CPU
         with tf.device('/CPU:0'):
-            weights = self.decoder_layers[layer_idx].get_weights()
-            # Convert to numpy arrays on CPU
+            # Get weights asynchronously
+            @tf.function(experimental_relax_shapes=True)
+            def get_weights_async(layer):
+                return layer.get_weights()
+            
+            weights = get_weights_async(self.decoder_layers[layer_idx])
             self._layer_weights_cpu[layer_idx] = [w.numpy() for w in weights]
             
             # Clear GPU memory
-            zero_weights = [
-                tf.zeros_like(w, dtype=self._dtype)
-                for w in weights
-            ]
-            tf.function(experimental_relax_shapes=True)(
-                self.decoder_layers[layer_idx].set_weights
-            )(zero_weights)
+            @tf.function(experimental_relax_shapes=True)
+            def clear_weights_async(layer, weights):
+                layer.set_weights([tf.zeros_like(w) for w in weights])
+                return None
+                
+            clear_weights_async(self.decoder_layers[layer_idx], weights)
             
         if self._active_layer_idx == layer_idx:
             self._active_layer_idx = None
@@ -147,7 +239,7 @@ class Phi3Transformer(tf.keras.Model):
     def manage_layer_memory(self, current_idx: int):
         """Manage layer memory by prefetching and evicting."""
         # Ensure previous operations are complete
-        tf.keras.backend.get_session().run(tf.keras.backend.get_session().graph.get_operations())
+        self._ensure_stream_sync()
         
         # Evict layers we don't need
         if self._active_layer_idx is not None and self._active_layer_idx != current_idx:
@@ -164,7 +256,7 @@ class Phi3Transformer(tf.keras.Model):
         self._active_layer_idx = current_idx
         
         # Ensure prefetch is complete
-        tf.keras.backend.get_session().run(tf.keras.backend.get_session().graph.get_operations())
+        self._ensure_stream_sync()
         
     def _update_causal_mask(
         self, 
