@@ -64,7 +64,7 @@ class Phi3Transformer(tf.keras.Model):
     """
     def __init__(self, config: Phi3Config, **kwargs):
         super().__init__(**kwargs)
-        print("Initializing Phi3Transformer with config:", config)
+        print("Initializing Phi3Transformer with config")
         
         self.config = config
         # Get layer norm epsilon, default to 1e-5 if not present
@@ -247,7 +247,7 @@ class Phi3DecoderLayer(tf.keras.Model):
     
     def __init__(self, config: Phi3Config, **kwargs):
         super().__init__(**kwargs)
-        print(f"Initializing Phi3DecoderLayer with config: {config}")
+        print(f"Initializing Phi3DecoderLayer with config..")
         
         self.config = config
         
