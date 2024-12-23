@@ -13,6 +13,7 @@ from tensorflow.keras import layers, Model
 from diffusers.loaders import PeftAdapterMixin
 from huggingface_hub import snapshot_download
 from safetensors.tensorflow import load_file
+import gc
 
 from omnigen_tf.transformer import Phi3Config, Phi3Transformer
 
@@ -268,7 +269,7 @@ class PatchEmbedMR(layers.Layer):
         return x
 
 
-class OmniGen(Model):
+class OmniGen(tf.keras.Model):
     """Diffusion model with a Transformer backbone.
     
     This is the main OmniGen model that combines:
@@ -289,6 +290,8 @@ class OmniGen(Model):
         in_channels: Number of input channels
         pe_interpolation: Interpolation scale for positional embeddings (must be float)
         pos_embed_max_size: Maximum size for positional embeddings
+        device: Device to place model on ('CPU', 'GPU', or None for auto-detect)
+        mixed_precision: Whether to use mixed precision training
     """
     def __init__(
         self,
@@ -297,6 +300,8 @@ class OmniGen(Model):
         in_channels=4,
         pe_interpolation: float = 1.0,
         pos_embed_max_size: int = 192,
+        device=None,
+        mixed_precision=True,
     ):
         """Initialize OmniGen model.
         
@@ -306,11 +311,27 @@ class OmniGen(Model):
             in_channels: Number of input channels
             pe_interpolation: Interpolation scale for positional embeddings (must be float)
             pos_embed_max_size: Maximum size for positional embeddings
+            device: Device to place model on ('CPU', 'GPU', or None for auto-detect)
+            mixed_precision: Whether to use mixed precision training
         """
         super().__init__()
         
-        print("Initializing OmniGen with config")
+        # Set up device strategy
+        if device is None:
+            if len(tf.config.list_physical_devices('GPU')) > 0:
+                device = 'GPU'
+            else:
+                print("No GPU detected, using CPU. This may be slow!")
+                device = 'CPU'
+                
+        self.device = device
         
+        # Enable mixed precision if requested and on GPU
+        if mixed_precision and device == 'GPU':
+            policy = tf.keras.mixed_precision.Policy('mixed_float16')
+            tf.keras.mixed_precision.set_global_policy(policy)
+            print("Using mixed precision")
+            
         # Save configuration
         self.config = transformer_config
         self.patch_size = patch_size
@@ -324,45 +345,65 @@ class OmniGen(Model):
             self.pe_interpolation = 1.0
         else:
             self.pe_interpolation = float(pe_interpolation)
-        
-        # Initialize embedders
-        print("Creating embedders...")
-        self.x_embedder = PatchEmbedMR(patch_size, in_channels, self.config.hidden_size, bias=True)
-        self.input_x_embedder = PatchEmbedMR(patch_size, in_channels, self.config.hidden_size, bias=True)
-        
-        # Initialize time embedders
-        print("Creating time embedders...")
-        self.time_token = TimestepEmbedder(self.config.hidden_size)
-        self.t_embedder = TimestepEmbedder(self.config.hidden_size)
-        
-        try:
-            # Initialize transformer (LLM)
-            print("Creating Phi3Transformer...")
-            self.llm = Phi3Transformer(transformer_config)
-            print("Phi3Transformer created successfully")
             
-            if not hasattr(self, 'llm') or self.llm is None:
-                raise ValueError("LLM initialization failed")
+        with tf.device(f'/{device}:0'):
+            # Initialize embedders
+            print("Creating embedders...")
+            self.x_embedder = PatchEmbedMR(patch_size, in_channels, self.config.hidden_size, bias=True)
+            self.input_x_embedder = PatchEmbedMR(patch_size, in_channels, self.config.hidden_size, bias=True)
+            
+            # Initialize time embedders
+            print("Creating time embedders...")
+            self.time_token = TimestepEmbedder(self.config.hidden_size)
+            self.t_embedder = TimestepEmbedder(self.config.hidden_size)
+            
+            try:
+                # Initialize transformer (LLM)
+                print("Creating Phi3Transformer...")
+                self.llm = Phi3Transformer(transformer_config)
+                print("Phi3Transformer created successfully")
                 
-        except Exception as e:
-            print(f"Error initializing LLM: {str(e)}")
-            raise
+                if not hasattr(self, 'llm') or self.llm is None:
+                    raise ValueError("LLM initialization failed")
+                    
+            except Exception as e:
+                print(f"Error initializing LLM: {str(e)}")
+                raise
+                
+            # Set up positional embeddings
+            print("Setting up positional embeddings...")
+            pos_embed = get_2d_sincos_pos_embed(
+                self.llm.config.hidden_size,
+                pos_embed_max_size,
+                interpolation_scale=self.pe_interpolation,
+                base_size=64
+            )
+            self.pos_embed = tf.Variable(pos_embed[None], trainable=False)
+            print("Positional embeddings created")
             
-        # Set up positional embeddings
-        print("Setting up positional embeddings...")
-        pos_embed = get_2d_sincos_pos_embed(
-            self.llm.config.hidden_size,
-            pos_embed_max_size,
-            interpolation_scale=self.pe_interpolation,
-            base_size=64
-        )
-        self.pos_embed = tf.Variable(pos_embed[None], trainable=False)
-        print("Positional embeddings created")
+            # Initialize final layer
+            print("Creating final layer...")
+            self.final_layer = FinalLayer(self.config.hidden_size, patch_size, self.out_channels)
+            print("Final layer created")
+            
+        # Set model to eval mode (equivalent to PyTorch's model.eval())
+        self.trainable = False
         
-        # Initialize final layer
-        print("Creating final layer...")
-        self.final_layer = FinalLayer(self.config.hidden_size, patch_size, self.out_channels)
-        print("Final layer created")
+    def memory_efficient_forward(self, *args, **kwargs):
+        """Memory efficient forward pass that cleans up GPU memory."""
+        try:
+            # Run forward pass
+            output = self.call(*args, **kwargs)
+            
+            # Clear unnecessary tensors
+            tf.keras.backend.clear_session()
+            gc.collect()
+            
+            return output
+            
+        except Exception as e:
+            print(f"Error in forward pass: {str(e)}")
+            raise
 
     @classmethod
     def from_pretrained(cls, model_name, **kwargs):
