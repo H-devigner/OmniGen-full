@@ -484,12 +484,41 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         
         if os.path.exists(os.path.join(model_name, 'model.safetensors')):
             print("Loading safetensors weights...")
-            load_safetensors(model, os.path.join(model_name, 'model.safetensors'))
+            try:
+                from safetensors.tensorflow import load_file
+                
+                # Load weights with CPU device to save memory
+                with tf.device('/CPU:0'):
+                    state_dict = load_file(os.path.join(model_name, 'model.safetensors'))
+                    
+                    # Convert weights to TensorFlow format
+                    tf_weights = {}
+                    for name, tensor in state_dict.items():
+                        # Convert PyTorch weight names to TensorFlow format
+                        tf_name = name.replace('.', '/')
+                        # Ensure tensor is on CPU and convert to float32
+                        tf_weights[tf_name] = tf.cast(tensor, tf.float32)
+                    
+                    # Load weights into model
+                    model.load_weights(tf_weights)
+                    print("Successfully loaded weights from safetensors")
+                    
+            except Exception as e:
+                print(f"Error loading safetensors: {str(e)}")
+                print("Attempting to load TensorFlow checkpoint...")
+                try:
+                    model = tf.saved_model.load(os.path.join(model_name, 'model'))
+                except Exception as e2:
+                    print(f"Error loading TensorFlow checkpoint: {str(e2)}")
+                    raise ValueError("Failed to load model weights") from e2
         else:
-            print("Loading pickle weights...")
-            state_dict = torch.load(os.path.join(model_name, 'pytorch_model.bin'), map_location='cpu')
-            model.load_state_dict(state_dict)
-            
+            print("No safetensors found, loading TensorFlow checkpoint...")
+            try:
+                model = tf.saved_model.load(os.path.join(model_name, 'model'))
+            except Exception as e:
+                print(f"Error loading TensorFlow checkpoint: {str(e)}")
+                raise ValueError("Failed to load model weights") from e
+                
         return model
 
     def unpatchify(self, x, h, w):
