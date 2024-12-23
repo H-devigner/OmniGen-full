@@ -245,7 +245,7 @@ class PatchEmbedMR(layers.Layer):
         return x
 
 
-class OmniGen(tf.keras.Model, PeftAdapterMixin):
+class OmniGen(tf.keras.Model):
     """Diffusion model with a Transformer backbone.
     
     This is the main OmniGen model that combines:
@@ -268,7 +268,6 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         in_channels: Number of input channels
         pe_interpolation: Interpolation scale for positional embeddings (must be float)
         pos_embed_max_size: Maximum size for positional embeddings
-        device: Device to place model on ('CPU', 'GPU', or None for auto-detect)
     """
     def __init__(
         self,
@@ -277,116 +276,157 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         in_channels=4,
         pe_interpolation: float = 1.0,
         pos_embed_max_size: int = 192,
-        device=None,
     ):
-        tf.keras.Model.__init__(self)
-        PeftAdapterMixin.__init__(self)
+        super().__init__()
         
-        # Enable mixed precision
-        policy = tf.keras.mixed_precision.Policy('mixed_float16')
-        tf.keras.mixed_precision.set_global_policy(policy)
+        # Memory management setup
+        self._persistent_buffers = {}
+        self._cached_weights = {}
+        self._is_on_cpu = False
         
-        # Basic configuration
-        self.patch_size = patch_size
+        # Model configuration
         self.in_channels = in_channels
         self.out_channels = in_channels
+        self.patch_size = patch_size
         self.pos_embed_max_size = pos_embed_max_size
         self.pe_interpolation = pe_interpolation
         
-        # Memory management
-        self._model_on_cpu = False
-        self._cache = None
-        self._active_layer = None
-        
-        # Create model components with proper dtype
+        # Set compute dtype based on available hardware
+        self._compute_dtype = tf.float32
+        if tf.config.list_physical_devices('GPU'):
+            self._compute_dtype = tf.float16
+            
+        # Initialize components with proper dtype
+        hidden_size = transformer_config.hidden_size
         self.x_embedder = PatchEmbedMR(
-            patch_size, in_channels, transformer_config.hidden_size,
-            dtype=policy.compute_dtype
+            patch_size, in_channels, hidden_size,
+            dtype=self._compute_dtype
         )
         self.input_x_embedder = PatchEmbedMR(
-            patch_size, in_channels, transformer_config.hidden_size,
-            dtype=policy.compute_dtype
+            patch_size, in_channels, hidden_size,
+            dtype=self._compute_dtype
         )
         
-        self.time_token = TimestepEmbedder(
-            transformer_config.hidden_size,
-            dtype=policy.compute_dtype
-        )
-        self.t_embedder = TimestepEmbedder(
-            transformer_config.hidden_size,
-            dtype=policy.compute_dtype
-        )
+        # Create embedders
+        self.time_token = TimestepEmbedder(hidden_size)
+        self.t_embedder = TimestepEmbedder(hidden_size)
         
-        # Create positional embeddings
+        # Register positional embedding buffer
         pos_embed = get_2d_sincos_pos_embed(
-            transformer_config.hidden_size,
-            pos_embed_max_size,
+            hidden_size, pos_embed_max_size,
             interpolation_scale=self.pe_interpolation,
             base_size=64
         )
-        self.pos_embed = tf.cast(pos_embed, policy.compute_dtype)
-        
-        self.final_layer = FinalLayer(
-            transformer_config.hidden_size,
-            patch_size,
-            self.out_channels,
-            dtype=policy.compute_dtype
+        self._register_buffer(
+            "pos_embed",
+            tf.convert_to_tensor(pos_embed, dtype=self._compute_dtype)[None, ...],
+            persistent=True
         )
         
+        # Final layer and transformer
+        self.final_layer = FinalLayer(
+            hidden_size, patch_size, self.out_channels,
+            dtype=self._compute_dtype
+        )
         self.transformer = Phi3Transformer(
-            transformer_config,
-            dtype=policy.compute_dtype
+            config=transformer_config,
+            dtype=self._compute_dtype
         )
         
         self.initialize_weights()
         
-    def _clear_memory(self):
-        """Clear model memory and caches."""
-        if hasattr(self, '_cache'):
-            del self._cache
-        if hasattr(self, '_active_layer'):
-            del self._active_layer
-            
-        # Clear transformer cache
-        if hasattr(self.transformer, 'cache'):
-            self.transformer.cache.clear()
-            
-        # Force garbage collection
-        import gc
-        gc.collect()
+    def _register_buffer(self, name, tensor, persistent=False):
+        """Register a persistent buffer similar to PyTorch."""
+        if persistent:
+            self._persistent_buffers[name] = tensor
+        setattr(self, name, tensor)
         
-        # Clear GPU memory if available
+    def _move_to_cpu(self):
+        """Move model weights to CPU."""
+        if not self._is_on_cpu:
+            self._cached_weights = {}
+            for var in self.trainable_variables:
+                self._cached_weights[var.name] = var.numpy()
+                with tf.device('/CPU:0'):
+                    var.assign(tf.identity(var))
+            self._is_on_cpu = True
+            
+    def _move_to_gpu(self):
+        """Move model weights back to GPU."""
+        if self._is_on_cpu and tf.config.list_physical_devices('GPU'):
+            for var in self.trainable_variables:
+                if var.name in self._cached_weights:
+                    with tf.device('/GPU:0'):
+                        var.assign(tf.identity(self._cached_weights[var.name]))
+            self._cached_weights = {}
+            self._is_on_cpu = False
+            
+    def _clear_memory(self):
+        """Clear GPU memory."""
         if tf.config.list_physical_devices('GPU'):
             tf.keras.backend.clear_session()
             
-    def enable_cpu_offload(self):
-        """Move model to CPU to save memory."""
-        if not self._model_on_cpu:
-            self._model_on_cpu = True
+    @tf.function(jit_compile=True)
+    def call(self, x, timestep, input_ids=None, input_img_latents=None,
+             input_image_sizes=None, attention_mask=None, position_ids=None,
+             training=False):
+        """Forward pass with memory optimizations."""
+        try:
+            # Process in smaller batches
+            batch_size = x.shape[0]
+            max_batch_size = 4  # Adjust based on memory
             
-            # Move model weights to CPU
-            with tf.device('/CPU:0'):
-                for layer in self.layers:
-                    for weight in layer.weights:
-                        weight.assign(tf.identity(weight))
-                        
-            # Enable transformer CPU offload
-            self.transformer._model_on_cpu = True
+            outputs = []
+            for i in range(0, batch_size, max_batch_size):
+                end_idx = min(i + max_batch_size, batch_size)
+                
+                # Get batch slice
+                x_batch = x[i:end_idx]
+                timestep_batch = timestep[i:end_idx]
+                
+                # Process embeddings
+                t_emb = self.t_embedder(timestep_batch)
+                
+                # Process latents
+                latents = self.x_embedder(x_batch)
+                height, width = x_batch.shape[2:4]
+                pos_embed = self.cropped_pos_embed(height, width)
+                latents = latents + pos_embed
+                
+                # Process input images
+                if input_img_latents is not None:
+                    img_latents = input_img_latents[i:end_idx]
+                    input_latents = self.input_x_embedder(img_latents)
+                    input_latents = input_latents + pos_embed
+                else:
+                    input_latents = None
+                    
+                # Run transformer
+                hidden_states = self.transformer(
+                    input_ids=input_ids[i:end_idx] if input_ids is not None else None,
+                    attention_mask=attention_mask[i:end_idx] if attention_mask is not None else None,
+                    position_ids=position_ids[i:end_idx] if position_ids is not None else None,
+                    inputs_embeds=latents,
+                    input_image_embeds=input_latents,
+                    t_emb=t_emb,
+                    training=training
+                )
+                
+                # Process output
+                output = self.final_layer(hidden_states, t_emb)
+                output = self.unpatchify(output, height, width)
+                outputs.append(output)
+                
+                # Clear memory after each batch
+                if i + max_batch_size < batch_size:
+                    self._clear_memory()
+                    
+            # Combine outputs
+            return tf.concat(outputs, axis=0)
             
-    def disable_cpu_offload(self):
-        """Move model back to GPU."""
-        if self._model_on_cpu:
-            self._model_on_cpu = False
-            
-            # Move weights back to GPU if available
-            if tf.config.list_physical_devices('GPU'):
-                with tf.device('/GPU:0'):
-                    for layer in self.layers:
-                        for weight in layer.weights:
-                            weight.assign(tf.identity(weight))
-                            
-            # Disable transformer CPU offload
-            self.transformer._model_on_cpu = False
+        finally:
+            # Ensure memory is cleared
+            self._clear_memory()
             
     def initialize_weights(self):
         """Initialize model weights."""
@@ -581,115 +621,3 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
             shapes_list.append((h, w))
         
         return x_list, num_tokens_list, shapes_list
-
-    @tf.function(jit_compile=True)
-    def _process_batch(self, x, timestep, input_ids, input_img_latents,
-                      input_image_sizes, attention_mask, position_ids):
-        """Process a single batch with XLA optimization."""
-        # Get embeddings
-        t_emb = self.t_embedder(timestep)
-        
-        # Process latents
-        latents, pos_embed = self.patch_multiple_resolutions(
-            [x], is_input_images=False
-        )
-        
-        # Process input images if provided
-        if input_img_latents is not None:
-            input_latents, input_pos_embed = self.patch_multiple_resolutions(
-                input_img_latents, is_input_images=True
-            )
-        else:
-            input_latents = []
-            input_pos_embed = []
-            
-        # Run transformer
-        hidden_states = self.transformer(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            inputs_embeds=latents,
-            pos_embeds=pos_embed,
-            input_image_embeds=input_latents,
-            input_image_pos_embeds=input_pos_embed,
-            t_emb=t_emb,
-        )
-        
-        # Process output
-        output = self.final_layer(hidden_states, t_emb)
-        output = self.unpatchify(output, x.shape[1], x.shape[2])
-        
-        return output
-        
-    def call(self, x, timestep, input_ids, input_img_latents, input_image_sizes,
-            attention_mask, position_ids, padding_latent=None, past_key_values=None,
-            return_past_key_values=True, offload_model=False, training=False):
-        """Forward pass with memory and performance optimizations."""
-        try:
-            # Enable CPU offload if requested
-            if offload_model:
-                self.enable_cpu_offload()
-                
-            # Clear any existing caches
-            if past_key_values is None:
-                self._clear_memory()
-                
-            # Process in smaller batches to save memory
-            batch_size = x.shape[0]
-            max_batch_size = 4  # Adjust based on available memory
-            
-            outputs = []
-            for i in range(0, batch_size, max_batch_size):
-                end_idx = min(i + max_batch_size, batch_size)
-                
-                # Get batch slice
-                x_batch = x[i:end_idx]
-                timestep_batch = timestep[i:end_idx]
-                input_ids_batch = input_ids[i:end_idx] if input_ids is not None else None
-                input_img_latents_batch = input_img_latents[i:end_idx] if input_img_latents is not None else None
-                attention_mask_batch = attention_mask[i:end_idx] if attention_mask is not None else None
-                position_ids_batch = position_ids[i:end_idx] if position_ids is not None else None
-                
-                # Process batch with XLA optimization
-                output_batch = self._process_batch(
-                    x_batch, timestep_batch, input_ids_batch,
-                    input_img_latents_batch, input_image_sizes,
-                    attention_mask_batch, position_ids_batch
-                )
-                
-                outputs.append(output_batch)
-                
-                # Force memory cleanup after each batch
-                tf.keras.backend.clear_session()
-                
-            # Combine outputs
-            output = tf.concat(outputs, axis=0)
-            
-            return output
-            
-        finally:
-            # Always disable CPU offload
-            if offload_model:
-                self.disable_cpu_offload()
-                
-    @tf.function(jit_compile=True)
-    def forward_with_cfg(self, x, timestep, input_ids, input_img_latents,
-                        input_image_sizes, attention_mask, position_ids,
-                        cfg_scale, use_img_cfg, img_cfg_scale):
-        """Apply classifier-free guidance with XLA optimization."""
-        # Process with conditions
-        cond_out = self.call(
-            x, timestep, input_ids, input_img_latents,
-            input_image_sizes, attention_mask, position_ids
-        )
-        
-        # Process without conditions
-        uncond_out = self.call(
-            x, timestep, None, None,
-            input_image_sizes, attention_mask, position_ids
-        )
-        
-        # Apply guidance
-        output = uncond_out + cfg_scale * (cond_out - uncond_out)
-        
-        return output
