@@ -8,6 +8,7 @@ from .model import OmniGen
 from .processor import OmniGenProcessor
 from .scheduler import OmniGenScheduler
 from .pipeline import OmniGenPipeline
+from .utils import *  # Import all utility functions
 
 # TensorFlow-specific components
 from .transformer import Phi3Config, Phi3Transformer
@@ -19,7 +20,7 @@ __all__ = [
     "OmniGenProcessor",
     "OmniGenScheduler",
     "OmniGenPipeline",
-    # TensorFlow-specific
+    # TensorFlow-specific components
     "Phi3Config",
     "Phi3Transformer",
     "WeightConverter",
