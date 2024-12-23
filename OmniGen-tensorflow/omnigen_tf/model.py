@@ -42,12 +42,12 @@ class TimestepEmbedder(Model):
     This module creates sinusoidal embeddings for the diffusion timesteps,
     similar to positional embeddings in transformers but for temporal positions.
     """
-    def __init__(self, hidden_size, frequency_embedding_size=256):
+    def __init__(self, hidden_size, frequency_embedding_size=256, dtype=tf.float32):
         super().__init__()
         self.mlp = tf.keras.Sequential([
-            layers.Dense(hidden_size, use_bias=True),
-            layers.Activation('silu'),  # Using silu to match PyTorch's SiLU
-            layers.Dense(hidden_size, use_bias=True)
+            layers.Dense(hidden_size, use_bias=True, dtype=dtype),
+            layers.Activation('silu', dtype=dtype),  # Using silu to match PyTorch's SiLU
+            layers.Dense(hidden_size, use_bias=True, dtype=dtype)
         ])
         self.frequency_embedding_size = frequency_embedding_size
 
@@ -213,14 +213,15 @@ class PatchEmbedMR(layers.Layer):
         embed_dim: Dimension of the patch embeddings
         bias: Whether to include bias in the projection
     """
-    def __init__(self, patch_size=2, in_chans=4, embed_dim=768, bias=True):
+    def __init__(self, patch_size=2, in_chans=4, embed_dim=768, bias=True, dtype=tf.float32):
         super().__init__()
         self.proj = layers.Conv2D(
             embed_dim,
             kernel_size=patch_size,
             strides=patch_size,
             use_bias=bias,
-            name='patch_embed'
+            name='patch_embed',
+            dtype=dtype
         )
 
     def call(self, x):
@@ -267,7 +268,7 @@ class OmniGen(tf.keras.Model):
         pe_interpolation: Interpolation scale for positional embeddings (must be float)
         pos_embed_max_size: Maximum size for positional embeddings
         device: Device to place model on ('CPU', 'GPU', or None for auto-detect)
-        mixed_precision: Whether to use mixed precision training
+        dtype: Data type for model weights and computations
     """
     def __init__(
         self,
@@ -277,7 +278,7 @@ class OmniGen(tf.keras.Model):
         pe_interpolation: float = 1.0,
         pos_embed_max_size: int = 192,
         device=None,
-        mixed_precision=True,
+        dtype=tf.bfloat16,
     ):
         """Initialize OmniGen model.
         
@@ -288,50 +289,54 @@ class OmniGen(tf.keras.Model):
             pe_interpolation: Interpolation scale for positional embeddings (must be float)
             pos_embed_max_size: Maximum size for positional embeddings
             device: Device to place model on ('CPU', 'GPU', or None for auto-detect)
-            mixed_precision: Whether to use mixed precision training
+            dtype: Data type for model weights and computations
         """
         super().__init__()
         
-        # Set up device strategy
+        # Set up device and dtype strategy
         if device is None:
             if len(tf.config.list_physical_devices('GPU')) > 0:
                 device = 'GPU'
+                print("Using GPU for inference")
+                # Enable mixed precision
+                tf.keras.mixed_precision.set_global_policy('mixed_float16')
             else:
-                print("No GPU detected, using CPU. This may be slow!")
                 device = 'CPU'
+                print("No GPU detected, using CPU. This may be slow!")
                 
         self.device = device
+        self.dtype = dtype
         
-        # Enable mixed precision if requested and on GPU
-        if mixed_precision and device == 'GPU':
-            policy = tf.keras.mixed_precision.Policy('mixed_float16')
-            tf.keras.mixed_precision.set_global_policy(policy)
-            print("Using mixed precision")
-            
-        # Save configuration
-        self.config = transformer_config
-        self.patch_size = patch_size
-        self.in_channels = in_channels
-        self.out_channels = in_channels
-        self.pos_embed_max_size = pos_embed_max_size
+        # Initialize memory optimization flags
+        self.use_kv_cache = True
+        self.offload_kv_cache = True
+        self.kv_cache = None
+        self.cpu_offload = False
         
-        # Ensure pe_interpolation is float
-        if not isinstance(pe_interpolation, (int, float)):
-            print(f"Warning: pe_interpolation should be float, got {type(pe_interpolation)}. Using default value 1.0")
-            self.pe_interpolation = 1.0
-        else:
-            self.pe_interpolation = float(pe_interpolation)
-            
         with tf.device(f'/{device}:0'):
-            # Initialize embedders
+            # Save configuration
+            self.config = transformer_config
+            self.patch_size = patch_size
+            self.in_channels = in_channels
+            self.out_channels = in_channels
+            self.pos_embed_max_size = pos_embed_max_size
+            
+            # Ensure pe_interpolation is float
+            if not isinstance(pe_interpolation, (int, float)):
+                print(f"Warning: pe_interpolation should be float, got {type(pe_interpolation)}. Using default value 1.0")
+                self.pe_interpolation = 1.0
+            else:
+                self.pe_interpolation = float(pe_interpolation)
+            
+            # Initialize embedders with proper dtype
             print("Creating embedders...")
-            self.x_embedder = PatchEmbedMR(patch_size, in_channels, self.config.hidden_size, bias=True)
-            self.input_x_embedder = PatchEmbedMR(patch_size, in_channels, self.config.hidden_size, bias=True)
+            self.x_embedder = PatchEmbedMR(patch_size, in_channels, self.config.hidden_size, bias=True, dtype=dtype)
+            self.input_x_embedder = PatchEmbedMR(patch_size, in_channels, self.config.hidden_size, bias=True, dtype=dtype)
             
             # Initialize time embedders
             print("Creating time embedders...")
-            self.time_token = TimestepEmbedder(self.config.hidden_size)
-            self.t_embedder = TimestepEmbedder(self.config.hidden_size)
+            self.time_token = TimestepEmbedder(self.config.hidden_size, dtype=dtype)
+            self.t_embedder = TimestepEmbedder(self.config.hidden_size, dtype=dtype)
             
             try:
                 # Initialize transformer (LLM)
@@ -354,7 +359,7 @@ class OmniGen(tf.keras.Model):
                 interpolation_scale=self.pe_interpolation,
                 base_size=64
             )
-            self.pos_embed = tf.Variable(pos_embed[None], trainable=False)
+            self.pos_embed = tf.Variable(pos_embed[None], trainable=False, dtype=dtype)
             print("Positional embeddings created")
             
             # Initialize final layer
@@ -362,9 +367,59 @@ class OmniGen(tf.keras.Model):
             self.final_layer = FinalLayer(self.config.hidden_size, patch_size, self.out_channels)
             print("Final layer created")
             
-        # Set model to eval mode (equivalent to PyTorch's model.eval())
+        # Set model to eval mode
         self.trainable = False
         
+    @tf.function(reduce_retracing=True)
+    def call(self, *args, training=False, **kwargs):
+        """Memory-efficient forward pass with KV caching."""
+        try:
+            # Use KV cache if enabled
+            if self.use_kv_cache and not training:
+                if self.kv_cache is not None:
+                    kwargs['past_key_values'] = self.kv_cache
+                    
+                # Run forward pass
+                outputs = super().call(*args, training=False, **kwargs)
+                
+                # Update KV cache
+                if self.offload_kv_cache:
+                    with tf.device('/CPU:0'):
+                        self.kv_cache = outputs.past_key_values
+                else:
+                    self.kv_cache = outputs.past_key_values
+                    
+                return outputs
+                
+            else:
+                return super().call(*args, training=training, **kwargs)
+                
+        except Exception as e:
+            print(f"Error in forward pass: {str(e)}")
+            raise
+            
+    def enable_cpu_offload(self):
+        """Enable CPU offloading for memory savings."""
+        self.cpu_offload = True
+        with tf.device('/CPU:0'):
+            for layer in self.layers:
+                layer = tf.identity(layer)
+        tf.keras.backend.clear_session()
+        gc.collect()
+        
+    def disable_cpu_offload(self):
+        """Disable CPU offloading."""
+        self.cpu_offload = False
+        with tf.device(f'/{self.device}:0'):
+            for layer in self.layers:
+                layer = tf.identity(layer)
+                
+    def clear_memory(self):
+        """Clear cached tensors and memory."""
+        self.kv_cache = None
+        tf.keras.backend.clear_session()
+        gc.collect()
+
     def memory_efficient_forward(self, *args, **kwargs):
         """Memory efficient forward pass that cleans up GPU memory."""
         try:

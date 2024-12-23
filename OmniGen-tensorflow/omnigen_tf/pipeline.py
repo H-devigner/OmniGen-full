@@ -128,7 +128,7 @@ class OmniGenPipeline:
         height: int = 1024,
         width: int = 1024,
         num_inference_steps: int = 50,
-        guidance_scale: float = 3.0,
+        guidance_scale: float = 3,
         use_img_guidance: bool = True,
         img_guidance_scale: float = 1.6,
         max_input_image_size: int = 1024,
@@ -137,63 +137,46 @@ class OmniGenPipeline:
         use_kv_cache: bool = True,
         offload_kv_cache: bool = True,
         use_input_image_size_as_output: bool = False,
-        dtype: tf.dtypes.DType = tf.float32,
+        dtype=tf.bfloat16,
         seed: int = None,
         output_type: str = "pil",
-    ) -> Dict[str, Any]:
-        """Generate images from text prompt.
-        
-        Args:
-            prompt: Text prompt(s)
-            input_images: Optional input image paths
-            height: Output height
-            width: Output width
-            num_inference_steps: Number of denoising steps
-            guidance_scale: Classifier-free guidance scale
-            use_img_guidance: Whether to use image guidance
-            img_guidance_scale: Image guidance scale
-            max_input_image_size: Maximum input image size
-            separate_cfg_infer: Whether to do separate inference for different guidance
-            offload_model: Whether to offload model to CPU
-            use_kv_cache: Whether to use key-value cache
-            offload_kv_cache: Whether to offload cache to CPU
-            use_input_image_size_as_output: Whether to use input size as output
-            dtype: Data type
-            seed: Random seed
-            output_type: Output type ("pil" or "tensor")
-            
-        Returns:
-            Dictionary with generated images
-        """
+    ):
+        """Run pipeline with memory optimizations."""
         try:
+            # Set random seed if provided
+            if seed is not None:
+                tf.random.set_seed(seed)
+
+            # Enable CPU offloading if requested
+            if offload_model:
+                self.model.enable_cpu_offload()
+
+            # Configure KV cache
+            self.model.use_kv_cache = use_kv_cache
+            self.model.offload_kv_cache = offload_kv_cache
+
+            # Process inputs
+            if not isinstance(prompt, list):
+                prompt = [prompt]
+            batch_size = len(prompt)
+
             # Clear any existing cached tensors
             tf.keras.backend.clear_session()
             gc.collect()
-            
+
             with tf.device(f'/{self.device}:0'):
-                # Set random seed if provided
-                if seed is not None:
-                    tf.random.set_seed(seed)
-
-                # Enable CPU offloading if requested
-                if offload_model:
-                    self.enable_model_cpu_offload()
-
-                # Process inputs
-                if not isinstance(prompt, list):
-                    prompt = [prompt]
-                
-                batch_size = len(prompt)
-
                 # Process text and images
                 model_inputs = self.processor(
-                    prompt, 
+                    prompt,
                     input_images=input_images,
                     max_input_image_size=max_input_image_size
                 )
 
-                # Move inputs to device
-                model_inputs = {k: self.move_to_device(v) for k, v in model_inputs.items()}
+                # Move inputs to device and cast to dtype
+                model_inputs = {
+                    k: tf.cast(self.move_to_device(v), dtype)
+                    for k, v in model_inputs.items()
+                }
 
                 # Initialize latents
                 latents = tf.random.normal(
@@ -204,19 +187,35 @@ class OmniGenPipeline:
                 # Setup scheduler
                 scheduler = OmniGenScheduler(num_inference_steps)
 
-                # Run inference
-                images = self.model.generate(
-                    latents,
-                    model_inputs,
-                    scheduler,
-                    guidance_scale=guidance_scale,
-                    use_img_guidance=use_img_guidance,
-                    img_guidance_scale=img_guidance_scale,
-                    separate_cfg_infer=separate_cfg_infer,
-                    use_kv_cache=use_kv_cache,
-                    offload_kv_cache=offload_kv_cache,
-                    dtype=dtype
-                )
+                if separate_cfg_infer:
+                    # Run inference separately for each guidance to save memory
+                    outputs = []
+                    for i in range(batch_size):
+                        batch_output = self.model.memory_efficient_forward(
+                            latents[i:i+1],
+                            model_inputs={k: v[i:i+1] for k, v in model_inputs.items()},
+                            scheduler=scheduler,
+                            guidance_scale=guidance_scale,
+                            use_img_guidance=use_img_guidance,
+                            img_guidance_scale=img_guidance_scale,
+                            dtype=dtype
+                        )
+                        outputs.append(batch_output)
+                        # Clear cache after each batch
+                        self.model.clear_memory()
+                    
+                    images = tf.concat(outputs, axis=0)
+                else:
+                    # Run inference on full batch
+                    images = self.model.memory_efficient_forward(
+                        latents,
+                        model_inputs=model_inputs,
+                        scheduler=scheduler,
+                        guidance_scale=guidance_scale,
+                        use_img_guidance=use_img_guidance,
+                        img_guidance_scale=img_guidance_scale,
+                        dtype=dtype
+                    )
 
                 # Decode images
                 images = self.vae.decode(images / self.vae.config.scaling_factor).sample
@@ -230,14 +229,15 @@ class OmniGenPipeline:
 
             # Cleanup
             if offload_model:
-                self.disable_model_cpu_offload()
+                self.model.disable_cpu_offload()
 
-            # Clean up after inference
+            # Clear cache
+            self.model.clear_memory()
             tf.keras.backend.clear_session()
             gc.collect()
-            
+
             return {"images": images}
-            
+
         except Exception as e:
             print(f"Error in pipeline: {str(e)}")
             raise
