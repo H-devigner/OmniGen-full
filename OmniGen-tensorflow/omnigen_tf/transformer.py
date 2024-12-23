@@ -257,11 +257,11 @@ class Phi3Transformer(tf.keras.Model):
                     layer.bias.assign(tf.zeros_like(layer.bias))
                     
             elif isinstance(layer, tf.keras.layers.LayerNormalization):
-                # Initialize gamma to ones and beta to zeros
-                if layer.gamma is not None:
-                    layer.gamma.assign(tf.ones_like(layer.gamma))
-                if layer.beta is not None:
-                    layer.beta.assign(tf.zeros_like(layer.beta))
+                # Initialize scale (gamma) to ones and offset (beta) to zeros
+                if hasattr(layer, 'scale') and layer.scale is not None:
+                    layer.scale.assign(tf.ones_like(layer.scale))
+                if hasattr(layer, 'offset') and layer.offset is not None:
+                    layer.offset.assign(tf.zeros_like(layer.offset))
                     
             elif isinstance(layer, tf.keras.layers.Embedding):
                 # Initialize embeddings with truncated normal
