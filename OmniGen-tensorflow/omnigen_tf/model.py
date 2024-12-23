@@ -269,8 +269,6 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         pe_interpolation: Interpolation scale for positional embeddings (must be float)
         pos_embed_max_size: Maximum size for positional embeddings
         device: Device to place model on ('CPU', 'GPU', or None for auto-detect)
-        compute_dtype: Data type for computations (e.g. tf.float32, tf.bfloat16)
-        mixed_precision: Whether to use mixed precision training
     """
     def __init__(
         self,
@@ -280,217 +278,200 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         pe_interpolation: float = 1.0,
         pos_embed_max_size: int = 192,
         device=None,
-        compute_dtype=tf.bfloat16,
-        mixed_precision: bool = True,
     ):
         tf.keras.Model.__init__(self)
         PeftAdapterMixin.__init__(self)
         
-        # Store configuration
-        self._compute_dtype = compute_dtype
-        self._device = None
+        # Basic configuration
         self.patch_size = patch_size
         self.in_channels = in_channels
         self.out_channels = in_channels
         self.pos_embed_max_size = pos_embed_max_size
         self.pe_interpolation = pe_interpolation
         
-        # Set up device and dtype strategy
-        if device is None:
-            if len(tf.config.list_physical_devices('GPU')) > 0:
-                device = 'GPU'
-                print("Using GPU for inference")
-                
-                # Enable mixed precision if requested and on GPU
-                if mixed_precision:
-                    policy = tf.keras.mixed_precision.Policy('mixed_float16')
-                    tf.keras.mixed_precision.set_global_policy(policy)
-                    print("Enabled mixed precision training")
-            else:
-                device = 'CPU'
-                print("No GPU found, using CPU for inference")
-                
-                # Disable mixed precision on CPU
-                if mixed_precision:
-                    print("Mixed precision disabled on CPU")
-                    mixed_precision = False
-                    
-        self._device = device
-
-        # Initialize memory optimization flags
-        self.use_kv_cache = True
-        self.offload_kv_cache = True
-        self.model_cpu_offload = False
+        # Memory management flags
+        self._model_on_cpu = False
+        self._cache_on_cpu = False
         self._kv_cache = None
+        self._active_layer = None
         
-        # Build model components with proper device placement
-        with tf.device(f'/{self._device}:0'):
-            # Create embedders
-            self.x_embedder = PatchEmbedMR(
-                patch_size, in_channels, transformer_config.hidden_size,
-                dtype=self._compute_dtype
-            )
-            self.input_x_embedder = PatchEmbedMR(
-                patch_size, in_channels, transformer_config.hidden_size,
-                dtype=self._compute_dtype
-            )
+        # Set compute dtype
+        self._compute_dtype = tf.float32
+        if tf.config.list_physical_devices('GPU'):
+            self._compute_dtype = tf.float16
             
-            # Create time embedders
-            self.time_token = TimestepEmbedder(
-                transformer_config.hidden_size,
-                dtype=self._compute_dtype
-            )
-            self.t_embedder = TimestepEmbedder(
-                transformer_config.hidden_size,
-                dtype=self._compute_dtype
-            )
-            
-            # Create positional embeddings
-            pos_embed = get_2d_sincos_pos_embed(
-                transformer_config.hidden_size,
-                pos_embed_max_size,
-                interpolation_scale=self.pe_interpolation,
-                base_size=64
-            )
-            self.pos_embed = tf.constant(pos_embed, dtype=self._compute_dtype)
-            
-            # Create final layer
-            self.final_layer = FinalLayer(
-                transformer_config.hidden_size,
-                patch_size,
-                self.out_channels,
-                dtype=self._compute_dtype
-            )
-            
-            # Create transformer
-            self.transformer = Phi3Transformer(
-                transformer_config,
-                dtype=self._compute_dtype
-            )
-            # Disable cache by default for memory efficiency
-            self.transformer.config.use_cache = False
-            
-        self.initialize_weights()
-
-    def enable_cpu_offload(self):
-        """Enable CPU offloading for memory savings."""
-        self.model_cpu_offload = True
-        print("Moving model layers to CPU...")
+        # Create model components
+        self.x_embedder = PatchEmbedMR(
+            patch_size, in_channels, transformer_config.hidden_size,
+            dtype=self._compute_dtype
+        )
+        self.input_x_embedder = PatchEmbedMR(
+            patch_size, in_channels, transformer_config.hidden_size,
+            dtype=self._compute_dtype
+        )
         
-        # Use tf.device context to ensure proper placement
-        with tf.device('/CPU:0'):
-            # Move transformer layers to CPU by forcing a copy
-            for layer in self.transformer.layers:
-                layer.set_weights([tf.identity(w).numpy() for w in layer.weights])
-                
-            # Move embedders to CPU
-            self.x_embedder.set_weights([tf.identity(w).numpy() for w in self.x_embedder.weights])
-            self.input_x_embedder.set_weights([tf.identity(w).numpy() for w in self.input_x_embedder.weights])
-            
-            # Move other components
-            self.time_token.set_weights([tf.identity(w).numpy() for w in self.time_token.weights])
-            self.t_embedder.set_weights([tf.identity(w).numpy() for w in self.t_embedder.weights])
-            self.final_layer.set_weights([tf.identity(w).numpy() for w in self.final_layer.weights])
-            
-        # Clear GPU memory
-        tf.keras.backend.clear_session()
-        print("Model layers moved to CPU")
-
-    def disable_cpu_offload(self):
-        """Disable CPU offloading."""
-        self.model_cpu_offload = False
-        print("Moving model layers back to GPU...")
+        self.time_token = TimestepEmbedder(
+            transformer_config.hidden_size,
+            dtype=self._compute_dtype
+        )
+        self.t_embedder = TimestepEmbedder(
+            transformer_config.hidden_size,
+            dtype=self._compute_dtype
+        )
         
-        # Use tf.device context to ensure proper placement
-        with tf.device(f'/{self._device}:0'):
-            # Move transformer layers back to GPU
-            for layer in self.transformer.layers:
-                layer.set_weights([tf.identity(w) for w in layer.weights])
-                
-            # Move embedders back to GPU
-            self.x_embedder.set_weights([tf.identity(w) for w in self.x_embedder.weights])
-            self.input_x_embedder.set_weights([tf.identity(w) for w in self.input_x_embedder.weights])
-            
-            # Move other components
-            self.time_token.set_weights([tf.identity(w) for w in self.time_token.weights])
-            self.t_embedder.set_weights([tf.identity(w) for w in self.t_embedder.weights])
-            self.final_layer.set_weights([tf.identity(w) for w in self.final_layer.weights])
-            
-        print("Model layers moved back to GPU")
-
-    def enable_kv_cache(self):
-        """Enable key-value caching for faster inference."""
-        self.use_kv_cache = True
-        self.transformer.config.use_cache = True
-        print("Key-value caching enabled")
-
-    def disable_kv_cache(self):
-        """Disable key-value caching."""
-        self.use_kv_cache = False
+        # Create positional embeddings
+        pos_embed = get_2d_sincos_pos_embed(
+            transformer_config.hidden_size,
+            pos_embed_max_size,
+            interpolation_scale=self.pe_interpolation,
+            base_size=64
+        )
+        self.pos_embed = tf.constant(pos_embed, dtype=self._compute_dtype)
+        
+        self.final_layer = FinalLayer(
+            transformer_config.hidden_size,
+            patch_size,
+            self.out_channels,
+            dtype=self._compute_dtype
+        )
+        
+        self.transformer = Phi3Transformer(
+            transformer_config,
+            dtype=self._compute_dtype
+        )
         self.transformer.config.use_cache = False
-        self._kv_cache = None
-        print("Key-value caching disabled")
-
-    def clear_kv_cache(self):
-        """Clear the key-value cache."""
-        self._kv_cache = None
-        tf.keras.backend.clear_session()
-        print("Key-value cache cleared")
-
-    def offload_kv_cache_to_cpu(self):
-        """Move key-value cache to CPU to save GPU memory."""
-        if self._kv_cache is not None:
-            print("Moving KV cache to CPU...")
+        
+        self.initialize_weights()
+        
+    def enable_cpu_offload(self):
+        """Move model to CPU to save memory."""
+        if not self._model_on_cpu:
+            # Save weights to temporary files
+            self.save_weights('temp_weights')
+            
+            # Clear GPU memory
+            self._clear_model_memory()
+            
+            # Load weights on CPU
             with tf.device('/CPU:0'):
-                # Convert tensors to numpy and store on CPU
-                self._kv_cache = [tf.identity(k).numpy() for k in self._kv_cache]
-            print("KV cache moved to CPU")
-
-    def load_kv_cache_to_gpu(self):
-        """Move key-value cache back to GPU."""
-        if self._kv_cache is not None:
-            print("Moving KV cache to GPU...")
-            with tf.device(f'/{self._device}:0'):
-                # Convert numpy arrays back to tensors on GPU
-                self._kv_cache = [tf.convert_to_tensor(k, dtype=self._compute_dtype) for k in self._kv_cache]
-            print("KV cache moved to GPU")
-
-    @tf.function(reduce_retracing=True)
-    def call(self, *args, training=False, **kwargs):
-        """Memory-efficient forward pass with KV caching."""
-        # Handle CPU offloading
-        if self.model_cpu_offload:
-            self.enable_cpu_offload()
+                self.load_weights('temp_weights')
             
-        # Clear session to free memory
-        if not training and not self.use_kv_cache:
-            tf.keras.backend.clear_session()
+            self._model_on_cpu = True
             
-        try:
-            # Move KV cache to GPU if needed
-            if self.use_kv_cache and self._kv_cache is not None:
-                self.load_kv_cache_to_gpu()
+            # Clean up temp files
+            if os.path.exists('temp_weights.index'):
+                os.remove('temp_weights.index')
                 
-            # Forward pass
-            outputs = super().call(*args, training=training, **kwargs)
+    def disable_cpu_offload(self):
+        """Move model back to GPU."""
+        if self._model_on_cpu:
+            # Move weights back to GPU
+            if tf.config.list_physical_devices('GPU'):
+                with tf.device('/GPU:0'):
+                    self.save_weights('temp_weights')
+                    self._clear_model_memory()
+                    self.load_weights('temp_weights')
             
-            # Update and offload KV cache if needed
-            if self.use_kv_cache and self.offload_kv_cache:
-                if isinstance(outputs, tuple) and len(outputs) > 1:
-                    self._kv_cache = outputs[1]
-                    self.offload_kv_cache_to_cpu()
-                    
-            return outputs
+            self._model_on_cpu = False
+            
+            # Clean up temp files
+            if os.path.exists('temp_weights.index'):
+                os.remove('temp_weights.index')
+                
+    def _clear_model_memory(self):
+        """Clear model memory and caches."""
+        tf.keras.backend.clear_session()
+        self._kv_cache = None
+        self._active_layer = None
+        gc.collect()
+        
+    def _move_to_device(self, tensor, device=None):
+        """Move tensor to specified device."""
+        if device is None:
+            device = '/CPU:0' if self._model_on_cpu else '/GPU:0'
+        
+        with tf.device(device):
+            return tf.identity(tensor)
+            
+    def _ensure_sync(self):
+        """Ensure operations are synchronized."""
+        if tf.config.list_physical_devices('GPU'):
+            tf.keras.backend.get_session().run(tf.keras.backend.get_session().graph.get_operations())
+            
+    @tf.function(reduce_retracing=True)
+    def call(self, x, timestep, input_ids, input_img_latents, input_image_sizes,
+             attention_mask, position_ids, padding_latent=None, past_key_values=None,
+             return_past_key_values=True, offload_model=False, training=False):
+        """Forward pass with memory optimizations."""
+        try:
+            if offload_model:
+                self.enable_cpu_offload()
+                
+            # Process inputs
+            x, num_tokens, shapes = self.patch_multiple_resolutions(x, padding_latent)
+            time_token = self.time_token(timestep, dtype=x.dtype)
+            time_token = tf.expand_dims(time_token, axis=1)
+            
+            # Process conditional inputs
+            if input_img_latents is not None:
+                input_latents, _, _ = self.patch_multiple_resolutions(
+                    input_img_latents, is_input_images=True
+                )
+                
+            if input_ids is not None:
+                condition_embeds = self.transformer.embed_tokens(input_ids)
+                input_img_idx = 0
+                
+                for b_idx in input_image_sizes.keys():
+                    for start_idx, end_idx in input_image_sizes[b_idx]:
+                        condition_embeds = tf.tensor_scatter_nd_update(
+                            condition_embeds,
+                            [[b_idx, i] for i in range(start_idx, end_idx)],
+                            input_latents[input_img_idx]
+                        )
+                        input_img_idx += 1
+                        
+                input_emb = tf.concat([condition_embeds, time_token, x], axis=1)
+            else:
+                input_emb = tf.concat([time_token, x], axis=1)
+                
+            # Run transformer with memory management
+            output = self.transformer(
+                inputs_embeds=input_emb,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                offload_model=offload_model
+            )
+            
+            # Process output
+            output, past_key_values = output.last_hidden_state, output.past_key_values
+            
+            if isinstance(x, list):
+                image_embedding = output[:, -tf.reduce_max(num_tokens):]
+                time_emb = self.t_embedder(timestep, dtype=x.dtype)
+                x = self.final_layer(image_embedding, time_emb)
+                
+                latents = []
+                for i in range(x.shape[0]):
+                    latent = x[i:i+1, :num_tokens[i]]
+                    latent = self.unpatchify(latent, shapes[i][0], shapes[i][1])
+                    latents.append(latent)
+            else:
+                image_embedding = output[:, -num_tokens:]
+                time_emb = self.t_embedder(timestep, dtype=x.dtype)
+                x = self.final_layer(image_embedding, time_emb)
+                latents = self.unpatchify(x, shapes[0], shapes[1])
+                
+            if return_past_key_values:
+                return latents, past_key_values
+            return latents
             
         finally:
-            # Always move back to GPU if needed
-            if self.model_cpu_offload:
+            if offload_model:
                 self.disable_cpu_offload()
+                self._clear_model_memory()
                 
-            # Clear any temporary tensors
-            if not training:
-                tf.keras.backend.clear_session()
-
     def initialize_weights(self):
         """Initialize model weights."""
         # Helper function to initialize a single layer
@@ -670,6 +651,8 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         # Process each resolution
         x_list = []
         pos_embed_list = []
+        num_tokens_list = []
+        shapes_list = []
         
         for idx, x in enumerate(latents):
             h, w = tf.shape(x)[1], tf.shape(x)[2]
@@ -683,12 +666,14 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
             
             x_list.append(x_embed)
             pos_embed_list.append(pos_embed)
+            num_tokens_list.append(tf.shape(x_embed)[1])
+            shapes_list.append((h, w))
         
-        return x_list, pos_embed_list
+        return x_list, num_tokens_list, shapes_list
 
     def call(self, x, timestep, input_ids, input_img_latents, input_image_sizes,
             attention_mask, position_ids, padding_latent=None, past_key_values=None,
-            return_past_key_values=True, offload_model=False):
+            return_past_key_values=True, offload_model=False, training=False):
         """Forward pass of the model.
         
         This is the main method that processes inputs through the entire model pipeline:
@@ -714,7 +699,7 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
             Model output (image or list of images) and optionally past_key_values
         """
         # Process input latents
-        x_list, pos_embed_list = self.patch_multiple_resolutions(
+        x_list, num_tokens, shapes = self.patch_multiple_resolutions(
             [x] if not isinstance(x, (list, tuple)) else x,
             padding_latent,
             is_input_images=False
@@ -723,7 +708,7 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         # Process input images if provided
         input_img_embed_list = []
         if input_img_latents is not None:
-            input_img_embed_list, _ = self.patch_multiple_resolutions(
+            input_img_embed_list, _, _ = self.patch_multiple_resolutions(
                 input_img_latents,
                 is_input_images=True
             )
@@ -734,7 +719,7 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         
         # Prepare inputs for transformer
         transformer_inputs = []
-        for x_embed, pos_embed in zip(x_list, pos_embed_list):
+        for x_embed, pos_embed in zip(x_list, num_tokens):
             transformer_inputs.append(x_embed + pos_embed)
         
         hidden_states = tf.concat(transformer_inputs, axis=1)
