@@ -258,9 +258,10 @@ class Phi3Transformer(tf.keras.Model):
                     
             elif isinstance(layer, tf.keras.layers.LayerNormalization):
                 # Initialize scale (gamma) to ones and offset (beta) to zeros
-                if hasattr(layer, 'scale') and layer.scale is not None:
+                # Only initialize if they are tf.Variables (not booleans)
+                if hasattr(layer, 'scale') and isinstance(layer.scale, tf.Variable):
                     layer.scale.assign(tf.ones_like(layer.scale))
-                if hasattr(layer, 'offset') and layer.offset is not None:
+                if hasattr(layer, 'offset') and isinstance(layer.offset, tf.Variable):
                     layer.offset.assign(tf.zeros_like(layer.offset))
                     
             elif isinstance(layer, tf.keras.layers.Embedding):
