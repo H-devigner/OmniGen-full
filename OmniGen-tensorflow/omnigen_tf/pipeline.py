@@ -58,34 +58,110 @@ class OmniGenPipeline:
         self.vae = vae
         self.model = model
         self.processor = processor
+        
+        # Set device
+        if device is None:
+            if tf.config.list_physical_devices('GPU'):
+                device = '/GPU:0'
+            else:
+                print("No GPU found, using CPU. This may be slow!")
+                device = '/CPU:0'
         self.device = device
         
-        # Track model state
-        self.model_cpu_offload = False
+        # Enable mixed precision
+        policy = tf.keras.mixed_precision.Policy('mixed_float16')
+        tf.keras.mixed_precision.set_global_policy(policy)
+        
+        # Memory optimization flags
         self._model_on_cpu = False
         self._vae_on_cpu = False
         
-        # Set mixed precision policy
-        tf.keras.mixed_precision.set_global_policy('mixed_float16')
-        
-        if device is None:
-            gpus = tf.config.list_physical_devices('GPU')
-            if gpus:
-                try:
-                    # Memory growth needs to be the same across GPUs
-                    for gpu in gpus:
-                        tf.config.experimental.set_memory_growth(gpu, True)
-                    self.device = '/GPU:0'
-                except RuntimeError as e:
-                    print(e)
-            else:
-                print("No GPU found, using CPU instead. This may take a long time!")
-                self.device = '/CPU:0'
+    def _move_to_device(self, model, device):
+        """Move model to specified device."""
+        with tf.device(device):
+            for layer in model.layers:
+                for weight in layer.weights:
+                    weight.assign(tf.identity(weight))
+                    
+    def enable_cpu_offload(self):
+        """Move models to CPU to save memory."""
+        if not self._model_on_cpu:
+            self._move_to_device(self.model, '/CPU:0')
+            self._model_on_cpu = True
+            
+        if not self._vae_on_cpu:
+            self._move_to_device(self.vae, '/CPU:0')
+            self._vae_on_cpu = True
+            
+    def disable_cpu_offload(self):
+        """Move models back to GPU."""
+        if self._model_on_cpu and tf.config.list_physical_devices('GPU'):
+            self._move_to_device(self.model, '/GPU:0')
+            self._model_on_cpu = False
+            
+        if self._vae_on_cpu and tf.config.list_physical_devices('GPU'):
+            self._move_to_device(self.vae, '/GPU:0')
+            self._vae_on_cpu = False
+            
+    @tf.function(jit_compile=True)
+    def _process_batch(self, prompt_embeds, timesteps):
+        """Process a single batch with XLA optimization."""
+        # Move to device
+        with tf.device(self.device):
+            # Generate latents
+            latents = self.model(
+                prompt_embeds,
+                timesteps,
+                training=False
+            )
+            
+            # Decode latents
+            images = self.vae.decode(latents).sample
+            
+            return images
+            
+    def __call__(self, prompt, **kwargs):
+        """Generate images with memory optimization."""
+        try:
+            # Enable CPU offload
+            self.enable_cpu_offload()
+            
+            # Process prompt
+            text_inputs = self.processor(prompt)
+            
+            # Get batch size and process in chunks
+            batch_size = text_inputs["input_ids"].shape[0]
+            max_batch_size = 4  # Adjust based on memory
+            
+            all_images = []
+            for i in range(0, batch_size, max_batch_size):
+                end_idx = min(i + max_batch_size, batch_size)
                 
-        # Set models to eval mode
-        self.model.trainable = False
-        self.vae.trainable = False
-        
+                # Get batch slice
+                batch_inputs = {
+                    k: v[i:end_idx] for k, v in text_inputs.items()
+                }
+                
+                # Process batch
+                images = self._process_batch(
+                    batch_inputs["input_ids"],
+                    batch_inputs["timesteps"]
+                )
+                
+                all_images.append(images)
+                
+                # Force cleanup
+                tf.keras.backend.clear_session()
+                
+            # Combine results
+            images = tf.concat(all_images, axis=0)
+            
+            return images
+            
+        finally:
+            # Disable CPU offload
+            self.disable_cpu_offload()
+            
     @classmethod
     def from_pretrained(cls, model_name, vae_path=None, device=None):
         """Load pipeline from pretrained models.
@@ -128,187 +204,6 @@ class OmniGenPipeline:
             device=device
         )
         
-    def enable_model_cpu_offload(self):
-        """Move model weights to CPU to save GPU memory."""
-        if not self._model_on_cpu:
-            with tf.device('/CPU:0'):
-                self.model.save_weights('model_weights_temp')
-                self.vae.save_weights('vae_weights_temp')
-            self._model_on_cpu = True
-            self._vae_on_cpu = True
-            tf.keras.backend.clear_session()
-            gc.collect()
-            
-    def disable_model_cpu_offload(self):
-        """Move model weights back to device."""
-        if self._model_on_cpu:
-            with tf.device(self.device):
-                self.model.load_weights('model_weights_temp')
-                self.vae.load_weights('vae_weights_temp')
-            self._model_on_cpu = False
-            self._vae_on_cpu = False
-            # Clean up temp files
-            if os.path.exists('model_weights_temp.index'):
-                os.remove('model_weights_temp.index')
-            if os.path.exists('vae_weights_temp.index'):
-                os.remove('vae_weights_temp.index')
-                
-    def to(self, device):
-        """Move models to specified device."""
-        self.device = device
-        with tf.device(device):
-            if not self._model_on_cpu:
-                self.model.set_weights(self.model.get_weights())
-            if not self._vae_on_cpu:
-                self.vae.set_weights(self.vae.get_weights())
-                
-    def move_to_device(self, data):
-        """Move data to current device."""
-        if isinstance(data, list):
-            return [self._move_tensor(x) for x in data]
-        return self._move_tensor(data)
-    
-    def _move_tensor(self, tensor):
-        """Helper to move a single tensor to device."""
-        if self._model_on_cpu:
-            return tf.identity(tensor)
-        with tf.device(self.device):
-            return tf.identity(tensor)
-            
-    def _cleanup_memory(self):
-        """Cleanup GPU memory."""
-        tf.keras.backend.clear_session()
-        gc.collect()
-        
-    def _process_batch(
-        self,
-        prompt,
-        input_images=None,
-        height=1024,
-        width=1024,
-        num_inference_steps=50,
-        guidance_scale=3,
-        use_img_guidance=True,
-        img_guidance_scale=1.6,
-        max_input_image_size=1024,
-        use_kv_cache=True,
-        offload_kv_cache=True,
-        use_input_image_size_as_output=False,
-    ):
-        # Process text and images
-        model_inputs = self.processor(
-            prompt,
-            input_images=input_images,
-            max_input_image_size=max_input_image_size
-        )
-
-        # Move inputs to device and cast to dtype
-        model_inputs = {
-            k: tf.cast(self.move_to_device(v), tf.bfloat16)
-            for k, v in model_inputs.items()
-        }
-
-        # Initialize latents
-        latents = tf.random.normal(
-            [len(prompt), self.vae.config.latent_channels, height // 8, width // 8],
-            dtype=tf.bfloat16
-        )
-
-        # Setup scheduler
-        scheduler = OmniGenScheduler(num_inference_steps)
-
-        # Run inference on batch
-        images = self.model.memory_efficient_forward(
-            latents,
-            model_inputs=model_inputs,
-            scheduler=scheduler,
-            guidance_scale=guidance_scale,
-            use_img_guidance=use_img_guidance,
-            img_guidance_scale=img_guidance_scale,
-            dtype=tf.bfloat16
-        )
-
-        # Decode images
-        images = self.vae.decode(images / self.vae.config.scaling_factor).sample
-        images = (images + 1) / 2
-        images = tf.clip_by_value(images, 0, 1)
-        images = tf.transpose(images, [0, 2, 3, 1])
-
-        # Convert to output format
-        images = [Image.fromarray((img.numpy() * 255).astype(np.uint8)) for img in images]
-
-        return images
-
-    def __call__(
-        self,
-        prompt,
-        input_images=None,
-        height=1024,
-        width=1024,
-        num_inference_steps=50,
-        guidance_scale=3,
-        use_img_guidance=True,
-        img_guidance_scale=1.6,
-        max_input_image_size=1024,
-        separate_cfg_infer=True,  # Enable by default to save memory
-        offload_model=True,      # Enable by default
-        use_kv_cache=True,
-        offload_kv_cache=True,
-        use_input_image_size_as_output=False,
-        output_type="pil",
-    ):
-        # Enable CPU offload if requested
-        if offload_model:
-            self.enable_model_cpu_offload()
-            
-        try:
-            # Process in smaller batches if using separate CFG inference
-            if separate_cfg_infer:
-                batch_size = 1
-            else:
-                batch_size = 2 if guidance_scale > 1 else 1
-                
-            # Process images in chunks to save memory
-            results = []
-            for i in range(0, len(prompt) if isinstance(prompt, list) else 1, batch_size):
-                batch_prompt = prompt[i:i+batch_size] if isinstance(prompt, list) else prompt
-                batch_images = input_images[i:i+batch_size] if input_images is not None else None
-                
-                # Move models to device for this batch
-                if offload_model:
-                    self.disable_model_cpu_offload()
-                    
-                # Process batch
-                result = self._process_batch(
-                    batch_prompt,
-                    batch_images,
-                    height,
-                    width,
-                    num_inference_steps,
-                    guidance_scale,
-                    use_img_guidance,
-                    img_guidance_scale,
-                    max_input_image_size,
-                    use_kv_cache,
-                    offload_kv_cache,
-                    use_input_image_size_as_output,
-                )
-                results.extend(result)
-                
-                # Move models back to CPU after batch
-                if offload_model:
-                    self.enable_model_cpu_offload()
-                    
-                # Cleanup after each batch
-                self._cleanup_memory()
-                
-            return {"images": results}
-            
-        finally:
-            # Ensure models are moved back to device
-            if offload_model:
-                self.disable_model_cpu_offload()
-                
     def vae_encode(self, x: tf.Tensor, dtype: tf.dtypes.DType) -> tf.Tensor:
         """Encode images using VAE.
         

@@ -282,6 +282,10 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         tf.keras.Model.__init__(self)
         PeftAdapterMixin.__init__(self)
         
+        # Enable mixed precision
+        policy = tf.keras.mixed_precision.Policy('mixed_float16')
+        tf.keras.mixed_precision.set_global_policy(policy)
+        
         # Basic configuration
         self.patch_size = patch_size
         self.in_channels = in_channels
@@ -293,31 +297,24 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         self._model_on_cpu = False
         self._cache = None
         self._active_layer = None
-        self._prefetch_queue = []
-        self._evict_queue = []
         
-        # Set compute dtype
-        self._compute_dtype = tf.float32
-        if tf.config.list_physical_devices('GPU'):
-            self._compute_dtype = tf.float16
-            
-        # Create model components
+        # Create model components with proper dtype
         self.x_embedder = PatchEmbedMR(
             patch_size, in_channels, transformer_config.hidden_size,
-            dtype=self._compute_dtype
+            dtype=policy.compute_dtype
         )
         self.input_x_embedder = PatchEmbedMR(
             patch_size, in_channels, transformer_config.hidden_size,
-            dtype=self._compute_dtype
+            dtype=policy.compute_dtype
         )
         
         self.time_token = TimestepEmbedder(
             transformer_config.hidden_size,
-            dtype=self._compute_dtype
+            dtype=policy.compute_dtype
         )
         self.t_embedder = TimestepEmbedder(
             transformer_config.hidden_size,
-            dtype=self._compute_dtype
+            dtype=policy.compute_dtype
         )
         
         # Create positional embeddings
@@ -327,18 +324,18 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
             interpolation_scale=self.pe_interpolation,
             base_size=64
         )
-        self.pos_embed = tf.constant(pos_embed, dtype=self._compute_dtype)
+        self.pos_embed = tf.cast(pos_embed, policy.compute_dtype)
         
         self.final_layer = FinalLayer(
             transformer_config.hidden_size,
             patch_size,
             self.out_channels,
-            dtype=self._compute_dtype
+            dtype=policy.compute_dtype
         )
         
         self.transformer = Phi3Transformer(
             transformer_config,
-            dtype=self._compute_dtype
+            dtype=policy.compute_dtype
         )
         
         self.initialize_weights()
@@ -585,10 +582,49 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         
         return x_list, num_tokens_list, shapes_list
 
+    @tf.function(jit_compile=True)
+    def _process_batch(self, x, timestep, input_ids, input_img_latents,
+                      input_image_sizes, attention_mask, position_ids):
+        """Process a single batch with XLA optimization."""
+        # Get embeddings
+        t_emb = self.t_embedder(timestep)
+        
+        # Process latents
+        latents, pos_embed = self.patch_multiple_resolutions(
+            [x], is_input_images=False
+        )
+        
+        # Process input images if provided
+        if input_img_latents is not None:
+            input_latents, input_pos_embed = self.patch_multiple_resolutions(
+                input_img_latents, is_input_images=True
+            )
+        else:
+            input_latents = []
+            input_pos_embed = []
+            
+        # Run transformer
+        hidden_states = self.transformer(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=latents,
+            pos_embeds=pos_embed,
+            input_image_embeds=input_latents,
+            input_image_pos_embeds=input_pos_embed,
+            t_emb=t_emb,
+        )
+        
+        # Process output
+        output = self.final_layer(hidden_states, t_emb)
+        output = self.unpatchify(output, x.shape[1], x.shape[2])
+        
+        return output
+        
     def call(self, x, timestep, input_ids, input_img_latents, input_image_sizes,
             attention_mask, position_ids, padding_latent=None, past_key_values=None,
             return_past_key_values=True, offload_model=False, training=False):
-        """Forward pass with memory optimizations."""
+        """Forward pass with memory and performance optimizations."""
         try:
             # Enable CPU offload if requested
             if offload_model:
@@ -598,59 +634,37 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
             if past_key_values is None:
                 self._clear_memory()
                 
-            # Process inputs
-            x = self._move_to_device(x)
-            timestep = self._move_to_device(timestep)
+            # Process in smaller batches to save memory
+            batch_size = x.shape[0]
+            max_batch_size = 4  # Adjust based on available memory
             
-            # Get embeddings
-            t_emb = self.t_embedder(timestep)
-            
-            # Process latents
-            latents, pos_embed = self.patch_multiple_resolutions(
-                [x], padding_latent, is_input_images=False
-            )
-            
-            # Process input images if provided
-            if input_img_latents is not None:
-                input_latents, input_pos_embed = self.patch_multiple_resolutions(
-                    input_img_latents, is_input_images=True
+            outputs = []
+            for i in range(0, batch_size, max_batch_size):
+                end_idx = min(i + max_batch_size, batch_size)
+                
+                # Get batch slice
+                x_batch = x[i:end_idx]
+                timestep_batch = timestep[i:end_idx]
+                input_ids_batch = input_ids[i:end_idx] if input_ids is not None else None
+                input_img_latents_batch = input_img_latents[i:end_idx] if input_img_latents is not None else None
+                attention_mask_batch = attention_mask[i:end_idx] if attention_mask is not None else None
+                position_ids_batch = position_ids[i:end_idx] if position_ids is not None else None
+                
+                # Process batch with XLA optimization
+                output_batch = self._process_batch(
+                    x_batch, timestep_batch, input_ids_batch,
+                    input_img_latents_batch, input_image_sizes,
+                    attention_mask_batch, position_ids_batch
                 )
-            else:
-                input_latents = []
-                input_pos_embed = []
                 
-            # Run transformer
-            hidden_states = self.transformer(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                inputs_embeds=latents,
-                pos_embeds=pos_embed,
-                input_image_embeds=input_latents,
-                input_image_pos_embeds=input_pos_embed,
-                t_emb=t_emb,
-                use_cache=return_past_key_values,
-                training=training
-            )
-            
-            # Get output
-            if return_past_key_values:
-                hidden_states, past_key_values = hidden_states
+                outputs.append(output_batch)
                 
-            # Process output
-            output = self.final_layer(hidden_states, t_emb)
-            output = self.unpatchify(output, x.shape[1], x.shape[2])
-            
-            # Ensure sync before cleanup
-            self._ensure_sync()
-            
-            # Cleanup
-            if not return_past_key_values:
-                self._clear_memory()
+                # Force memory cleanup after each batch
+                tf.keras.backend.clear_session()
                 
-            if return_past_key_values:
-                return output, past_key_values
+            # Combine outputs
+            output = tf.concat(outputs, axis=0)
+            
             return output
             
         finally:
@@ -658,97 +672,24 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
             if offload_model:
                 self.disable_cpu_offload()
                 
-    def forward_with_cfg(self, x, timestep, input_ids, input_img_latents, input_image_sizes,
-                        attention_mask, position_ids, cfg_scale, use_img_cfg, img_cfg_scale,
-                        past_key_values, use_kv_cache, offload_model):
-        """Forward pass with classifier-free guidance.
+    @tf.function(jit_compile=True)
+    def forward_with_cfg(self, x, timestep, input_ids, input_img_latents,
+                        input_image_sizes, attention_mask, position_ids,
+                        cfg_scale, use_img_cfg, img_cfg_scale):
+        """Apply classifier-free guidance with XLA optimization."""
+        # Process with conditions
+        cond_out = self.call(
+            x, timestep, input_ids, input_img_latents,
+            input_image_sizes, attention_mask, position_ids
+        )
         
-        This method implements classifier-free guidance by:
-        1. Running the model on both conditional and unconditional inputs
-        2. Combining the outputs using the guidance scale
+        # Process without conditions
+        uncond_out = self.call(
+            x, timestep, None, None,
+            input_image_sizes, attention_mask, position_ids
+        )
         
-        Args:
-            x: Input latents
-            timestep: Diffusion timesteps
-            input_ids: Text input IDs
-            input_img_latents: Optional input image latents
-            input_image_sizes: Sizes of input images
-            attention_mask: Attention mask for transformer
-            position_ids: Position IDs for transformer
-            cfg_scale: Classifier-free guidance scale
-            use_img_cfg: Whether to use image guidance
-            img_cfg_scale: Image guidance scale
-            past_key_values: Optional cached key-values
-            use_kv_cache: Whether to use key-value cache
-            offload_model: Whether to offload model during processing
-            
-        Returns:
-            Guided model output and optionally past_key_values
-        """
-        # Double the inputs for cfg
-        latents = [x] if not isinstance(x, (list, tuple)) else x
-        timesteps = tf.concat([timestep] * 2, axis=0)
-        input_ids_double = tf.concat([input_ids] * 2, axis=0)
+        # Apply guidance
+        output = uncond_out + cfg_scale * (cond_out - uncond_out)
         
-        if attention_mask is not None:
-            attention_mask = tf.concat([attention_mask] * 2, axis=0)
-        if position_ids is not None:
-            position_ids = tf.concat([position_ids] * 2, axis=0)
-        
-        # Handle input images
-        if input_img_latents is not None and use_img_cfg:
-            input_img_latents = [tf.concat([img] * 2, axis=0) for img in input_img_latents]
-        
-        # Forward pass
-        if use_kv_cache and past_key_values is not None:
-            model_output = self.call(
-                latents,
-                timesteps,
-                input_ids_double,
-                input_img_latents,
-                input_image_sizes,
-                attention_mask,
-                position_ids,
-                past_key_values=past_key_values,
-                return_past_key_values=True,
-                offload_model=offload_model
-            )
-            model_output, past_key_values = model_output
-        else:
-            model_output = self.call(
-                latents,
-                timesteps,
-                input_ids_double,
-                input_img_latents,
-                input_image_sizes,
-                attention_mask,
-                position_ids,
-                offload_model=offload_model
-            )
-        
-        # Apply classifier-free guidance
-        if isinstance(model_output, (list, tuple)):
-            model_output = [
-                self._apply_cfg(out, cfg_scale if i == 0 else img_cfg_scale)
-                for i, out in enumerate(model_output)
-            ]
-        else:
-            model_output = self._apply_cfg(model_output, cfg_scale)
-        
-        if use_kv_cache and past_key_values is not None:
-            return model_output, past_key_values
-        return model_output
-
-    def _apply_cfg(self, model_output, scale):
-        """Apply classifier-free guidance scaling.
-        
-        Args:
-            model_output: Model output tensor
-            scale: Guidance scale factor
-            
-        Returns:
-            Scaled output tensor
-        """
-        batch_size = tf.shape(model_output)[0] // 2
-        cond, uncond = tf.split(model_output, 2, axis=0)
-        return uncond + scale * (cond - uncond)
+        return output
