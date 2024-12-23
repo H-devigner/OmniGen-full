@@ -69,10 +69,10 @@ class Phi3Transformer(tf.keras.Model):
         self.num_hidden_layers = config.num_hidden_layers
         
         # Initialize layers
-        self.layers = []
+        self.decoder_layers = []
         for i in range(config.num_hidden_layers):
             layer = Phi3DecoderLayer(config, dtype=self._dtype)
-            self.layers.append(layer)
+            self.decoder_layers.append(layer)
             
         self.norm = tf.keras.layers.LayerNormalization(
             epsilon=config.layer_norm_eps,
@@ -82,7 +82,7 @@ class Phi3Transformer(tf.keras.Model):
         # Memory management
         self._current_device = None
         self._active_layer_idx = None
-        self._layer_weights_cpu = [None] * len(self.layers)
+        self._layer_weights_cpu = [None] * len(self.decoder_layers)
         self._prefetch_queue = []
         
     def _get_device_strategy(self):
@@ -95,7 +95,7 @@ class Phi3Transformer(tf.keras.Model):
         
     def prefetch_layer(self, layer_idx: int):
         """Prefetch next layer weights to device."""
-        if layer_idx >= len(self.layers):
+        if layer_idx >= len(self.decoder_layers):
             return
             
         # Skip if weights already on device
@@ -107,7 +107,7 @@ class Phi3Transformer(tf.keras.Model):
             # If weights are on CPU, restore them
             if self._layer_weights_cpu[layer_idx] is not None:
                 weights = self._layer_weights_cpu[layer_idx]
-                self.layers[layer_idx].set_weights([
+                self.decoder_layers[layer_idx].set_weights([
                     tf.convert_to_tensor(w, dtype=self._dtype) 
                     for w in weights
                 ])
@@ -121,12 +121,12 @@ class Phi3Transformer(tf.keras.Model):
             return
             
         # Store weights on CPU
-        weights = self.layers[layer_idx].get_weights()
+        weights = self.decoder_layers[layer_idx].get_weights()
         self._layer_weights_cpu[layer_idx] = [w.numpy() for w in weights]
         
         # Clear from device
         with tf.device('/CPU:0'):
-            self.layers[layer_idx].set_weights([
+            self.decoder_layers[layer_idx].set_weights([
                 tf.zeros_like(w, dtype=self._dtype)
                 for w in weights
             ])
@@ -145,7 +145,7 @@ class Phi3Transformer(tf.keras.Model):
         
         # Prefetch next layer
         next_idx = current_idx + 1
-        if next_idx < len(self.layers):
+        if next_idx < len(self.decoder_layers):
             self.prefetch_layer(next_idx)
             
         self._active_layer_idx = current_idx
@@ -235,7 +235,7 @@ class Phi3Transformer(tf.keras.Model):
         next_decoder_cache = None
         
         # Process through layers
-        for idx, decoder_layer in enumerate(self.layers):
+        for idx, decoder_layer in enumerate(self.decoder_layers):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
                 
@@ -312,7 +312,7 @@ class Phi3Transformer(tf.keras.Model):
                 )
         
         # Initialize all layers recursively
-        for layer in self.layers:
+        for layer in self.decoder_layers:
             if hasattr(layer, 'layers'):  # For nested layers/models
                 for sublayer in layer.layers:
                     _init_weights(sublayer)
