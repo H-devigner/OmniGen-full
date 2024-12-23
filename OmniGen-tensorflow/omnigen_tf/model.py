@@ -140,36 +140,36 @@ class FinalLayer(layers.Layer):
 
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0, interpolation_scale=1.0, base_size=1):
-    """Create 2D sinusoidal positional embeddings.
-    
-    This function generates position embeddings for a 2D grid, optionally with
-    class token and interpolation support. It's used to provide spatial awareness
-    to the transformer model.
-    
-    Args:
-        embed_dim: Embedding dimension
-        grid_size: Size of the grid (H, W) or single int for square grid
-        cls_token: Whether to add embeddings for class token
-        extra_tokens: Number of extra tokens to add embeddings for
-        interpolation_scale: Scale factor for interpolation
-        base_size: Base size for grid scaling
-        
-    Returns:
-        Array of shape [grid_size*grid_size, embed_dim] or 
-        [1+grid_size*grid_size, embed_dim] with positional embeddings
     """
+    grid_size: int of the grid height and width return: pos_embed: [grid_size*grid_size, embed_dim] or
+    [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
+    """
+    # Convert all inputs to float32 numpy arrays
+    interpolation_scale = np.float32(interpolation_scale)
+    base_size = np.float32(base_size)
+    
     if isinstance(grid_size, int):
         grid_size = (grid_size, grid_size)
-
-    grid_h = np.arange(grid_size[0], dtype=np.float32) / (grid_size[0] / base_size) / interpolation_scale
-    grid_w = np.arange(grid_size[1], dtype=np.float32) / (grid_size[1] / base_size) / interpolation_scale
-    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
+    
+    # Convert grid sizes to float32
+    grid_h_size = np.float32(grid_size[0])
+    grid_w_size = np.float32(grid_size[1])
+    
+    # Create grid arrays
+    grid_h = np.arange(grid_size[0], dtype=np.float32)
+    grid_w = np.arange(grid_size[1], dtype=np.float32)
+    
+    # Perform divisions with float32 values
+    grid_h = grid_h / (grid_h_size / base_size) / interpolation_scale
+    grid_w = grid_w / (grid_w_size / base_size) / interpolation_scale
+    
+    grid = np.meshgrid(grid_w, grid_h)
     grid = np.stack(grid, axis=0)
-
     grid = grid.reshape([2, 1, grid_size[1], grid_size[0]])
+    
     pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
     if cls_token and extra_tokens > 0:
-        pos_embed = np.concatenate([np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0)
+        pos_embed = np.concatenate([np.zeros([extra_tokens, embed_dim], dtype=np.float32), pos_embed], axis=0)
     return pos_embed
 
 
