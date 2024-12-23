@@ -11,481 +11,298 @@ from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
 
-class Cache:
-    """Base cache class for key-value caching in attention layers."""
-    def __init__(self):
-        self.cache = {}
-        self._seen_tokens = 0
-
-    def get_seq_length(self) -> int:
-        """Get the sequence length of the cached keys."""
-        if not self.cache:
-            return 0
-        return next(iter(self.cache.values()))[0].shape[1]
-
-    def update(self, key: str, key_value: Tuple[tf.Tensor, tf.Tensor], layer_idx: int):
-        """Update the cache with new key-value pairs."""
-        if layer_idx not in self.cache:
-            self.cache[layer_idx] = {}
-        self.cache[layer_idx][key] = key_value
-
-
-class DynamicCache(Cache):
-    """Dynamic cache that grows with each forward pass."""
+class OptimizedMultiHeadAttention(tf.keras.layers.Layer):
+    """Optimized multi-head attention implementation."""
     
-    def __init__(self, num_tokens_for_img: int = None, offload_kv_cache: bool = False):
-        super().__init__()
-        self.key_cache = []
-        self.value_cache = []
-        self.original_device = []
-        self.num_tokens_for_img = num_tokens_for_img
-        self.offload_kv_cache = offload_kv_cache
-        self._active_stream = None
-        
-    def update(self, key_states: tf.Tensor, value_states: tf.Tensor, layer_idx: int):
-        """Concatenate new key-value pairs with existing ones."""
-        if layer_idx >= len(self.key_cache):
-            self.key_cache.append(key_states)
-            self.value_cache.append(value_states)
-            self.original_device.append(key_states.device)
-        else:
-            with tf.device(key_states.device):
-                self.key_cache[layer_idx] = tf.concat([self.key_cache[layer_idx], key_states], axis=-2)
-                self.value_cache[layer_idx] = tf.concat([self.value_cache[layer_idx], value_states], axis=-2)
-                
-    def __getitem__(self, layer_idx: int):
-        """Gets the cache for this layer, handling device placement."""
-        if layer_idx >= len(self.key_cache):
-            raise IndexError(f"Cache index {layer_idx} out of range")
-            
-        # Prefetch next layer
-        if layer_idx + 1 < len(self.key_cache):
-            self.prefetch_layer(layer_idx + 1)
-            
-        # Evict previous layer
-        if layer_idx > 0:
-            self.evict_previous_layer(layer_idx - 1)
-            
-        return self.key_cache[layer_idx], self.value_cache[layer_idx]
-        
-    def prefetch_layer(self, layer_idx: int):
-        """Prefetch next layer to device."""
-        if not self.offload_kv_cache or layer_idx >= len(self.key_cache):
-            return
-            
-        if tf.config.list_physical_devices('GPU'):
-            # Start async prefetch
-            self._active_stream = tf.device('/GPU:0')
-            with self._active_stream:
-                self.prefetch_async(self.key_cache[layer_idx])
-                self.prefetch_async(self.value_cache[layer_idx])
-                
-    def prefetch_async(self, tensor):
-        """Async prefetch helper."""
-        if tensor.device != '/GPU:0':
-            with tf.device('/GPU:0'):
-                tf.identity(tensor)  # Force async copy
-                
-    def evict_previous_layer(self, layer_idx: int):
-        """Move previous layer to CPU."""
-        if not self.offload_kv_cache or layer_idx < 0:
-            return
-            
-        # Wait for any active prefetch
-        if self._active_stream is not None:
-            with self._active_stream:
-                pass  # Synchronize
-            self._active_stream = None
-            
-        # Move to CPU asynchronously
-        if tf.config.list_physical_devices('GPU'):
-            with tf.device('/CPU:0'):
-                self.evict_async(self.key_cache[layer_idx])
-                self.evict_async(self.value_cache[layer_idx])
-                
-    def evict_async(self, tensor):
-        """Async eviction helper."""
-        if tensor.device != '/CPU:0':
-            with tf.device('/CPU:0'):
-                tf.identity(tensor)  # Force async copy
-
-
-class StaticCache(Cache):
-    """Static cache with fixed size."""
-    def update(self, key: str, key_value: Tuple[tf.Tensor, tf.Tensor], layer_idx: int):
-        """Update cache without growing."""
-        if layer_idx not in self.cache:
-            self.cache[layer_idx] = {}
-        self.cache[layer_idx][key] = key_value
-
-
-class DynamicCacheManagement:
-    """Dynamic cache for transformer layers.
-    
-    Handles async prefetching and eviction of layers to manage memory efficiently.
-    """
-    def __init__(self):
-        self.cache = {}
-        self._active_layer = None
-        self._prefetch_queue = []
-        
-    def store(self, layer_idx, key, value):
-        """Store key-value pair for layer."""
-        if layer_idx not in self.cache:
-            self.cache[layer_idx] = {}
-        self.cache[layer_idx][key] = value
-        
-    def retrieve(self, layer_idx, key):
-        """Get cached value for layer."""
-        return self.cache.get(layer_idx, {}).get(key)
-        
-    def clear(self):
-        """Clear all cached values."""
-        self.cache.clear()
-        self._active_layer = None
-        self._prefetch_queue.clear()
-        
-    def prefetch_layer(self, layer_idx):
-        """Queue layer for prefetching."""
-        if layer_idx not in self._prefetch_queue:
-            self._prefetch_queue.append(layer_idx)
-            
-    def evict_layer(self, layer_idx):
-        """Evict layer from cache."""
-        if layer_idx in self.cache:
-            del self.cache[layer_idx]
-            
-    def set_active_layer(self, layer_idx):
-        """Set currently active layer."""
-        self._active_layer = layer_idx
-
-
-class Phi3Transformer(tf.keras.Model):
-    """Transformer model with memory optimizations.
-    
-    Implements efficient memory management through:
-    1. Dynamic cache management
-    2. Layer-wise CPU offloading
-    3. Async operations with TF execution
-    """
     def __init__(self, config, dtype=tf.float32):
         super().__init__()
-        self.config = config
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.hidden_size // self.num_heads
+        self.hidden_size = config.hidden_size
+        self.dropout = getattr(config, 'attention_dropout', 0.0)
         self._dtype = dtype
-        self.cache = DynamicCacheManagement()
-        self.num_hidden_layers = config.num_hidden_layers
         
-        # Memory optimization flags
-        self._active_layer = None
-        self._prefetch_queue = []
-        self._evict_queue = []
+        # Initialize QKV projections
+        self.q_proj = layers.Dense(self.hidden_size, use_bias=False, dtype=self._dtype)
+        self.k_proj = layers.Dense(self.hidden_size, use_bias=False, dtype=self._dtype)
+        self.v_proj = layers.Dense(self.hidden_size, use_bias=False, dtype=self._dtype)
+        self.out_proj = layers.Dense(self.hidden_size, use_bias=True, dtype=self._dtype)
         
-        # Initialize layers
-        self.decoder_layers = []
-        for i in range(config.num_hidden_layers):
-            layer = Phi3DecoderLayer(config, dtype=self._dtype)
-            self.decoder_layers.append(layer)
+    @tf.function(jit_compile=True)
+    def _split_heads(self, tensor):
+        """Split heads for parallel computation."""
+        batch_size = tf.shape(tensor)[0]
+        tensor = tf.reshape(tensor, (batch_size, -1, self.num_heads, self.head_dim))
+        return tf.transpose(tensor, perm=[0, 2, 1, 3])
+        
+    @tf.function(jit_compile=True)
+    def call(self, hidden_states, attention_mask=None, past_key_value=None, 
+             use_cache=False, training=False):
+        """Optimized attention computation."""
+        batch_size = tf.shape(hidden_states)[0]
+        seq_length = tf.shape(hidden_states)[1]
+        
+        # Compute Q, K, V
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+        
+        # Handle cached key/values
+        if past_key_value is not None:
+            key_states = tf.concat([past_key_value[0], key_states], axis=1)
+            value_states = tf.concat([past_key_value[1], value_states], axis=1)
             
-        self.norm = tf.keras.layers.LayerNormalization(
-            epsilon=1e-5,
+        if use_cache:
+            present = (key_states, value_states)
+        else:
+            present = None
+            
+        # Split heads
+        query_states = self._split_heads(query_states)
+        key_states = self._split_heads(key_states)
+        value_states = self._split_heads(value_states)
+        
+        # Compute attention scores efficiently
+        scale = tf.cast(1.0 / tf.math.sqrt(tf.cast(self.head_dim, self._dtype)), self._dtype)
+        attention_scores = tf.matmul(query_states, key_states, transpose_b=True) * scale
+        
+        # Apply attention mask
+        if attention_mask is not None:
+            attention_mask = tf.cast(attention_mask, self._dtype)
+            attention_scores = tf.where(attention_mask, attention_scores, 
+                                      tf.fill(tf.shape(attention_scores), tf.cast(-1e9, self._dtype)))
+            
+        # Compute attention probabilities
+        attention_probs = tf.nn.softmax(attention_scores, axis=-1)
+        attention_probs = tf.keras.layers.Dropout(self.dropout)(attention_probs, training=training)
+        
+        # Compute context
+        context = tf.matmul(attention_probs, value_states)
+        context = tf.transpose(context, perm=[0, 2, 1, 3])
+        context = tf.reshape(context, (batch_size, seq_length, self.hidden_size))
+        
+        # Output projection
+        outputs = self.out_proj(context)
+        
+        return outputs, present
+
+
+class OptimizedDynamicCache:
+    """Optimized dynamic cache for transformer layers."""
+    
+    def __init__(self):
+        self.cache = {}
+        self._prefetch_stream = None
+        self._current_device = None
+        self._is_gpu_available = tf.config.list_physical_devices('GPU')
+        
+    def update(self, layer_idx: int, key_value: Tuple[tf.Tensor, tf.Tensor]):
+        """Update cache with new key-value pair."""
+        if layer_idx not in self.cache:
+            self.cache[layer_idx] = []
+        self.cache[layer_idx].append(key_value)
+        
+    def get(self, layer_idx: int) -> Optional[Tuple[tf.Tensor, tf.Tensor]]:
+        """Get cached values for layer."""
+        return self.cache.get(layer_idx)
+        
+    @tf.function(jit_compile=True)
+    def prefetch_layer(self, layer_idx: int):
+        """Efficient layer prefetching."""
+        if not self._is_gpu_available or layer_idx not in self.cache:
+            return
+            
+        if self._prefetch_stream is None:
+            self._prefetch_stream = tf.device('/GPU:0')
+            
+        with self._prefetch_stream:
+            # Batch transfer weights
+            for key_value in self.cache[layer_idx]:
+                # Non-blocking transfer
+                tf.identity(key_value[0])
+                tf.identity(key_value[1])
+                
+    @tf.function(jit_compile=True)
+    def evict_layer(self, layer_idx: int):
+        """Efficient layer eviction."""
+        if layer_idx not in self.cache:
+            return
+            
+        with tf.device('/CPU:0'):
+            for i, key_value in enumerate(self.cache[layer_idx]):
+                # Move to CPU efficiently
+                self.cache[layer_idx][i] = (
+                    tf.identity(key_value[0]),
+                    tf.identity(key_value[1])
+                )
+
+
+class Phi3DecoderLayer(tf.keras.layers.Layer):
+    """Optimized decoder layer implementation."""
+    
+    def __init__(self, config: Phi3Config, dtype=None):
+        super().__init__()
+        self.config = config
+        self._dtype = dtype or tf.float32
+        
+        # Initialize attention
+        self.self_attn = OptimizedMultiHeadAttention(config, dtype=self._dtype)
+        
+        # Initialize MLP with optimal chunk size
+        self.mlp = tf.keras.Sequential([
+            layers.Dense(
+                config.intermediate_size,
+                activation=self._gelu,
+                dtype=self._dtype
+            ),
+            layers.Dense(config.hidden_size, dtype=self._dtype),
+            layers.Dropout(getattr(config, 'hidden_dropout', 0.1))
+        ])
+        
+        # Layer norms
+        self.input_layernorm = layers.LayerNormalization(
+            epsilon=getattr(config, 'layer_norm_eps', 1e-5),
+            dtype=self._dtype
+        )
+        self.post_attention_layernorm = layers.LayerNormalization(
+            epsilon=getattr(config, 'layer_norm_eps', 1e-5),
             dtype=self._dtype
         )
         
-    def prefetch_layer(self, layer_idx: int):
-        """Prefetch layer weights to GPU."""
-        if layer_idx >= self.num_hidden_layers:
-            return
-            
-        if tf.config.list_physical_devices('GPU'):
-            layer = self.decoder_layers[layer_idx]
-            self._prefetch_queue.append(layer)
-            
-            # Start async prefetch
-            with tf.device('/GPU:0'):
-                for weight in layer.weights:
-                    tf.identity(weight)
-                    
-    def evict_layer(self, layer_idx: int):
-        """Move layer weights to CPU."""
-        if layer_idx < 0:
-            return
-            
-        if tf.config.list_physical_devices('GPU'):
-            layer = self.decoder_layers[layer_idx]
-            self._evict_queue.append(layer)
-            
-            # Start async eviction
-            with tf.device('/CPU:0'):
-                for weight in layer.weights:
-                    tf.identity(weight)
-                    
-    def _ensure_layer_on_device(self, layer_idx, device):
-        """Ensure layer weights are on correct device."""
-        layer = self.decoder_layers[layer_idx]
+    @staticmethod
+    @tf.function(jit_compile=True)
+    def _gelu(x):
+        """Optimized GELU implementation."""
+        return 0.5 * x * (1.0 + tf.math.tanh(
+            tf.cast(0.7978845608028654, x.dtype) * 
+            (x + tf.cast(0.044715, x.dtype) * tf.pow(x, 3))
+        ))
         
-        # Move weights to device
-        with tf.device(device):
-            for weight in layer.weights:
-                if weight.device != device:
-                    weight.assign(tf.identity(weight))
-                    
-    def _prefetch_next_layer(self, current_idx):
-        """Prefetch next layer asynchronously."""
-        next_idx = (current_idx + 1) % len(self.decoder_layers)
-        self.cache.prefetch_layer(next_idx)
-        
-        # Use async execution
-        @tf.function(experimental_async=True)
-        def prefetch():
-            self._ensure_layer_on_device(next_idx, '/GPU:0')
-            
-        prefetch()
-        
-    def _evict_previous_layer(self, current_idx):
-        """Move previous layer to CPU."""
-        if current_idx > 0:
-            prev_idx = current_idx - 1
-            self.cache.evict_layer(prev_idx)
-            
-            # Use async execution
-            @tf.function(experimental_async=True) 
-            def evict():
-                self._ensure_layer_on_device(prev_idx, '/CPU:0')
-                
-            evict()
-            
-    def _update_causal_mask(
-        self, 
-        attention_mask: Optional[tf.Tensor],
-        input_shape: tf.TensorShape,
-        dtype: tf.dtypes.DType,
-        past_key_values_length: int = 0
-    ) -> tf.Tensor:
-        """
-        Update the causal mask for auto-regressive decoding.
-        
-        Args:
-            attention_mask: Optional attention mask
-            input_shape: Shape of input
-            dtype: Data type of mask
-            past_key_values_length: Length of past key-values for caching
-            
-        Returns:
-            Updated causal attention mask
-        """
-        batch_size, seq_length = input_shape[0], input_shape[1]
-        
-        if attention_mask is None:
-            attention_mask = tf.ones((batch_size, seq_length))
-            
-        # Create causal mask
-        # tf.experimental.numpy.triu is similar to torch.triu
-        causal_mask = 1 - tf.experimental.numpy.triu(
-            tf.ones((seq_length, seq_length)), k=1
-        )
-        causal_mask = tf.cast(causal_mask[None, None, :, :], dtype)
-        
-        if past_key_values_length > 0:
-            causal_mask = tf.pad(
-                causal_mask,
-                [[0, 0], [0, 0], [0, 0], [past_key_values_length, 0]]
-            )
-            
-        if attention_mask is not None:
-            # Extend attention mask for sequence length
-            extended_attention_mask = attention_mask[:, None, None, :]
-            extended_attention_mask = tf.cast(extended_attention_mask, dtype)
-            extended_attention_mask = (1.0 - extended_attention_mask) * tf.dtypes.as_dtype(dtype).min
-            causal_mask = causal_mask + extended_attention_mask
-            
-        return causal_mask
-
-    def call(self, inputs_embeds, attention_mask=None, position_ids=None,
-             past_key_values=None, use_cache=None, output_attentions=None,
-             output_hidden_states=None, return_dict=None, training=False):
-        """Forward pass with memory optimization."""
-        
-        # Handle defaults
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
-        output_attentions = (
-            output_attentions if output_attentions is not None 
-            else self.config.output_attentions
-        )
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None
-            else self.config.output_hidden_states
-        )
-        return_dict = (
-            return_dict if return_dict is not None 
-            else self.config.use_return_dict
-        )
-        
-        # Initialize caches
-        if past_key_values is None:
-            past_key_values = tuple([None] * self.num_hidden_layers)
-            
-        all_hidden_states = () if output_hidden_states else None
-        all_self_attns = () if output_attentions else None
-        next_decoder_cache = () if use_cache else None
-        
-        hidden_states = inputs_embeds
-        
-        # Process through layers with memory optimization
-        for idx, decoder_layer in enumerate(self.decoder_layers):
-            # Memory management
-            self.cache.set_active_layer(idx)
-            self._ensure_layer_on_device(idx, '/GPU:0')
-            
-            # Process layer
-            layer_outputs = decoder_layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_values[idx] if past_key_values is not None else None,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                training=training,
-            )
-            
-            hidden_states = layer_outputs[0]
-            
-            if use_cache:
-                next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
-                
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
-                
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-                
-            # Async operations
-            self._prefetch_next_layer(idx)
-            self._evict_previous_layer(idx)
-            
-        # Final layer norm
-        hidden_states = self.norm(hidden_states)
-        
-        # Clear active layer and queues
-        self.cache.clear()
-        self._active_layer = None
-        self._prefetch_queue.clear()
-        self._evict_queue.clear()
-        
-        # Return results
-        if not return_dict:
-            return tuple(v for v in [
-                hidden_states,
-                next_decoder_cache,
-                all_hidden_states,
-                all_self_attns,
-            ] if v is not None)
-            
-        return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            past_key_values=next_decoder_cache,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attns,
-        )
-
-
-class Phi3DecoderLayer(tf.keras.Model):
-    """Decoder layer for Phi3 model with self-attention and feed-forward networks."""
-    
-    def __init__(self, config: Phi3Config, dtype=None, **kwargs):
-        super().__init__(**kwargs)
-        print(f"Initializing Phi3DecoderLayer with config..")
-        
-        self.config = config
-        
-        # Get configuration values with defaults
-        layer_norm_eps = getattr(config, 'layer_norm_eps', 1e-5)
-        attention_dropout = getattr(config, 'attention_dropout', 0.0)
-        hidden_dropout = getattr(config, 'hidden_dropout_prob', 0.1)
-        
-        # Initialize attention layer
-        print("Creating self-attention layer...")
-        self.self_attn = layers.MultiHeadAttention(
-            num_heads=config.num_attention_heads,
-            key_dim=config.hidden_size // config.num_attention_heads,
-            dropout=attention_dropout,
-            name="self_attn"
-        )
-        
-        # Initialize MLP
-        print("Creating MLP layers...")
-        self.mlp = tf.keras.Sequential([
-            layers.Dense(config.intermediate_size, activation="gelu", name="fc1"),
-            layers.Dense(config.hidden_size, name="fc2"),
-            layers.Dropout(hidden_dropout),
-        ], name="mlp")
-        
-        # Initialize layer norms
-        print("Creating layer normalizations...")
-        self.input_layernorm = layers.LayerNormalization(
-            epsilon=layer_norm_eps, 
-            name="input_layernorm"
-        )
-        self.post_attention_layernorm = layers.LayerNormalization(
-            epsilon=layer_norm_eps, 
-            name="post_attention_layernorm"
-        )
-        
-        print("Phi3DecoderLayer initialization completed")
-        print(f"Attention heads: {config.num_attention_heads}")
-        print(f"Hidden size: {config.hidden_size}")
-        print(f"Intermediate size: {config.intermediate_size}")
-        print(f"Layer norm epsilon: {layer_norm_eps}")
-        print(f"Attention dropout: {attention_dropout}")
-        print(f"Hidden dropout: {hidden_dropout}")
-
-    def call(
-        self,
-        hidden_states: tf.Tensor,
-        attention_mask: Optional[tf.Tensor] = None,
-        position_ids: Optional[tf.Tensor] = None,
-        past_key_value: Optional[Tuple[tf.Tensor]] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        training: bool = False,
-    ) -> Tuple[tf.Tensor, ...]:
-        """
-        Forward pass of decoder layer.
-        
-        Args:
-            hidden_states: Input tensor
-            attention_mask: Attention mask
-            position_ids: Position IDs
-            past_key_value: Past key-value states
-            output_attentions: Whether to output attention weights
-            use_cache: Whether to use caching
-            training: Whether in training mode
-            
-        Returns:
-            Tuple of output tensor and optional cache
-        """
+    @tf.function(jit_compile=True)
+    def call(self, hidden_states, attention_mask=None, past_key_value=None,
+             use_cache=False, training=False):
+        """Optimized forward pass."""
+        # Self attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-
-        # Self Attention
-        attn_outputs = self.self_attn(
-            query=hidden_states,
-            value=hidden_states,
-            key=hidden_states,
+        
+        attention_outputs, present = self.self_attn(
+            hidden_states,
             attention_mask=attention_mask,
-            training=training,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+            training=training
         )
-        hidden_states = residual + attn_outputs
-
-        # Feed Forward
+        
+        hidden_states = attention_outputs + residual
+        
+        # MLP
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states, training=training)
-        hidden_states = residual + hidden_states
-
+        hidden_states = hidden_states + residual
+        
         outputs = (hidden_states,)
-        if output_attentions:
-            outputs += (attn_outputs,)
         if use_cache:
-            outputs += (past_key_value,)
-
+            outputs += (present,)
+            
         return outputs
+
+
+class Phi3Transformer(tf.keras.Model):
+    """Optimized transformer implementation."""
+    
+    def __init__(self, config: Phi3Config, dtype=tf.float32):
+        super().__init__()
+        self.config = config
+        self._dtype = dtype
+        
+        # Initialize layers
+        self.decoder_layers = [
+            Phi3DecoderLayer(config, dtype=self._dtype)
+            for _ in range(config.num_hidden_layers)
+        ]
+        
+        self.norm = layers.LayerNormalization(
+            epsilon=getattr(config, 'layer_norm_eps', 1e-5),
+            dtype=self._dtype
+        )
+        
+        # Cache management
+        self.cache = OptimizedDynamicCache()
+        
+    def _get_optimal_chunk_size(self, total_size):
+        """Calculate optimal chunk size based on available memory."""
+        if not tf.config.list_physical_devices('GPU'):
+            return min(32, total_size)
+            
+        # Estimate based on model size and available GPU memory
+        return min(64, total_size)
+        
+    @tf.function(jit_compile=True)
+    def call(self, inputs_embeds, attention_mask=None, position_ids=None,
+             past_key_values=None, use_cache=False, training=False):
+        """Optimized forward pass with memory management."""
+        
+        # Process in optimal chunks
+        batch_size = tf.shape(inputs_embeds)[0]
+        chunk_size = self._get_optimal_chunk_size(batch_size)
+        
+        all_hidden_states = []
+        all_presents = [] if use_cache else None
+        
+        for i in range(0, batch_size, chunk_size):
+            end_idx = tf.minimum(i + chunk_size, batch_size)
+            chunk_inputs = inputs_embeds[i:end_idx]
+            
+            if attention_mask is not None:
+                chunk_mask = attention_mask[i:end_idx]
+            else:
+                chunk_mask = None
+                
+            hidden_states = chunk_inputs
+            presents = [] if use_cache else None
+            
+            # Process through layers
+            for idx, layer in enumerate(self.decoder_layers):
+                # Prefetch next layer
+                if idx < len(self.decoder_layers) - 1:
+                    self.cache.prefetch_layer(idx + 1)
+                    
+                past_key_value = past_key_values[idx] if past_key_values is not None else None
+                
+                layer_outputs = layer(
+                    hidden_states,
+                    attention_mask=chunk_mask,
+                    past_key_value=past_key_value,
+                    use_cache=use_cache,
+                    training=training
+                )
+                
+                hidden_states = layer_outputs[0]
+                
+                if use_cache:
+                    presents.append(layer_outputs[1])
+                    
+                # Evict previous layer
+                if idx > 0:
+                    self.cache.evict_layer(idx - 1)
+                    
+            # Final layer norm
+            hidden_states = self.norm(hidden_states)
+            
+            all_hidden_states.append(hidden_states)
+            if use_cache:
+                all_presents.append(presents)
+                
+        # Combine results
+        hidden_states = tf.concat(all_hidden_states, axis=0)
+        
+        if use_cache:
+            presents = tuple(zip(*all_presents))
+            return BaseModelOutputWithPast(
+                last_hidden_state=hidden_states,
+                past_key_values=presents
+            )
+            
+        return BaseModelOutputWithPast(last_hidden_state=hidden_states)
