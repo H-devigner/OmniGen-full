@@ -84,42 +84,51 @@ class OmniGenPipeline:
             self.vae.trainable = False
             
     @classmethod
-    def from_pretrained(cls, model_name: str, vae_path: str = None, device: str = None, mixed_precision: bool = True):
+    def from_pretrained(cls, model_name, vae_path=None, device=None, mixed_precision=True):
         """Load pipeline from pretrained model.
         
         Args:
-            model_name: Name or path of pretrained model
+            model_name: Model name on HuggingFace Hub or path to local model
             vae_path: Optional path to VAE model
             device: Device to place models on ('CPU', 'GPU', or None for auto-detect)
-            mixed_precision: Whether to use mixed precision
-            
-        Returns:
-            OmniGenPipeline instance
+            mixed_precision: Whether to use mixed precision (only on GPU)
         """
         if not os.path.exists(model_name):
-            print(f"Downloading model from {model_name}")
-            cache_folder = os.getenv('HF_HUB_CACHE')
             model_name = snapshot_download(
                 repo_id=model_name,
-                cache_dir=cache_folder,
-                ignore_patterns=['flax_model.msgpack', 'rust_model.ot', 'model.pt']
+                cache_dir=os.getenv('HF_HUB_CACHE'),
+                allow_patterns=["*.json", "*.safetensors"]
             )
             print(f"Downloaded model to {model_name}")
-            
+
         # Load models with specified device and precision settings
-        model = OmniGen.from_pretrained(model_name, device=device, mixed_precision=mixed_precision)
+        model = OmniGen.from_pretrained(
+            model_name, 
+            device=device,
+            mixed_precision=mixed_precision
+        )
         processor = OmniGenProcessor.from_pretrained(model_name)
-        
+
         # Load or download VAE
-        if os.path.exists(os.path.join(model_name, "vae")):
-            vae = AutoencoderKL.from_pretrained(os.path.join(model_name, "vae"))
-        elif vae_path is not None:
-            vae = AutoencoderKL.from_pretrained(vae_path)
+        if vae_path is None:
+            print("Loading default SDXL VAE...")
+            vae = AutoencoderKL.from_pretrained(
+                "stabilityai/sdxl-vae",
+                from_tf=True
+            )
         else:
-            print("No VAE found, downloading stabilityai/sdxl-vae")
-            vae = AutoencoderKL.from_pretrained("stabilityai/sdxl-vae")
-            
-        return cls(vae, model, processor, device=device, mixed_precision=mixed_precision)
+            vae = AutoencoderKL.from_pretrained(vae_path, from_tf=True)
+
+        # Create pipeline instance
+        pipeline = cls(
+            vae=vae,
+            model=model,
+            processor=processor,
+            device=device,
+            mixed_precision=mixed_precision
+        )
+
+        return pipeline
         
     def __call__(
         self,

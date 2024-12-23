@@ -270,6 +270,7 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         pos_embed_max_size: Maximum size for positional embeddings
         device: Device to place model on ('CPU', 'GPU', or None for auto-detect)
         dtype: Data type for model weights and computations
+        mixed_precision: Whether to use mixed precision training
     """
     def __init__(
         self,
@@ -280,6 +281,7 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         pos_embed_max_size: int = 192,
         device=None,
         dtype=tf.bfloat16,
+        mixed_precision: bool = True,
     ):
         tf.keras.Model.__init__(self)
         PeftAdapterMixin.__init__(self)
@@ -289,12 +291,21 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
             if len(tf.config.list_physical_devices('GPU')) > 0:
                 device = 'GPU'
                 print("Using GPU for inference")
-                # Enable mixed precision
-                tf.keras.mixed_precision.set_global_policy('mixed_float16')
+                
+                # Enable mixed precision if requested and on GPU
+                if mixed_precision:
+                    policy = tf.keras.mixed_precision.Policy('mixed_float16')
+                    tf.keras.mixed_precision.set_global_policy(policy)
+                    print("Enabled mixed precision training")
             else:
                 device = 'CPU'
-                print("No GPU detected, using CPU. This may be slow!")
+                print("No GPU found, using CPU for inference")
                 
+                # Disable mixed precision on CPU
+                if mixed_precision:
+                    print("Mixed precision disabled on CPU")
+                    mixed_precision = False
+                    
         self.device = device
         self.dtype = dtype
         
@@ -428,11 +439,13 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
             raise
 
     @classmethod
-    def from_pretrained(cls, model_name, **kwargs):
+    def from_pretrained(cls, model_name, device=None, mixed_precision=True, **kwargs):
         """Load model from pretrained weights.
         
         Args:
             model_name: Name of the model to load
+            device: Device to place model on ('CPU', 'GPU', or None for auto-detect)
+            mixed_precision: Whether to use mixed precision training
             **kwargs: Additional arguments passed to model initialization
             
         Returns:
@@ -449,7 +462,7 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
             print(f"Downloaded model to {model_name}")
 
         config = Phi3Config.from_pretrained(model_name)
-        model = cls(config, **kwargs)
+        model = cls(config, device=device, mixed_precision=mixed_precision, **kwargs)
         
         if os.path.exists(os.path.join(model_name, 'model.safetensors')):
             print("Loading safetensors weights...")
