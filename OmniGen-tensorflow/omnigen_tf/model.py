@@ -17,7 +17,7 @@ from safetensors.tensorflow import load_file
 from omnigen_tf.transformer import Phi3Config, Phi3Transformer
 
 
-def modulate(x, shift, scale):
+def modulate_tensorflow(x, shift, scale):
     """Apply adaptive layer normalization modulation.
     
     Args:
@@ -28,7 +28,11 @@ def modulate(x, shift, scale):
     Returns:
         Modulated tensor with same shape as input
     """
-    return x * (1 + scale[:, tf.newaxis]) + shift[:, tf.newaxis]
+    # Ensure all constants and tensors are the same dtype
+    x = tf.cast(x, tf.float32)
+    shift = tf.cast(shift, tf.float32)
+    scale = tf.cast(scale, tf.float32)
+    return x * (1.0 + scale[:, tf.newaxis]) + shift[:, tf.newaxis]
 
 
 class TimestepEmbedder(Model):
