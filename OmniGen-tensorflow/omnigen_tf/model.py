@@ -78,30 +78,6 @@ class TimestepEmbedder(Model):
         return t_emb
 
 
-class CustomLayerNormalization(layers.Layer):
-    """Custom Layer Normalization implementation to match PyTorch's behavior.
-    
-    This layer implements layer normalization without learnable parameters,
-    matching PyTorch's LayerNorm with elementwise_affine=False. This is crucial
-    for maintaining model compatibility between frameworks.
-    
-    Args:
-        epsilon: Small float added to variance to avoid dividing by zero
-    """
-    def __init__(self, epsilon=1e-6):
-        super().__init__()
-        self.epsilon = epsilon
-
-    def build(self, input_shape):
-        self.scale = None  # No learnable parameters
-        self.offset = None
-
-    def call(self, inputs):
-        mean = tf.reduce_mean(inputs, axis=-1, keepdims=True)
-        variance = tf.reduce_variance(inputs, axis=-1, keepdims=True)
-        return (inputs - mean) / tf.sqrt(variance + self.epsilon)
-
-
 class FinalLayer(layers.Layer):
     """The final layer of the DiT model.
     
@@ -116,7 +92,7 @@ class FinalLayer(layers.Layer):
     """
     def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
-        self.norm_final = CustomLayerNormalization(epsilon=1e-6)
+        self.norm_final = tf.keras.layers.LayerNormalization(epsilon=1e-6)
         self.linear = layers.Dense(patch_size * patch_size * out_channels, use_bias=True)
         self.adaLN_modulation = tf.keras.Sequential([
             layers.Activation('silu'),
