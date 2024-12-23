@@ -6,20 +6,18 @@ matching the PyTorch version's functionality while leveraging TensorFlow-specifi
 
 import os
 import gc
-from typing import Any, Callable, Dict, List, Optional, Union
-
 import tensorflow as tf
 import numpy as np
+from typing import Dict, List, Optional, Union
 from PIL import Image
 from safetensors import safe_open
 from huggingface_hub import snapshot_download
-from diffusers.models import AutoencoderKL
+from diffusers import AutoencoderKL
 from diffusers.utils import logging
-from peft import PeftAdapterMixin
 
-from .model import OmniGen
 from .processor import OmniGenProcessor
 from .scheduler import OmniGenScheduler
+from .model import OmniGen
 
 logger = logging.get_logger(__name__)
 
@@ -39,7 +37,7 @@ EXAMPLE_DOC_STRING = """
 """
 
 
-class OmniGenPipeline(PeftAdapterMixin):
+class OmniGenPipeline:
     """Pipeline for text-to-image generation using OmniGen."""
     
     def __init__(
@@ -309,9 +307,6 @@ class OmniGenPipeline(PeftAdapterMixin):
                 allow_patterns="*.safetensors"
             )
             
-        # Load weights using safetensors
-        lora_state_dict = safe_open(lora_path, framework="tf")
-        
-        # Let PeftAdapterMixin handle the merging
-        self.load_adapter_weights(lora_state_dict)
+        # Let the model handle LoRA merging using PeftAdapterMixin
+        self.model.merge_adapter(lora_path)
         print(f"Successfully merged LoRA weights from {lora_path}")
