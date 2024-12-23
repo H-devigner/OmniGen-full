@@ -119,13 +119,60 @@ class StaticCache(Cache):
         self.cache[layer_idx][key] = key_value
 
 
-class Phi3Transformer(tf.keras.Model):
-    """Transformer decoder with memory optimizations."""
+class DynamicCacheManagement:
+    """Dynamic cache for transformer layers.
     
-    def __init__(self, config, dtype=None):
+    Handles async prefetching and eviction of layers to manage memory efficiently.
+    """
+    def __init__(self):
+        self.cache = {}
+        self._active_layer = None
+        self._prefetch_queue = []
+        
+    def store(self, layer_idx, key, value):
+        """Store key-value pair for layer."""
+        if layer_idx not in self.cache:
+            self.cache[layer_idx] = {}
+        self.cache[layer_idx][key] = value
+        
+    def retrieve(self, layer_idx, key):
+        """Get cached value for layer."""
+        return self.cache.get(layer_idx, {}).get(key)
+        
+    def clear(self):
+        """Clear all cached values."""
+        self.cache.clear()
+        self._active_layer = None
+        self._prefetch_queue.clear()
+        
+    def prefetch_layer(self, layer_idx):
+        """Queue layer for prefetching."""
+        if layer_idx not in self._prefetch_queue:
+            self._prefetch_queue.append(layer_idx)
+            
+    def evict_layer(self, layer_idx):
+        """Evict layer from cache."""
+        if layer_idx in self.cache:
+            del self.cache[layer_idx]
+            
+    def set_active_layer(self, layer_idx):
+        """Set currently active layer."""
+        self._active_layer = layer_idx
+
+
+class Phi3Transformer(tf.keras.Model):
+    """Transformer model with memory optimizations.
+    
+    Implements efficient memory management through:
+    1. Dynamic cache management
+    2. Layer-wise CPU offloading
+    3. Async operations with TF execution
+    """
+    def __init__(self, config, dtype=tf.float32):
         super().__init__()
         self.config = config
-        self._dtype = dtype or tf.float32
+        self._dtype = dtype
+        self.cache = DynamicCacheManagement()
         self.num_hidden_layers = config.num_hidden_layers
         
         # Memory optimization flags
@@ -172,6 +219,41 @@ class Phi3Transformer(tf.keras.Model):
                 for weight in layer.weights:
                     tf.identity(weight)
                     
+    def _ensure_layer_on_device(self, layer_idx, device):
+        """Ensure layer weights are on correct device."""
+        layer = self.decoder_layers[layer_idx]
+        
+        # Move weights to device
+        with tf.device(device):
+            for weight in layer.weights:
+                if weight.device != device:
+                    weight.assign(tf.identity(weight))
+                    
+    def _prefetch_next_layer(self, current_idx):
+        """Prefetch next layer asynchronously."""
+        next_idx = (current_idx + 1) % len(self.decoder_layers)
+        self.cache.prefetch_layer(next_idx)
+        
+        # Use async execution
+        @tf.function(experimental_async=True)
+        def prefetch():
+            self._ensure_layer_on_device(next_idx, '/GPU:0')
+            
+        prefetch()
+        
+    def _evict_previous_layer(self, current_idx):
+        """Move previous layer to CPU."""
+        if current_idx > 0:
+            prev_idx = current_idx - 1
+            self.cache.evict_layer(prev_idx)
+            
+            # Use async execution
+            @tf.function(experimental_async=True) 
+            def evict():
+                self._ensure_layer_on_device(prev_idx, '/CPU:0')
+                
+            evict()
+            
     def _update_causal_mask(
         self, 
         attention_mask: Optional[tf.Tensor],
@@ -221,7 +303,7 @@ class Phi3Transformer(tf.keras.Model):
     def call(self, inputs_embeds, attention_mask=None, position_ids=None,
              past_key_values=None, use_cache=None, output_attentions=None,
              output_hidden_states=None, return_dict=None, training=False):
-        """Forward pass with memory optimizations."""
+        """Forward pass with memory optimization."""
         
         # Handle defaults
         use_cache = use_cache if use_cache is not None else self.config.use_cache
@@ -251,13 +333,10 @@ class Phi3Transformer(tf.keras.Model):
         # Process through layers with memory optimization
         for idx, decoder_layer in enumerate(self.decoder_layers):
             # Memory management
-            self._active_layer = idx
-            if idx + 1 < self.num_hidden_layers:
-                self.prefetch_layer(idx + 1)
-            if idx > 0:
-                self.evict_layer(idx - 1)
-                
-            # Layer processing
+            self.cache.set_active_layer(idx)
+            self._ensure_layer_on_device(idx, '/GPU:0')
+            
+            # Process layer
             layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=attention_mask,
@@ -279,10 +358,15 @@ class Phi3Transformer(tf.keras.Model):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
                 
+            # Async operations
+            self._prefetch_next_layer(idx)
+            self._evict_previous_layer(idx)
+            
         # Final layer norm
         hidden_states = self.norm(hidden_states)
         
         # Clear active layer and queues
+        self.cache.clear()
         self._active_layer = None
         self._prefetch_queue.clear()
         self._evict_queue.clear()

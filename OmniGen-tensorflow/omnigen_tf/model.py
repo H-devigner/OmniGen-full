@@ -289,11 +289,12 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         self.pos_embed_max_size = pos_embed_max_size
         self.pe_interpolation = pe_interpolation
         
-        # Memory management flags
+        # Memory management
         self._model_on_cpu = False
-        self._cache_on_cpu = False
-        self._kv_cache = None
+        self._cache = None
         self._active_layer = None
+        self._prefetch_queue = []
+        self._evict_queue = []
         
         # Set compute dtype
         self._compute_dtype = tf.float32
@@ -339,16 +340,19 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
             transformer_config,
             dtype=self._compute_dtype
         )
-        self.transformer.config.use_cache = False
         
         self.initialize_weights()
         
-    def _clear_model_memory(self):
+    def _clear_memory(self):
         """Clear model memory and caches."""
-        if hasattr(self, '_kv_cache'):
-            del self._kv_cache
+        if hasattr(self, '_cache'):
+            del self._cache
         if hasattr(self, '_active_layer'):
             del self._active_layer
+            
+        # Clear transformer cache
+        if hasattr(self.transformer, 'cache'):
+            self.transformer.cache.clear()
             
         # Force garbage collection
         import gc
@@ -358,40 +362,35 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         if tf.config.list_physical_devices('GPU'):
             tf.keras.backend.clear_session()
             
-    def _move_to_device(self, tensor, device=None):
-        """Move tensor to specified device."""
-        if device is None:
-            device = '/GPU:0' if tf.config.list_physical_devices('GPU') else '/CPU:0'
-            
-        with tf.device(device):
-            return tf.identity(tensor)
-            
-    def _ensure_sync(self):
-        """Ensure operations are synchronized."""
-        if tf.config.list_physical_devices('GPU'):
-            tf.keras.backend.get_session().run(tf.keras.backend.get_session().graph.get_operations())
-            
     def enable_cpu_offload(self):
         """Move model to CPU to save memory."""
         if not self._model_on_cpu:
             self._model_on_cpu = True
+            
+            # Move model weights to CPU
             with tf.device('/CPU:0'):
-                # Move weights to CPU
                 for layer in self.layers:
                     for weight in layer.weights:
                         weight.assign(tf.identity(weight))
                         
+            # Enable transformer CPU offload
+            self.transformer._model_on_cpu = True
+            
     def disable_cpu_offload(self):
         """Move model back to GPU."""
         if self._model_on_cpu:
             self._model_on_cpu = False
+            
+            # Move weights back to GPU if available
             if tf.config.list_physical_devices('GPU'):
                 with tf.device('/GPU:0'):
-                    # Move weights back to GPU
                     for layer in self.layers:
                         for weight in layer.weights:
                             weight.assign(tf.identity(weight))
                             
+            # Disable transformer CPU offload
+            self.transformer._model_on_cpu = False
+            
     def initialize_weights(self):
         """Initialize model weights."""
         # Helper function to initialize a single layer
@@ -597,7 +596,7 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
                 
             # Clear any existing caches
             if past_key_values is None:
-                self._clear_model_memory()
+                self._clear_memory()
                 
             # Process inputs
             x = self._move_to_device(x)
@@ -648,7 +647,7 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
             
             # Cleanup
             if not return_past_key_values:
-                self._clear_model_memory()
+                self._clear_memory()
                 
             if return_past_key_values:
                 return output, past_key_values
