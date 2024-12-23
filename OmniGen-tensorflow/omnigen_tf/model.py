@@ -283,50 +283,57 @@ class OmniGen(Model):
         transformer_config: Configuration for the Phi3 transformer
         patch_size: Size of image patches
         in_channels: Number of input channels
-        pe_interpolation: Interpolation scale for positional embeddings
+        pe_interpolation: Positional embedding interpolation method
         pos_embed_max_size: Maximum size for positional embeddings
     """
     def __init__(
         self,
-        transformer_config: Phi3Config,
-        patch_size=2,
+        transformer_config,
+        patch_size=8,
         in_channels=4,
-        pe_interpolation: float = 1.0,
-        pos_embed_max_size: int = 192,
+        pe_interpolation="bilinear",
+        pos_embed_max_size=64
     ):
+        """Initialize OmniGen model.
+        
+        Args:
+            transformer_config: Configuration for the transformer model
+            patch_size: Size of image patches
+            in_channels: Number of input channels
+            pe_interpolation: Positional embedding interpolation method
+            pos_embed_max_size: Maximum size for positional embeddings
+        """
         super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = in_channels
+        
+        # Save configuration
+        self.config = transformer_config
         self.patch_size = patch_size
-        self.pos_embed_max_size = pos_embed_max_size
-
-        hidden_size = transformer_config.hidden_size
-
-        # Image embedding layers
-        self.x_embedder = PatchEmbedMR(patch_size, in_channels, hidden_size)
-        self.input_x_embedder = PatchEmbedMR(patch_size, in_channels, hidden_size)
-
-        # Time embedding layers
-        self.time_token = TimestepEmbedder(hidden_size)
-        self.t_embedder = TimestepEmbedder(hidden_size)
+        self.in_channels = in_channels
+        
+        # Initialize transformer (LLM)
+        self.llm = Phi3Transformer(transformer_config)
         
         # Positional embedding setup
         self.pe_interpolation = pe_interpolation
         pos_embed = get_2d_sincos_pos_embed(
-            self.llm.config.hidden_size,
+            self.config.hidden_size,  # Use config instead of llm.config
             pos_embed_max_size,
             interpolation_scale=self.pe_interpolation,
             base_size=64
         )
         self.pos_embed = tf.Variable(pos_embed[None], trainable=False)
 
-        # Output layers
-        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
-        
-        # Transformer backbone
-        self.llm = Phi3Transformer(config=transformer_config)
-        self.llm.config.use_cache = False
+        # Image embedding layers
+        self.x_embedder = PatchEmbedMR(patch_size, in_channels, self.llm.config.hidden_size)
+        self.input_x_embedder = PatchEmbedMR(patch_size, in_channels, self.llm.config.hidden_size)
 
+        # Time embedding layers
+        self.time_token = TimestepEmbedder(self.llm.config.hidden_size)
+        self.t_embedder = TimestepEmbedder(self.llm.config.hidden_size)
+        
+        # Output layers
+        self.final_layer = FinalLayer(self.llm.config.hidden_size, patch_size, self.in_channels)
+        
         self.initialize_weights()
 
     @classmethod
@@ -384,7 +391,7 @@ class OmniGen(Model):
         Returns:
             Tensor of shape [N, H, W, C] containing the reconstructed image
         """
-        c = self.out_channels
+        c = self.in_channels
         p = self.patch_size
         
         x = tf.reshape(x, [-1, h // p, w // p, p * p * c])
@@ -408,9 +415,9 @@ class OmniGen(Model):
         h, w = height // self.patch_size, width // self.patch_size
         pos_embed = self.pos_embed
         
-        if h * w != self.pos_embed_max_size * self.pos_embed_max_size:
+        if h * w != self.pos_embed.shape[1]:
             pos_embed = get_2d_sincos_pos_embed(
-                self.llm.config.hidden_size,
+                self.config.hidden_size,
                 (h, w),
                 interpolation_scale=self.pe_interpolation,
                 base_size=64
