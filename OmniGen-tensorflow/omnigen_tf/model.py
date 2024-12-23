@@ -7,13 +7,12 @@ closely follows the PyTorch version while utilizing TensorFlow-specific optimiza
 
 import os
 import tensorflow as tf
-import numpy as np
-import math
 from tensorflow.keras import layers, Model
-from diffusers.loaders import PeftAdapterMixin
+import numpy as np
+from typing import Dict, Optional, List, Union
+from safetensors import safe_open
 from huggingface_hub import snapshot_download
-from safetensors.tensorflow import load_file
-import gc
+from diffusers.loaders import PeftAdapterMixin
 
 from omnigen_tf.transformer import Phi3Config, Phi3Transformer
 
@@ -246,7 +245,7 @@ class PatchEmbedMR(layers.Layer):
         return x
 
 
-class OmniGen(tf.keras.Model):
+class OmniGen(tf.keras.Model, PeftAdapterMixin):
     """Diffusion model with a Transformer backbone.
     
     This is the main OmniGen model that combines:
@@ -254,12 +253,14 @@ class OmniGen(tf.keras.Model):
     2. Timestep embedding for diffusion conditioning
     3. Transformer backbone for processing
     4. Adaptive layer normalization for conditioning
+    5. LoRA support for efficient fine-tuning (via PeftAdapterMixin)
     
     The model can handle:
     - Multiple input resolutions
     - Classifier-free guidance
     - Key-value caching for efficient inference
     - Multi-modal inputs (text + images)
+    - Parameter efficient fine-tuning with LoRA
     
     Args:
         transformer_config: Configuration for the Phi3 transformer
@@ -280,18 +281,8 @@ class OmniGen(tf.keras.Model):
         device=None,
         dtype=tf.bfloat16,
     ):
-        """Initialize OmniGen model.
-        
-        Args:
-            transformer_config: Configuration for the transformer model
-            patch_size: Size of patches for patch embedding
-            in_channels: Number of input channels
-            pe_interpolation: Interpolation scale for positional embeddings (must be float)
-            pos_embed_max_size: Maximum size for positional embeddings
-            device: Device to place model on ('CPU', 'GPU', or None for auto-detect)
-            dtype: Data type for model weights and computations
-        """
-        super().__init__()
+        tf.keras.Model.__init__(self)
+        PeftAdapterMixin.__init__(self)
         
         # Set up device and dtype strategy
         if device is None:

@@ -11,9 +11,11 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import tensorflow as tf
 import numpy as np
 from PIL import Image
+from safetensors import safe_open
 from huggingface_hub import snapshot_download
 from diffusers.models import AutoencoderKL
 from diffusers.utils import logging
+from peft import PeftAdapterMixin
 
 from .model import OmniGen
 from .processor import OmniGenProcessor
@@ -37,7 +39,7 @@ EXAMPLE_DOC_STRING = """
 """
 
 
-class OmniGenPipeline:
+class OmniGenPipeline(PeftAdapterMixin):
     """Pipeline for text-to-image generation using OmniGen."""
     
     def __init__(
@@ -289,3 +291,27 @@ class OmniGenPipeline:
         with tf.device(self.device):
             self.model = tf.identity(self.model)
             self.vae = tf.identity(self.vae)
+
+    def merge_lora(self, lora_path: str):
+        """Merge LoRA weights into the base model.
+        
+        This method loads a LoRA checkpoint and merges its weights into the base model,
+        effectively applying the fine-tuned adaptations permanently.
+        
+        Args:
+            lora_path: Path to the LoRA checkpoint
+        """
+        # Load LoRA weights
+        if not os.path.exists(lora_path):
+            lora_path = snapshot_download(
+                repo_id=lora_path,
+                cache_dir=os.getenv('HF_HUB_CACHE'),
+                allow_patterns="*.safetensors"
+            )
+            
+        # Load weights using safetensors
+        lora_state_dict = safe_open(lora_path, framework="tf")
+        
+        # Let PeftAdapterMixin handle the merging
+        self.load_adapter_weights(lora_state_dict)
+        print(f"Successfully merged LoRA weights from {lora_path}")
