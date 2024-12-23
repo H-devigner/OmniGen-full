@@ -57,42 +57,99 @@ class StaticCache(Cache):
 class Phi3Transformer(tf.keras.Model):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers.
-    Each layer is a [`Phi3DecoderLayer`]. We only modified the attention mask.
+    We only modified the attention mask
     
     Args:
-        config: Phi3Config configuration object
+        config: Phi3Config
     """
-    def __init__(self, config: Phi3Config, **kwargs):
-        super().__init__(**kwargs)
-        print("Initializing Phi3Transformer with config")
-        
+    def __init__(self, config, dtype=None):
+        super().__init__()
         self.config = config
-        # Get layer norm epsilon, default to 1e-5 if not present
-        layer_norm_eps = getattr(config, 'layer_norm_eps', 1e-5)
+        self._dtype = dtype or tf.float32
+        self.num_hidden_layers = config.num_hidden_layers
         
-        # Renamed `layers` to `decoder_layers` to avoid conflict with TensorFlow's reserved `Model.layers`
-        self.decoder_layers = [Phi3DecoderLayer(config) for _ in range(config.num_hidden_layers)]
-        self.norm = layers.LayerNormalization(epsilon=layer_norm_eps)
-        self.use_cache = config.use_cache
+        # Initialize layers
+        self.layers = []
+        for i in range(config.num_hidden_layers):
+            layer = Phi3DecoderLayer(config, dtype=self._dtype)
+            self.layers.append(layer)
+            
+        self.norm = tf.keras.layers.LayerNormalization(
+            epsilon=config.layer_norm_eps,
+            dtype=self._dtype
+        )
         
-        print("Phi3Transformer initialization completed")
-        print(f"Number of decoder layers: {len(self.decoder_layers)}")
-        print(f"Hidden size: {config.hidden_size}")
-        print(f"Layer norm epsilon: {layer_norm_eps}")
-
-    def prefetch_layer(self, layer_idx: int, device: str):
-        """Prefetch layer to device (TensorFlow handles this automatically)."""
-        logger.info(f"Layer {layer_idx} prefetch handled by TensorFlow")
-
-    def evict_previous_layer(self, layer_idx: int):
-        """Evict layer from device (TensorFlow handles this automatically)."""
-        logger.info(f"Layer {layer_idx} eviction handled by TensorFlow")
-
-    def get_offload_layer(self, layer_idx: int, device: str):
-        """Handle layer offloading (TensorFlow manages memory automatically)."""
-        self.evict_previous_layer(layer_idx - 1)
-        self.prefetch_layer((layer_idx + 1) % len(self.decoder_layers), device)
-
+        # Memory management
+        self._current_device = None
+        self._active_layer_idx = None
+        self._layer_weights_cpu = [None] * len(self.layers)
+        self._prefetch_queue = []
+        
+    def _get_device_strategy(self):
+        """Get current device strategy."""
+        if self._current_device is None:
+            # Default to GPU if available
+            gpus = tf.config.list_physical_devices('GPU')
+            self._current_device = '/GPU:0' if gpus else '/CPU:0'
+        return self._current_device
+        
+    def prefetch_layer(self, layer_idx: int):
+        """Prefetch next layer weights to device."""
+        if layer_idx >= len(self.layers):
+            return
+            
+        # Skip if weights already on device
+        if self._active_layer_idx == layer_idx:
+            return
+            
+        device = self._get_device_strategy()
+        with tf.device(device):
+            # If weights are on CPU, restore them
+            if self._layer_weights_cpu[layer_idx] is not None:
+                weights = self._layer_weights_cpu[layer_idx]
+                self.layers[layer_idx].set_weights([
+                    tf.convert_to_tensor(w, dtype=self._dtype) 
+                    for w in weights
+                ])
+                self._layer_weights_cpu[layer_idx] = None
+                
+        self._prefetch_queue.append(layer_idx)
+                
+    def evict_layer(self, layer_idx: int):
+        """Move layer weights to CPU."""
+        if layer_idx < 0 or self._layer_weights_cpu[layer_idx] is not None:
+            return
+            
+        # Store weights on CPU
+        weights = self.layers[layer_idx].get_weights()
+        self._layer_weights_cpu[layer_idx] = [w.numpy() for w in weights]
+        
+        # Clear from device
+        with tf.device('/CPU:0'):
+            self.layers[layer_idx].set_weights([
+                tf.zeros_like(w, dtype=self._dtype)
+                for w in weights
+            ])
+            
+        if self._active_layer_idx == layer_idx:
+            self._active_layer_idx = None
+            
+    def manage_layer_memory(self, current_idx: int):
+        """Manage layer memory by prefetching and evicting."""
+        # Evict layers we don't need
+        if self._active_layer_idx is not None and self._active_layer_idx != current_idx:
+            self.evict_layer(self._active_layer_idx)
+            
+        # Prefetch current layer
+        self.prefetch_layer(current_idx)
+        
+        # Prefetch next layer
+        next_idx = current_idx + 1
+        if next_idx < len(self.layers):
+            self.prefetch_layer(next_idx)
+            
+        self._active_layer_idx = current_idx
+        
     def _update_causal_mask(
         self, 
         attention_mask: Optional[tf.Tensor],
@@ -141,105 +198,87 @@ class Phi3Transformer(tf.keras.Model):
 
     def call(
         self,
-        input_ids: Optional[tf.Tensor] = None,
-        attention_mask: Optional[tf.Tensor] = None,
-        position_ids: Optional[tf.Tensor] = None,
-        past_key_values: Optional[List[tf.Tensor]] = None,
-        inputs_embeds: Optional[tf.Tensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        cache_position: Optional[tf.Tensor] = None,
-        offload_model: Optional[bool] = False,
-        training: bool = False,
-    ) -> Union[Tuple, BaseModelOutputWithPast]:
-        """
-        Forward pass of the model.
-        
-        Args:
-            input_ids: Input token IDs
-            attention_mask: Attention mask
-            position_ids: Position IDs
-            past_key_values: Past key-value states for caching
-            inputs_embeds: Pre-computed input embeddings
-            use_cache: Whether to use caching
-            output_attentions: Whether to output attention weights
-            output_hidden_states: Whether to output hidden states
-            return_dict: Whether to return a ModelOutput object
-            cache_position: Position in cache
-            offload_model: Whether to offload model to CPU
-            training: Whether in training mode
-            
-        Returns:
-            Model outputs with hidden states and optional cache
-        """
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        cache_position=None,
+        offload_model=False,
+        training=False,
+    ):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
+        
+        if input_ids is None and inputs_embeds is None:
+            raise ValueError("You must specify either input_ids or inputs_embeds")
+            
+        # Handle attention mask format
         if attention_mask is not None and len(tf.shape(attention_mask)) == 3:
             dtype = inputs_embeds.dtype
-            min_dtype = tf.dtypes.as_dtype(dtype).min
-            attention_mask = (1 - attention_mask) * min_dtype
-            attention_mask = attention_mask[:, None, :, :]
+            min_val = tf.experimental.numpy.finfo(dtype.as_numpy_dtype).min
+            attention_mask = (1.0 - tf.cast(attention_mask, dtype)) * min_val
+            attention_mask = tf.expand_dims(attention_mask, axis=1)
         else:
-            attention_mask = self._update_causal_mask(
-                attention_mask,
-                tf.shape(inputs_embeds),
-                inputs_embeds.dtype,
-                past_key_values.get_seq_length() if past_key_values is not None else 0
-            )
-
+            raise Exception("attention_mask parameter was unavailable or invalid")
+            
         hidden_states = inputs_embeds
+        
+        # Initialize caches
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
-
-        for idx, decoder_layer in enumerate(self.decoder_layers):
+        
+        # Process through layers
+        for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
+                all_hidden_states = all_hidden_states + (hidden_states,)
+                
+            # Memory management
             if offload_model and not training:
-                self.get_offload_layer(idx, device="GPU")
-
+                self.manage_layer_memory(idx)
+                
+            # Layer forward pass
             layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_value=past_key_values[idx] if past_key_values is not None else None,
+                past_key_value=past_key_values,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
                 cache_position=cache_position,
-                training=training,
+                training=training
             )
-
+            
             hidden_states = layer_outputs[0]
-
+            
             if use_cache:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
-
+                
             if output_attentions:
-                all_self_attns += (layer_outputs[1],)
-
+                all_self_attns = all_self_attns + (layer_outputs[1],)
+                
+        # Final layer norm
         hidden_states = self.norm(hidden_states)
-
+        
+        # Add final hidden states
         if output_hidden_states:
-            all_hidden_states += (hidden_states,)
-
+            all_hidden_states = all_hidden_states + (hidden_states,)
+            
         if not return_dict:
             return tuple(v for v in [hidden_states, next_decoder_cache, all_hidden_states, all_self_attns] if v is not None)
-
-        return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            past_key_values=next_decoder_cache,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attns,
-        )
+            
+        return {
+            'last_hidden_state': hidden_states,
+            'past_key_values': next_decoder_cache,
+            'hidden_states': all_hidden_states,
+            'attentions': all_self_attns,
+        }
 
     def initialize_weights(self):
         """Initialize transformer weights."""
@@ -286,7 +325,7 @@ class Phi3Transformer(tf.keras.Model):
 class Phi3DecoderLayer(tf.keras.Model):
     """Decoder layer for Phi3 model with self-attention and feed-forward networks."""
     
-    def __init__(self, config: Phi3Config, **kwargs):
+    def __init__(self, config: Phi3Config, dtype=None, **kwargs):
         super().__init__(**kwargs)
         print(f"Initializing Phi3DecoderLayer with config..")
         
