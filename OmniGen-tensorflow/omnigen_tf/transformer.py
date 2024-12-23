@@ -67,14 +67,18 @@ class Phi3Transformer(tf.keras.Model):
         print("Initializing Phi3Transformer with config:", config)
         
         self.config = config
+        # Get layer norm epsilon, default to 1e-5 if not present
+        layer_norm_eps = getattr(config, 'layer_norm_eps', 1e-5)
+        
         # Renamed `layers` to `decoder_layers` to avoid conflict with TensorFlow's reserved `Model.layers`
         self.decoder_layers = [Phi3DecoderLayer(config) for _ in range(config.num_hidden_layers)]
-        self.norm = layers.LayerNormalization(epsilon=config.layer_norm_eps)
+        self.norm = layers.LayerNormalization(epsilon=layer_norm_eps)
         self.use_cache = config.use_cache
         
         print("Phi3Transformer initialization completed")
         print(f"Number of decoder layers: {len(self.decoder_layers)}")
         print(f"Hidden size: {config.hidden_size}")
+        print(f"Layer norm epsilon: {layer_norm_eps}")
 
     def prefetch_layer(self, layer_idx: int, device: str):
         """Prefetch layer to device (TensorFlow handles this automatically)."""
@@ -247,32 +251,36 @@ class Phi3DecoderLayer(tf.keras.Model):
         
         self.config = config
         
+        # Get configuration values with defaults
+        layer_norm_eps = getattr(config, 'layer_norm_eps', 1e-5)
+        attention_dropout = getattr(config, 'attention_dropout', 0.0)
+        hidden_dropout = getattr(config, 'hidden_dropout_prob', 0.1)
+        
         # Initialize attention layer
         print("Creating self-attention layer...")
         self.self_attn = layers.MultiHeadAttention(
             num_heads=config.num_attention_heads,
             key_dim=config.hidden_size // config.num_attention_heads,
-            dropout=config.attention_dropout if hasattr(config, 'attention_dropout') else 0.0,
+            dropout=attention_dropout,
             name="self_attn"
         )
         
         # Initialize MLP
         print("Creating MLP layers...")
-        dropout_rate = config.hidden_dropout_prob if hasattr(config, 'hidden_dropout_prob') else 0.1
         self.mlp = tf.keras.Sequential([
             layers.Dense(config.intermediate_size, activation="gelu", name="fc1"),
             layers.Dense(config.hidden_size, name="fc2"),
-            layers.Dropout(dropout_rate),
+            layers.Dropout(hidden_dropout),
         ], name="mlp")
         
         # Initialize layer norms
         print("Creating layer normalizations...")
         self.input_layernorm = layers.LayerNormalization(
-            epsilon=config.layer_norm_eps, 
+            epsilon=layer_norm_eps, 
             name="input_layernorm"
         )
         self.post_attention_layernorm = layers.LayerNormalization(
-            epsilon=config.layer_norm_eps, 
+            epsilon=layer_norm_eps, 
             name="post_attention_layernorm"
         )
         
@@ -280,7 +288,9 @@ class Phi3DecoderLayer(tf.keras.Model):
         print(f"Attention heads: {config.num_attention_heads}")
         print(f"Hidden size: {config.hidden_size}")
         print(f"Intermediate size: {config.intermediate_size}")
-        print(f"Dropout rate: {dropout_rate}")
+        print(f"Layer norm epsilon: {layer_norm_eps}")
+        print(f"Attention dropout: {attention_dropout}")
+        print(f"Hidden dropout: {hidden_dropout}")
 
     def call(
         self,
