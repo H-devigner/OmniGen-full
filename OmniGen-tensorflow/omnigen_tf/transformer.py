@@ -75,7 +75,7 @@ class Phi3Transformer(tf.keras.Model):
             self.decoder_layers.append(layer)
             
         self.norm = tf.keras.layers.LayerNormalization(
-            epsilon=config.layer_norm_eps,
+            epsilon=1e-5,  # Default value used in the PyTorch implementation
             dtype=self._dtype
         )
         
