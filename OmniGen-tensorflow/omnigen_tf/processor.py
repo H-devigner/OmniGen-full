@@ -8,6 +8,7 @@ import os
 import re
 from typing import Dict, List, Union, Optional
 import json
+import random
 
 import tensorflow as tf
 import numpy as np
@@ -119,44 +120,107 @@ class OmniGenProcessor:
 
 class OmniGenCollator:
     """Collator class for OmniGen model."""
-    def __call__(self, features):
-        # Implement collator logic here
-        input_ids = [feature['input_ids'] for feature in features]
-        pixel_values = [feature['pixel_values'] for feature in features]
-        image_sizes = [feature['image_sizes'] for feature in features]
-
-        # Pad input_ids to the longest sequence length
+    
+    def __init__(self, pad_token_id=2, hidden_size=3072):
+        self.pad_token_id = pad_token_id
+        self.hidden_size = hidden_size
+    
+    def create_position(self, attention_mask, num_tokens_for_output_images):
+        """Create position IDs from attention mask."""
+        batch_size = tf.shape(attention_mask)[0]
+        seq_length = tf.shape(attention_mask)[1]
+        
+        position_ids = tf.range(seq_length, dtype=tf.int32)[None].repeat(batch_size, axis=0)
+        position_ids = tf.where(attention_mask > 0, position_ids, 0)
+        
+        if num_tokens_for_output_images > 0:
+            output_position_ids = tf.range(num_tokens_for_output_images, dtype=tf.int32)
+            position_ids = tf.concat([position_ids, output_position_ids[None].repeat(batch_size, axis=0)], axis=1)
+        
+        return position_ids
+    
+    def create_mask(self, attention_mask, num_tokens_for_output_images):
+        """Create attention mask with output image tokens."""
+        batch_size = tf.shape(attention_mask)[0]
+        if num_tokens_for_output_images > 0:
+            output_mask = tf.ones((batch_size, num_tokens_for_output_images), dtype=tf.int32)
+            attention_mask = tf.concat([attention_mask, output_mask], axis=1)
+        return attention_mask
+    
+    def adjust_attention_for_input_images(self, attention_mask, image_sizes):
+        """Adjust attention mask for input images."""
+        if image_sizes is None:
+            return attention_mask
+            
+        for img_size in image_sizes:
+            start_idx, end_idx = img_size
+            attention_mask[:, start_idx:end_idx] = 1
+        return attention_mask
+    
+    def pad_input_ids(self, input_ids, image_sizes):
+        """Pad input IDs accounting for image tokens."""
         max_length = max(len(ids) for ids in input_ids)
-        padded_input_ids = [ids + [0] * (max_length - len(ids)) for ids in input_ids]
-
-        # Stack pixel_values and image_sizes
-        pixel_values = tf.stack(pixel_values, axis=0)
-        image_sizes = tf.stack(image_sizes, axis=0)
-
+        padded_input_ids = [ids + [self.pad_token_id] * (max_length - len(ids)) for ids in input_ids]
+        return tf.convert_to_tensor(padded_input_ids, dtype=tf.int32)
+    
+    def process_mllm_input(self, mllm_inputs, target_img_size):
+        """Process multi-modal inputs."""
+        input_ids = mllm_inputs["input_ids"]
+        pixel_values = mllm_inputs.get("pixel_values")
+        image_sizes = mllm_inputs.get("image_sizes")
+        
+        # Create attention mask
+        attention_mask = tf.cast(tf.not_equal(input_ids, self.pad_token_id), tf.int32)
+        attention_mask = self.adjust_attention_for_input_images(attention_mask, image_sizes)
+        
+        # Create position IDs
+        position_ids = self.create_position(attention_mask, target_img_size)
+        
+        # Update attention mask for output image tokens
+        attention_mask = self.create_mask(attention_mask, target_img_size)
+        
         return {
-            "input_ids": padded_input_ids,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
             "pixel_values": pixel_values,
             "image_sizes": image_sizes
         }
+    
+    def __call__(self, features):
+        """Process a batch of features."""
+        input_ids = [feature["input_ids"] for feature in features]
+        pixel_values = [feature.get("pixel_values") for feature in features]
+        image_sizes = [feature.get("image_sizes") for feature in features]
+        
+        # Pad input IDs
+        input_ids = self.pad_input_ids(input_ids, image_sizes)
+        
+        # Process multi-modal inputs
+        target_img_size = self.hidden_size // 16  # Same as PyTorch version
+        batch = self.process_mllm_input(
+            {"input_ids": input_ids, "pixel_values": pixel_values, "image_sizes": image_sizes},
+            target_img_size
+        )
+        
+        return batch
+
 
 class OmniGenSeparateCollator:
     """Separate collator class for OmniGen model."""
+    
     def __call__(self, features):
-        # Implement separate collator logic here
-        input_ids = [feature['input_ids'] for feature in features]
-        pixel_values = [feature['pixel_values'] for feature in features]
-        image_sizes = [feature['image_sizes'] for feature in features]
-
-        # Pad input_ids to the longest sequence length
-        max_length = max(len(ids) for ids in input_ids)
-        padded_input_ids = [ids + [0] * (max_length - len(ids)) for ids in input_ids]
-
-        # Stack pixel_values and image_sizes
-        pixel_values = tf.stack(pixel_values, axis=0)
-        image_sizes = tf.stack(image_sizes, axis=0)
-
+        """Process features separately."""
+        input_ids = [feature["input_ids"] for feature in features]
+        pixel_values = [feature.get("pixel_values") for feature in features]
+        image_sizes = [feature.get("image_sizes") for feature in features]
+        
+        # Stack pixel values if present
+        if any(pv is not None for pv in pixel_values):
+            pixel_values = tf.stack([pv for pv in pixel_values if pv is not None])
+        
         return {
-            "input_ids": padded_input_ids,
+            "input_ids": input_ids,
             "pixel_values": pixel_values,
             "image_sizes": image_sizes
         }
