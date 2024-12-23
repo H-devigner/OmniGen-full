@@ -89,7 +89,7 @@ class FinalLayer(layers.Layer):
         patch_size: Size of image patches
         out_channels: Number of output channels
     """
-    def __init__(self, hidden_size, patch_size, out_channels):
+    def __init__(self, hidden_size, patch_size, out_channels, dtype=tf.float32):
         super().__init__()
         self.norm_final = tf.keras.layers.LayerNormalization(epsilon=1e-6)
         self.linear = layers.Dense(patch_size * patch_size * out_channels, use_bias=True)
@@ -269,7 +269,7 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         pe_interpolation: Interpolation scale for positional embeddings (must be float)
         pos_embed_max_size: Maximum size for positional embeddings
         device: Device to place model on ('CPU', 'GPU', or None for auto-detect)
-        dtype: Data type for model weights and computations
+        compute_dtype: Data type for computations (e.g. tf.float32, tf.bfloat16)
         mixed_precision: Whether to use mixed precision training
     """
     def __init__(
@@ -280,11 +280,20 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         pe_interpolation: float = 1.0,
         pos_embed_max_size: int = 192,
         device=None,
-        dtype=tf.bfloat16,
+        compute_dtype=tf.bfloat16,
         mixed_precision: bool = True,
     ):
         tf.keras.Model.__init__(self)
         PeftAdapterMixin.__init__(self)
+        
+        # Store configuration
+        self._compute_dtype = compute_dtype
+        self._device = None
+        self.patch_size = patch_size
+        self.in_channels = in_channels
+        self.out_channels = in_channels
+        self.pos_embed_max_size = pos_embed_max_size
+        self.pe_interpolation = pe_interpolation
         
         # Set up device and dtype strategy
         if device is None:
@@ -306,72 +315,70 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
                     print("Mixed precision disabled on CPU")
                     mixed_precision = False
                     
-        self.device = device
-        self.dtype = dtype
-        
+        self._device = device
+
         # Initialize memory optimization flags
         self.use_kv_cache = True
         self.offload_kv_cache = True
-        self.kv_cache = None
-        self.cpu_offload = False
+        self.model_cpu_offload = False
         
-        with tf.device(f'/{device}:0'):
-            # Save configuration
-            self.config = transformer_config
-            self.patch_size = patch_size
-            self.in_channels = in_channels
-            self.out_channels = in_channels
-            self.pos_embed_max_size = pos_embed_max_size
+        # Build model components
+        with tf.device(f'/{self._device}:0'):
+            # Create embedders
+            self.x_embedder = PatchEmbedMR(
+                patch_size, in_channels, transformer_config.hidden_size,
+                dtype=self._compute_dtype
+            )
+            self.input_x_embedder = PatchEmbedMR(
+                patch_size, in_channels, transformer_config.hidden_size,
+                dtype=self._compute_dtype
+            )
             
-            # Ensure pe_interpolation is float
-            if not isinstance(pe_interpolation, (int, float)):
-                print(f"Warning: pe_interpolation should be float, got {type(pe_interpolation)}. Using default value 1.0")
-                self.pe_interpolation = 1.0
-            else:
-                self.pe_interpolation = float(pe_interpolation)
+            # Create time embedders
+            self.time_token = TimestepEmbedder(
+                transformer_config.hidden_size,
+                dtype=self._compute_dtype
+            )
+            self.t_embedder = TimestepEmbedder(
+                transformer_config.hidden_size,
+                dtype=self._compute_dtype
+            )
             
-            # Initialize embedders with proper dtype
-            print("Creating embedders...")
-            self.x_embedder = PatchEmbedMR(patch_size, in_channels, self.config.hidden_size, bias=True, dtype=dtype)
-            self.input_x_embedder = PatchEmbedMR(patch_size, in_channels, self.config.hidden_size, bias=True, dtype=dtype)
-            
-            # Initialize time embedders
-            print("Creating time embedders...")
-            self.time_token = TimestepEmbedder(self.config.hidden_size, dtype=dtype)
-            self.t_embedder = TimestepEmbedder(self.config.hidden_size, dtype=dtype)
-            
-            try:
-                # Initialize transformer (LLM)
-                print("Creating Phi3Transformer...")
-                self.llm = Phi3Transformer(transformer_config)
-                print("Phi3Transformer created successfully")
-                
-                if not hasattr(self, 'llm') or self.llm is None:
-                    raise ValueError("LLM initialization failed")
-                    
-            except Exception as e:
-                print(f"Error initializing LLM: {str(e)}")
-                raise
-                
-            # Set up positional embeddings
-            print("Setting up positional embeddings...")
+            # Create positional embeddings
             pos_embed = get_2d_sincos_pos_embed(
-                self.llm.config.hidden_size,
+                transformer_config.hidden_size,
                 pos_embed_max_size,
                 interpolation_scale=self.pe_interpolation,
                 base_size=64
             )
-            self.pos_embed = tf.Variable(pos_embed[None], trainable=False, dtype=dtype)
-            print("Positional embeddings created")
+            self.pos_embed = tf.constant(pos_embed, dtype=self._compute_dtype)
             
-            # Initialize final layer
-            print("Creating final layer...")
-            self.final_layer = FinalLayer(self.config.hidden_size, patch_size, self.out_channels)
-            print("Final layer created")
+            # Create final layer
+            self.final_layer = FinalLayer(
+                transformer_config.hidden_size,
+                patch_size,
+                self.out_channels,
+                dtype=self._compute_dtype
+            )
             
-        # Set model to eval mode
-        self.trainable = False
+            # Create transformer
+            self.transformer = Phi3Transformer(
+                transformer_config,
+                dtype=self._compute_dtype
+            )
+            
+        self.initialize_weights()
+
+    @property
+    def compute_dtype(self):
+        """Get the computation dtype."""
+        return self._compute_dtype
         
+    @property
+    def device(self):
+        """Get the device."""
+        return self._device
+
     @tf.function(reduce_retracing=True)
     def call(self, *args, training=False, **kwargs):
         """Memory-efficient forward pass with KV caching."""
@@ -402,7 +409,7 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
             
     def enable_cpu_offload(self):
         """Enable CPU offloading for memory savings."""
-        self.cpu_offload = True
+        self.model_cpu_offload = True
         with tf.device('/CPU:0'):
             for layer in self.layers:
                 layer = tf.identity(layer)
@@ -411,7 +418,7 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         
     def disable_cpu_offload(self):
         """Disable CPU offloading."""
-        self.cpu_offload = False
+        self.model_cpu_offload = False
         with tf.device(f'/{self.device}:0'):
             for layer in self.layers:
                 layer = tf.identity(layer)
@@ -553,7 +560,7 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         
         if h * w != self.pos_embed.shape[1]:
             pos_embed = get_2d_sincos_pos_embed(
-                self.llm.config.hidden_size,
+                self.transformer.config.hidden_size,
                 (h, w),
                 interpolation_scale=self.pe_interpolation,
                 base_size=64
@@ -660,7 +667,7 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
             hidden_states = tf.concat([hidden_states, input_img_embeds], axis=1)
         
         # Transformer forward pass
-        outputs = self.llm(
+        outputs = self.transformer(
             input_ids=input_ids,
             inputs_embeds=hidden_states,
             attention_mask=attention_mask,
