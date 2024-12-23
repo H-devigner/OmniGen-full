@@ -323,7 +323,7 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         self.model_cpu_offload = False
         self._kv_cache = None
         
-        # Build model components
+        # Build model components with proper device placement
         with tf.device(f'/{self._device}:0'):
             # Create embedders
             self.x_embedder = PatchEmbedMR(
@@ -372,40 +372,50 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
             
         self.initialize_weights()
 
-    @property
-    def compute_dtype(self):
-        """Get the computation dtype."""
-        return self._compute_dtype
-        
-    @property
-    def device(self):
-        """Get the device."""
-        return self._device
-
     def enable_cpu_offload(self):
         """Enable CPU offloading for memory savings."""
         self.model_cpu_offload = True
         print("Moving model layers to CPU...")
+        
+        # Use tf.device context to ensure proper placement
         with tf.device('/CPU:0'):
-            # Move transformer layers to CPU
+            # Move transformer layers to CPU by forcing a copy
             for layer in self.transformer.layers:
-                layer = tf.identity(layer)
+                layer.set_weights([tf.identity(w).numpy() for w in layer.weights])
+                
             # Move embedders to CPU
-            self.x_embedder = tf.identity(self.x_embedder)
-            self.input_x_embedder = tf.identity(self.input_x_embedder)
+            self.x_embedder.set_weights([tf.identity(w).numpy() for w in self.x_embedder.weights])
+            self.input_x_embedder.set_weights([tf.identity(w).numpy() for w in self.input_x_embedder.weights])
+            
+            # Move other components
+            self.time_token.set_weights([tf.identity(w).numpy() for w in self.time_token.weights])
+            self.t_embedder.set_weights([tf.identity(w).numpy() for w in self.t_embedder.weights])
+            self.final_layer.set_weights([tf.identity(w).numpy() for w in self.final_layer.weights])
+            
+        # Clear GPU memory
+        tf.keras.backend.clear_session()
         print("Model layers moved to CPU")
 
     def disable_cpu_offload(self):
         """Disable CPU offloading."""
         self.model_cpu_offload = False
         print("Moving model layers back to GPU...")
+        
+        # Use tf.device context to ensure proper placement
         with tf.device(f'/{self._device}:0'):
             # Move transformer layers back to GPU
             for layer in self.transformer.layers:
-                layer = tf.identity(layer)
+                layer.set_weights([tf.identity(w) for w in layer.weights])
+                
             # Move embedders back to GPU
-            self.x_embedder = tf.identity(self.x_embedder)
-            self.input_x_embedder = tf.identity(self.input_x_embedder)
+            self.x_embedder.set_weights([tf.identity(w) for w in self.x_embedder.weights])
+            self.input_x_embedder.set_weights([tf.identity(w) for w in self.input_x_embedder.weights])
+            
+            # Move other components
+            self.time_token.set_weights([tf.identity(w) for w in self.time_token.weights])
+            self.t_embedder.set_weights([tf.identity(w) for w in self.t_embedder.weights])
+            self.final_layer.set_weights([tf.identity(w) for w in self.final_layer.weights])
+            
         print("Model layers moved back to GPU")
 
     def enable_kv_cache(self):
@@ -432,7 +442,8 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         if self._kv_cache is not None:
             print("Moving KV cache to CPU...")
             with tf.device('/CPU:0'):
-                self._kv_cache = [tf.identity(k) for k in self._kv_cache]
+                # Convert tensors to numpy and store on CPU
+                self._kv_cache = [tf.identity(k).numpy() for k in self._kv_cache]
             print("KV cache moved to CPU")
 
     def load_kv_cache_to_gpu(self):
@@ -440,7 +451,8 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         if self._kv_cache is not None:
             print("Moving KV cache to GPU...")
             with tf.device(f'/{self._device}:0'):
-                self._kv_cache = [tf.identity(k) for k in self._kv_cache]
+                # Convert numpy arrays back to tensors on GPU
+                self._kv_cache = [tf.convert_to_tensor(k, dtype=self._compute_dtype) for k in self._kv_cache]
             print("KV cache moved to GPU")
 
     @tf.function(reduce_retracing=True)
