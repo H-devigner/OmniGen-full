@@ -445,6 +445,51 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
             print(f"Error in forward pass: {str(e)}")
             raise
 
+    def initialize_weights(self):
+        """Initialize model weights."""
+        # Helper function to initialize a single layer
+        def _init_weights(layer):
+            if isinstance(layer, tf.keras.layers.Dense):
+                # Initialize weight matrices with truncated normal
+                kernel_shape = layer.kernel.shape
+                stddev = 1.0 / tf.sqrt(tf.cast(kernel_shape[-1], tf.float32))
+                layer.kernel.assign(
+                    tf.random.truncated_normal(kernel_shape, stddev=stddev)
+                )
+                
+                # Initialize biases to zero if present
+                if layer.use_bias:
+                    layer.bias.assign(tf.zeros_like(layer.bias))
+                    
+            elif isinstance(layer, tf.keras.layers.LayerNormalization):
+                # Initialize gamma to ones and beta to zeros
+                if layer.gamma is not None:
+                    layer.gamma.assign(tf.ones_like(layer.gamma))
+                if layer.beta is not None:
+                    layer.beta.assign(tf.zeros_like(layer.beta))
+                    
+            elif isinstance(layer, tf.keras.layers.Embedding):
+                # Initialize embeddings with truncated normal
+                kernel_shape = layer.embeddings.shape
+                stddev = 1.0 / tf.sqrt(tf.cast(kernel_shape[-1], tf.float32))
+                layer.embeddings.assign(
+                    tf.random.truncated_normal(kernel_shape, stddev=stddev)
+                )
+        
+        # Initialize all layers recursively
+        for layer in self.layers:
+            if hasattr(layer, 'layers'):  # For nested layers/models
+                for sublayer in layer.layers:
+                    _init_weights(sublayer)
+            else:
+                _init_weights(layer)
+                
+        # Initialize transformer separately since it's a custom model
+        if hasattr(self, 'transformer') and hasattr(self.transformer, 'initialize_weights'):
+            self.transformer.initialize_weights()
+            
+        print("Model weights initialized successfully")
+
     @classmethod
     def from_pretrained(cls, model_name, device=None, mixed_precision=True, **kwargs):
         """Load model from pretrained weights.
@@ -509,19 +554,6 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
                 
         print("Model loaded successfully")
         return model
-
-    def initialize_weights(self):
-        """Initialize model weights using a basic initialization scheme."""
-        def _basic_init(layer):
-            if isinstance(layer, layers.Dense):
-                limit = tf.math.sqrt(6.0 / float(layer.input_shape[-1] + layer.units))
-                layer.kernel.assign(tf.random.uniform(
-                    layer.kernel.shape, -limit, limit, dtype=layer.kernel.dtype
-                ))
-                if layer.use_bias:
-                    layer.bias.assign(tf.zeros_like(layer.bias))
-
-        self.apply(_basic_init)
 
     def unpatchify(self, x, h, w):
         """Convert a sequence of patch embeddings back to an image.

@@ -241,6 +241,46 @@ class Phi3Transformer(tf.keras.Model):
             attentions=all_self_attns,
         )
 
+    def initialize_weights(self):
+        """Initialize transformer weights."""
+        def _init_weights(layer):
+            if isinstance(layer, tf.keras.layers.Dense):
+                # Initialize weight matrices with truncated normal
+                kernel_shape = layer.kernel.shape
+                stddev = 1.0 / tf.sqrt(tf.cast(kernel_shape[-1], tf.float32))
+                layer.kernel.assign(
+                    tf.random.truncated_normal(kernel_shape, stddev=stddev)
+                )
+                
+                # Initialize biases to zero if present
+                if layer.use_bias:
+                    layer.bias.assign(tf.zeros_like(layer.bias))
+                    
+            elif isinstance(layer, tf.keras.layers.LayerNormalization):
+                # Initialize gamma to ones and beta to zeros
+                if layer.gamma is not None:
+                    layer.gamma.assign(tf.ones_like(layer.gamma))
+                if layer.beta is not None:
+                    layer.beta.assign(tf.zeros_like(layer.beta))
+                    
+            elif isinstance(layer, tf.keras.layers.Embedding):
+                # Initialize embeddings with truncated normal
+                kernel_shape = layer.embeddings.shape
+                stddev = 1.0 / tf.sqrt(tf.cast(kernel_shape[-1], tf.float32))
+                layer.embeddings.assign(
+                    tf.random.truncated_normal(kernel_shape, stddev=stddev)
+                )
+        
+        # Initialize all layers recursively
+        for layer in self.layers:
+            if hasattr(layer, 'layers'):  # For nested layers/models
+                for sublayer in layer.layers:
+                    _init_weights(sublayer)
+            else:
+                _init_weights(layer)
+                
+        print("Transformer weights initialized successfully")
+
 
 class Phi3DecoderLayer(tf.keras.Model):
     """Decoder layer for Phi3 model with self-attention and feed-forward networks."""
