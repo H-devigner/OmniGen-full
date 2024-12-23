@@ -479,59 +479,44 @@ class OmniGen(tf.keras.Model):
         """Load model from pretrained weights.
         
         Args:
-            model_name: Name or path of the pretrained model
-            device: Device to place model on ('CPU', 'GPU', or None for auto-detect)
-            **kwargs: Additional arguments passed to model initialization
-            
-        Returns:
-            Loaded model instance
+            model_name: Name or path of pretrained model
+            device: Device to place model on (removed - handled by pipeline)
+            **kwargs: Additional arguments to pass to model constructor
         """
+        # Remove device from kwargs since it's handled by pipeline
+        if 'device' in kwargs:
+            del kwargs['device']
+            
         # Download model if needed
         if not os.path.exists(model_name):
-            print(f"Downloading model from {model_name}...")
+            from huggingface_hub import snapshot_download
             model_name = snapshot_download(model_name)
             print(f"Downloaded model to {model_name}")
             
+        # Create model
         config = Phi3Config.from_pretrained(model_name)
-        model = cls(config, device=device, **kwargs)
+        model = cls(config, **kwargs)
         
+        # Load weights
         if os.path.exists(os.path.join(model_name, 'model.safetensors')):
             print("Loading safetensors weights...")
-            try:
-                from safetensors.tensorflow import load_file
-                
-                # Load weights with CPU device to save memory
-                with tf.device('/CPU:0'):
-                    state_dict = load_file(os.path.join(model_name, 'model.safetensors'))
-                    
-                    # Convert weights to TensorFlow format
-                    tf_weights = {}
-                    for name, tensor in state_dict.items():
-                        # Convert PyTorch weight names to TensorFlow format
-                        tf_name = name.replace('.', '/')
-                        # Ensure tensor is on CPU and convert to float32
-                        tf_weights[tf_name] = tf.cast(tensor, tf.float32)
-                    
-                    # Load weights into model
-                    model.load_weights(tf_weights)
-                    print("Successfully loaded weights from safetensors")
-                    
-            except Exception as e:
-                print(f"Error loading safetensors: {str(e)}")
-                print("Attempting to load TensorFlow checkpoint...")
-                try:
-                    model = tf.saved_model.load(os.path.join(model_name, 'model'))
-                except Exception as e2:
-                    print(f"Error loading TensorFlow checkpoint: {str(e2)}")
-                    raise ValueError("Failed to load model weights") from e2
+            from safetensors.torch import load_file
+            state_dict = load_file(os.path.join(model_name, 'model.safetensors'))
+            # Convert torch state dict to TF
+            tf_state_dict = {}
+            for k, v in state_dict.items():
+                tf_state_dict[k] = tf.convert_to_tensor(v.numpy())
+            model.load_weights(tf_state_dict)
         else:
-            print("No safetensors found, loading TensorFlow checkpoint...")
-            try:
-                model = tf.saved_model.load(os.path.join(model_name, 'model'))
-            except Exception as e:
-                print(f"Error loading TensorFlow checkpoint: {str(e)}")
-                raise ValueError("Failed to load model weights") from e
-                
+            print("Loading PyTorch weights...")
+            import torch
+            state_dict = torch.load(os.path.join(model_name, 'model.pt'), map_location='cpu')
+            # Convert torch state dict to TF
+            tf_state_dict = {}
+            for k, v in state_dict.items():
+                tf_state_dict[k] = tf.convert_to_tensor(v.numpy())
+            model.load_weights(tf_state_dict)
+            
         return model
 
     def unpatchify(self, x, h, w):

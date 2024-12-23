@@ -167,42 +167,51 @@ class OmniGenPipeline:
         """Load pipeline from pretrained models.
         
         Args:
-            model_name: Name or path of the pretrained model
+            model_name: Name or path of pretrained model
             vae_path: Optional path to VAE model
             device: Device to place models on ('CPU', 'GPU', or None for auto-detect)
-            
-        Returns:
-            Initialized pipeline
         """
+        # Set device if not provided
+        if device is None:
+            if tf.config.list_physical_devices('GPU'):
+                device = '/GPU:0'
+            else:
+                print("No GPU found, using CPU. This may be slow!")
+                device = '/CPU:0'
+                
+        # Download model if needed
         if not os.path.exists(model_name):
-            print(f"Downloading model from {model_name}...")
+            from huggingface_hub import snapshot_download
             model_name = snapshot_download(model_name)
             print(f"Downloaded model to {model_name}")
             
-        # Load models with specified device
-        model = OmniGen.from_pretrained(
-            model_name, 
-            device=device,
-        )
-        processor = OmniGenProcessor.from_pretrained(model_name)
-        
-        # Load or download VAE
-        if vae_path is None:
-            vae_path = "stabilityai/sd-vae-ft-mse"
+        # Load models
+        with tf.device('/CPU:0'):  # Load on CPU first
+            model = OmniGen.from_pretrained(model_name)
+            processor = OmniGenProcessor.from_pretrained(model_name)
             
-        if not os.path.exists(vae_path):
-            print(f"Downloading VAE from {vae_path}...")
-            vae_path = snapshot_download(vae_path)
-            print(f"Downloaded VAE to {vae_path}")
+            # Load or download VAE
+            if vae_path is None:
+                vae_path = os.path.join(model_name, 'vae')
+            if not os.path.exists(vae_path):
+                print(f"Downloading VAE from {model_name}...")
+                vae_path = snapshot_download(model_name, subfolder='vae')
+            vae = AutoencoderKL.from_pretrained(vae_path)
             
-        vae = AutoencoderKL.from_pretrained(vae_path)
-        
-        return cls(
+        # Create pipeline
+        pipeline = cls(
+            vae=vae,
             model=model,
             processor=processor,
-            vae=vae,
             device=device
         )
+        
+        # Move to target device if GPU
+        if device == '/GPU:0':
+            pipeline._move_to_device(pipeline.model, device)
+            pipeline._move_to_device(pipeline.vae, device)
+            
+        return pipeline
         
     def vae_encode(self, x: tf.Tensor, dtype: tf.dtypes.DType) -> tf.Tensor:
         """Encode images using VAE.
