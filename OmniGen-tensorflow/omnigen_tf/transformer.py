@@ -103,14 +103,20 @@ class Phi3Transformer(tf.keras.Model):
             return
             
         device = self._get_device_strategy()
+        
+        # Use async execution for prefetching
         with tf.device(device):
-            # If weights are on CPU, restore them
             if self._layer_weights_cpu[layer_idx] is not None:
                 weights = self._layer_weights_cpu[layer_idx]
-                self.decoder_layers[layer_idx].set_weights([
+                # Convert to tensors asynchronously
+                converted_weights = [
                     tf.convert_to_tensor(w, dtype=self._dtype) 
                     for w in weights
-                ])
+                ]
+                # Set weights in a separate thread
+                tf.function(experimental_relax_shapes=True)(
+                    self.decoder_layers[layer_idx].set_weights
+                )(converted_weights)
                 self._layer_weights_cpu[layer_idx] = None
                 
         self._prefetch_queue.append(layer_idx)
@@ -121,21 +127,28 @@ class Phi3Transformer(tf.keras.Model):
             return
             
         # Store weights on CPU
-        weights = self.decoder_layers[layer_idx].get_weights()
-        self._layer_weights_cpu[layer_idx] = [w.numpy() for w in weights]
-        
-        # Clear from device
         with tf.device('/CPU:0'):
-            self.decoder_layers[layer_idx].set_weights([
+            weights = self.decoder_layers[layer_idx].get_weights()
+            # Convert to numpy arrays on CPU
+            self._layer_weights_cpu[layer_idx] = [w.numpy() for w in weights]
+            
+            # Clear GPU memory
+            zero_weights = [
                 tf.zeros_like(w, dtype=self._dtype)
                 for w in weights
-            ])
+            ]
+            tf.function(experimental_relax_shapes=True)(
+                self.decoder_layers[layer_idx].set_weights
+            )(zero_weights)
             
         if self._active_layer_idx == layer_idx:
             self._active_layer_idx = None
             
     def manage_layer_memory(self, current_idx: int):
         """Manage layer memory by prefetching and evicting."""
+        # Ensure previous operations are complete
+        tf.keras.backend.get_session().run(tf.keras.backend.get_session().graph.get_operations())
+        
         # Evict layers we don't need
         if self._active_layer_idx is not None and self._active_layer_idx != current_idx:
             self.evict_layer(self._active_layer_idx)
@@ -149,6 +162,9 @@ class Phi3Transformer(tf.keras.Model):
             self.prefetch_layer(next_idx)
             
         self._active_layer_idx = current_idx
+        
+        # Ensure prefetch is complete
+        tf.keras.backend.get_session().run(tf.keras.backend.get_session().graph.get_operations())
         
     def _update_causal_mask(
         self, 
