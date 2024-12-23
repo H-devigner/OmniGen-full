@@ -305,7 +305,7 @@ class OmniGen(Model):
         """
         super().__init__()
         
-        print("Initializing OmniGen with config:", transformer_config)
+        print("Initializing OmniGen with config")
         
         # Save configuration
         self.config = transformer_config
@@ -325,8 +325,6 @@ class OmniGen(Model):
             if not hasattr(self.llm, 'config'):
                 raise ValueError("LLM configuration is missing")
                 
-            print(f"LLM hidden size: {self.llm.config.hidden_size}")
-            
         except Exception as e:
             print(f"Error initializing LLM: {str(e)}")
             raise
