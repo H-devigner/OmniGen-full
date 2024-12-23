@@ -321,6 +321,7 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         self.use_kv_cache = True
         self.offload_kv_cache = True
         self.model_cpu_offload = False
+        self._kv_cache = None
         
         # Build model components
         with tf.device(f'/{self._device}:0'):
@@ -366,6 +367,8 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
                 transformer_config,
                 dtype=self._compute_dtype
             )
+            # Disable cache by default for memory efficiency
+            self.transformer.config.use_cache = False
             
         self.initialize_weights()
 
@@ -379,71 +382,102 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         """Get the device."""
         return self._device
 
-    @tf.function(reduce_retracing=True)
-    def call(self, *args, training=False, **kwargs):
-        """Memory-efficient forward pass with KV caching."""
-        try:
-            # Use KV cache if enabled
-            if self.use_kv_cache and not training:
-                if self.kv_cache is not None:
-                    kwargs['past_key_values'] = self.kv_cache
-                    
-                # Run forward pass
-                outputs = super().call(*args, training=False, **kwargs)
-                
-                # Update KV cache
-                if self.offload_kv_cache:
-                    with tf.device('/CPU:0'):
-                        self.kv_cache = outputs.past_key_values
-                else:
-                    self.kv_cache = outputs.past_key_values
-                    
-                return outputs
-                
-            else:
-                return super().call(*args, training=training, **kwargs)
-                
-        except Exception as e:
-            print(f"Error in forward pass: {str(e)}")
-            raise
-            
     def enable_cpu_offload(self):
         """Enable CPU offloading for memory savings."""
         self.model_cpu_offload = True
+        print("Moving model layers to CPU...")
         with tf.device('/CPU:0'):
-            for layer in self.layers:
+            # Move transformer layers to CPU
+            for layer in self.transformer.layers:
                 layer = tf.identity(layer)
-        tf.keras.backend.clear_session()
-        gc.collect()
-        
+            # Move embedders to CPU
+            self.x_embedder = tf.identity(self.x_embedder)
+            self.input_x_embedder = tf.identity(self.input_x_embedder)
+        print("Model layers moved to CPU")
+
     def disable_cpu_offload(self):
         """Disable CPU offloading."""
         self.model_cpu_offload = False
-        with tf.device(f'/{self.device}:0'):
-            for layer in self.layers:
+        print("Moving model layers back to GPU...")
+        with tf.device(f'/{self._device}:0'):
+            # Move transformer layers back to GPU
+            for layer in self.transformer.layers:
                 layer = tf.identity(layer)
-                
-    def clear_memory(self):
-        """Clear cached tensors and memory."""
-        self.kv_cache = None
-        tf.keras.backend.clear_session()
-        gc.collect()
+            # Move embedders back to GPU
+            self.x_embedder = tf.identity(self.x_embedder)
+            self.input_x_embedder = tf.identity(self.input_x_embedder)
+        print("Model layers moved back to GPU")
 
-    def memory_efficient_forward(self, *args, **kwargs):
-        """Memory efficient forward pass that cleans up GPU memory."""
-        try:
-            # Run forward pass
-            output = self.call(*args, **kwargs)
+    def enable_kv_cache(self):
+        """Enable key-value caching for faster inference."""
+        self.use_kv_cache = True
+        self.transformer.config.use_cache = True
+        print("Key-value caching enabled")
+
+    def disable_kv_cache(self):
+        """Disable key-value caching."""
+        self.use_kv_cache = False
+        self.transformer.config.use_cache = False
+        self._kv_cache = None
+        print("Key-value caching disabled")
+
+    def clear_kv_cache(self):
+        """Clear the key-value cache."""
+        self._kv_cache = None
+        tf.keras.backend.clear_session()
+        print("Key-value cache cleared")
+
+    def offload_kv_cache_to_cpu(self):
+        """Move key-value cache to CPU to save GPU memory."""
+        if self._kv_cache is not None:
+            print("Moving KV cache to CPU...")
+            with tf.device('/CPU:0'):
+                self._kv_cache = [tf.identity(k) for k in self._kv_cache]
+            print("KV cache moved to CPU")
+
+    def load_kv_cache_to_gpu(self):
+        """Move key-value cache back to GPU."""
+        if self._kv_cache is not None:
+            print("Moving KV cache to GPU...")
+            with tf.device(f'/{self._device}:0'):
+                self._kv_cache = [tf.identity(k) for k in self._kv_cache]
+            print("KV cache moved to GPU")
+
+    @tf.function(reduce_retracing=True)
+    def call(self, *args, training=False, **kwargs):
+        """Memory-efficient forward pass with KV caching."""
+        # Handle CPU offloading
+        if self.model_cpu_offload:
+            self.enable_cpu_offload()
             
-            # Clear unnecessary tensors
+        # Clear session to free memory
+        if not training and not self.use_kv_cache:
             tf.keras.backend.clear_session()
-            gc.collect()
             
-            return output
+        try:
+            # Move KV cache to GPU if needed
+            if self.use_kv_cache and self._kv_cache is not None:
+                self.load_kv_cache_to_gpu()
+                
+            # Forward pass
+            outputs = super().call(*args, training=training, **kwargs)
             
-        except Exception as e:
-            print(f"Error in forward pass: {str(e)}")
-            raise
+            # Update and offload KV cache if needed
+            if self.use_kv_cache and self.offload_kv_cache:
+                if isinstance(outputs, tuple) and len(outputs) > 1:
+                    self._kv_cache = outputs[1]
+                    self.offload_kv_cache_to_cpu()
+                    
+            return outputs
+            
+        finally:
+            # Always move back to GPU if needed
+            if self.model_cpu_offload:
+                self.disable_cpu_offload()
+                
+            # Clear any temporary tensors
+            if not training:
+                tf.keras.backend.clear_session()
 
     def initialize_weights(self):
         """Initialize model weights."""
