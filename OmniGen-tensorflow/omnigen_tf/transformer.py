@@ -252,16 +252,17 @@ class Phi3DecoderLayer(tf.keras.Model):
         self.self_attn = layers.MultiHeadAttention(
             num_heads=config.num_attention_heads,
             key_dim=config.hidden_size // config.num_attention_heads,
-            dropout=config.attention_dropout,
+            dropout=config.attention_dropout if hasattr(config, 'attention_dropout') else 0.0,
             name="self_attn"
         )
         
         # Initialize MLP
         print("Creating MLP layers...")
+        dropout_rate = config.hidden_dropout_prob if hasattr(config, 'hidden_dropout_prob') else 0.1
         self.mlp = tf.keras.Sequential([
             layers.Dense(config.intermediate_size, activation="gelu", name="fc1"),
             layers.Dense(config.hidden_size, name="fc2"),
-            layers.Dropout(config.hidden_dropout),
+            layers.Dropout(dropout_rate),
         ], name="mlp")
         
         # Initialize layer norms
@@ -279,6 +280,7 @@ class Phi3DecoderLayer(tf.keras.Model):
         print(f"Attention heads: {config.num_attention_heads}")
         print(f"Hidden size: {config.hidden_size}")
         print(f"Intermediate size: {config.intermediate_size}")
+        print(f"Dropout rate: {dropout_rate}")
 
     def call(
         self,
