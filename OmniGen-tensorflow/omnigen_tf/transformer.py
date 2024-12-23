@@ -54,7 +54,7 @@ class StaticCache(Cache):
         self.cache[layer_idx][key] = key_value
 
 
-class Phi3Transformer(Model):
+class Phi3Transformer(tf.keras.Model):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers.
     Each layer is a [`Phi3DecoderLayer`]. We only modified the attention mask.
@@ -64,11 +64,17 @@ class Phi3Transformer(Model):
     """
     def __init__(self, config: Phi3Config, **kwargs):
         super().__init__(**kwargs)
+        print("Initializing Phi3Transformer with config:", config)
+        
         self.config = config
         # Renamed `layers` to `decoder_layers` to avoid conflict with TensorFlow's reserved `Model.layers`
         self.decoder_layers = [Phi3DecoderLayer(config) for _ in range(config.num_hidden_layers)]
         self.norm = layers.LayerNormalization(epsilon=config.layer_norm_eps)
         self.use_cache = config.use_cache
+        
+        print("Phi3Transformer initialization completed")
+        print(f"Number of decoder layers: {len(self.decoder_layers)}")
+        print(f"Hidden size: {config.hidden_size}")
 
     def prefetch_layer(self, layer_idx: int, device: str):
         """Prefetch layer to device (TensorFlow handles this automatically)."""
@@ -232,26 +238,47 @@ class Phi3Transformer(Model):
         )
 
 
-class Phi3DecoderLayer(layers.Layer):
-    """
-    Decoder layer for Phi3 model with self-attention and feed-forward networks.
-    """
+class Phi3DecoderLayer(tf.keras.Model):
+    """Decoder layer for Phi3 model with self-attention and feed-forward networks."""
+    
     def __init__(self, config: Phi3Config, **kwargs):
         super().__init__(**kwargs)
+        print(f"Initializing Phi3DecoderLayer with config: {config}")
+        
         self.config = config
+        
+        # Initialize attention layer
+        print("Creating self-attention layer...")
         self.self_attn = layers.MultiHeadAttention(
             num_heads=config.num_attention_heads,
             key_dim=config.hidden_size // config.num_attention_heads,
             dropout=config.attention_dropout,
             name="self_attn"
         )
+        
+        # Initialize MLP
+        print("Creating MLP layers...")
         self.mlp = tf.keras.Sequential([
             layers.Dense(config.intermediate_size, activation="gelu", name="fc1"),
             layers.Dense(config.hidden_size, name="fc2"),
             layers.Dropout(config.hidden_dropout),
         ], name="mlp")
-        self.input_layernorm = layers.LayerNormalization(epsilon=config.layer_norm_eps, name="input_layernorm")
-        self.post_attention_layernorm = layers.LayerNormalization(epsilon=config.layer_norm_eps, name="post_attention_layernorm")
+        
+        # Initialize layer norms
+        print("Creating layer normalizations...")
+        self.input_layernorm = layers.LayerNormalization(
+            epsilon=config.layer_norm_eps, 
+            name="input_layernorm"
+        )
+        self.post_attention_layernorm = layers.LayerNormalization(
+            epsilon=config.layer_norm_eps, 
+            name="post_attention_layernorm"
+        )
+        
+        print("Phi3DecoderLayer initialization completed")
+        print(f"Attention heads: {config.num_attention_heads}")
+        print(f"Hidden size: {config.hidden_size}")
+        print(f"Intermediate size: {config.intermediate_size}")
 
     def call(
         self,

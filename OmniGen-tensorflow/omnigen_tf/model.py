@@ -305,36 +305,61 @@ class OmniGen(Model):
         """
         super().__init__()
         
+        print("Initializing OmniGen with config:", transformer_config)
+        
         # Save configuration
         self.config = transformer_config
         self.patch_size = patch_size
         self.in_channels = in_channels
         
-        # Initialize transformer (LLM)
-        self.llm = Phi3Transformer(transformer_config)
+        try:
+            # Initialize transformer (LLM)
+            print("Creating Phi3Transformer...")
+            self.llm = Phi3Transformer(transformer_config)
+            print("Phi3Transformer created successfully")
+            
+            if not hasattr(self, 'llm') or self.llm is None:
+                raise ValueError("LLM failed to initialize properly")
+                
+            # Validate LLM configuration
+            if not hasattr(self.llm, 'config'):
+                raise ValueError("LLM configuration is missing")
+                
+            print(f"LLM hidden size: {self.llm.config.hidden_size}")
+            
+        except Exception as e:
+            print(f"Error initializing LLM: {str(e)}")
+            raise
         
         # Positional embedding setup
+        print("Setting up positional embeddings...")
         self.pe_interpolation = pe_interpolation
         pos_embed = get_2d_sincos_pos_embed(
-            self.config.hidden_size,  # Use config instead of llm.config
+            self.llm.config.hidden_size,
             pos_embed_max_size,
             interpolation_scale=self.pe_interpolation,
             base_size=64
         )
         self.pos_embed = tf.Variable(pos_embed[None], trainable=False)
-
+        print("Positional embeddings created")
+        
         # Image embedding layers
+        print("Creating embedding layers...")
         self.x_embedder = PatchEmbedMR(patch_size, in_channels, self.llm.config.hidden_size)
         self.input_x_embedder = PatchEmbedMR(patch_size, in_channels, self.llm.config.hidden_size)
-
+        
         # Time embedding layers
         self.time_token = TimestepEmbedder(self.llm.config.hidden_size)
         self.t_embedder = TimestepEmbedder(self.llm.config.hidden_size)
+        print("Embedding layers created")
         
         # Output layers
+        print("Creating final layer...")
         self.final_layer = FinalLayer(self.llm.config.hidden_size, patch_size, self.in_channels)
+        print("Final layer created")
         
         self.initialize_weights()
+        print("OmniGen initialization completed")
 
     @classmethod
     def from_pretrained(cls, model_name, **kwargs):
