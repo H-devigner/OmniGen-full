@@ -343,6 +343,43 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         
         self.initialize_weights()
         
+    def _clear_model_memory(self):
+        """Clear model memory and caches."""
+        # Clear TensorFlow memory
+        tf.keras.backend.clear_session()
+        
+        # Clear caches
+        self._kv_cache = None
+        self._active_layer = None
+        
+        # Force garbage collection
+        gc.collect()
+        
+        # Clear GPU memory if available
+        if tf.config.list_physical_devices('GPU'):
+            for device in tf.config.list_physical_devices('GPU'):
+                try:
+                    tf.config.experimental.reset_memory_stats(device)
+                except:
+                    pass
+                    
+    def _move_to_device(self, tensor, device=None):
+        """Move tensor to specified device."""
+        if device is None:
+            device = '/CPU:0' if self._model_on_cpu else '/GPU:0'
+            
+        with tf.device(device):
+            # Use identity to force copy
+            return tf.identity(tensor)
+            
+    def _ensure_sync(self):
+        """Ensure operations are synchronized."""
+        if tf.config.list_physical_devices('GPU'):
+            # Wait for GPU operations to complete
+            tf.keras.backend.get_session().run(
+                tf.keras.backend.get_session().graph.get_operations()
+            )
+            
     def enable_cpu_offload(self):
         """Move model to CPU to save memory."""
         if not self._model_on_cpu:
@@ -355,7 +392,7 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
             # Load weights on CPU
             with tf.device('/CPU:0'):
                 self.load_weights('temp_weights')
-            
+                
             self._model_on_cpu = True
             
             # Clean up temp files
@@ -371,106 +408,12 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
                     self.save_weights('temp_weights')
                     self._clear_model_memory()
                     self.load_weights('temp_weights')
-            
+                    
             self._model_on_cpu = False
             
             # Clean up temp files
             if os.path.exists('temp_weights.index'):
                 os.remove('temp_weights.index')
-                
-    def _clear_model_memory(self):
-        """Clear model memory and caches."""
-        tf.keras.backend.clear_session()
-        self._kv_cache = None
-        self._active_layer = None
-        gc.collect()
-        
-    def _move_to_device(self, tensor, device=None):
-        """Move tensor to specified device."""
-        if device is None:
-            device = '/CPU:0' if self._model_on_cpu else '/GPU:0'
-        
-        with tf.device(device):
-            return tf.identity(tensor)
-            
-    def _ensure_sync(self):
-        """Ensure operations are synchronized."""
-        if tf.config.list_physical_devices('GPU'):
-            tf.keras.backend.get_session().run(tf.keras.backend.get_session().graph.get_operations())
-            
-    @tf.function(reduce_retracing=True)
-    def call(self, x, timestep, input_ids, input_img_latents, input_image_sizes,
-             attention_mask, position_ids, padding_latent=None, past_key_values=None,
-             return_past_key_values=True, offload_model=False, training=False):
-        """Forward pass with memory optimizations."""
-        try:
-            if offload_model:
-                self.enable_cpu_offload()
-                
-            # Process inputs
-            x, num_tokens, shapes = self.patch_multiple_resolutions(x, padding_latent)
-            time_token = self.time_token(timestep, dtype=x.dtype)
-            time_token = tf.expand_dims(time_token, axis=1)
-            
-            # Process conditional inputs
-            if input_img_latents is not None:
-                input_latents, _, _ = self.patch_multiple_resolutions(
-                    input_img_latents, is_input_images=True
-                )
-                
-            if input_ids is not None:
-                condition_embeds = self.transformer.embed_tokens(input_ids)
-                input_img_idx = 0
-                
-                for b_idx in input_image_sizes.keys():
-                    for start_idx, end_idx in input_image_sizes[b_idx]:
-                        condition_embeds = tf.tensor_scatter_nd_update(
-                            condition_embeds,
-                            [[b_idx, i] for i in range(start_idx, end_idx)],
-                            input_latents[input_img_idx]
-                        )
-                        input_img_idx += 1
-                        
-                input_emb = tf.concat([condition_embeds, time_token, x], axis=1)
-            else:
-                input_emb = tf.concat([time_token, x], axis=1)
-                
-            # Run transformer with memory management
-            output = self.transformer(
-                inputs_embeds=input_emb,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                offload_model=offload_model
-            )
-            
-            # Process output
-            output, past_key_values = output.last_hidden_state, output.past_key_values
-            
-            if isinstance(x, list):
-                image_embedding = output[:, -tf.reduce_max(num_tokens):]
-                time_emb = self.t_embedder(timestep, dtype=x.dtype)
-                x = self.final_layer(image_embedding, time_emb)
-                
-                latents = []
-                for i in range(x.shape[0]):
-                    latent = x[i:i+1, :num_tokens[i]]
-                    latent = self.unpatchify(latent, shapes[i][0], shapes[i][1])
-                    latents.append(latent)
-            else:
-                image_embedding = output[:, -num_tokens:]
-                time_emb = self.t_embedder(timestep, dtype=x.dtype)
-                x = self.final_layer(image_embedding, time_emb)
-                latents = self.unpatchify(x, shapes[0], shapes[1])
-                
-            if return_past_key_values:
-                return latents, past_key_values
-            return latents
-            
-        finally:
-            if offload_model:
-                self.disable_cpu_offload()
-                self._clear_model_memory()
                 
     def initialize_weights(self):
         """Initialize model weights."""
@@ -519,68 +462,34 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
         print("Model weights initialized successfully")
 
     @classmethod
-    def from_pretrained(cls, model_name, device=None, mixed_precision=True, **kwargs):
+    def from_pretrained(cls, model_name, device=None, **kwargs):
         """Load model from pretrained weights.
         
         Args:
-            model_name: Name of the model to load
+            model_name: Name or path of the pretrained model
             device: Device to place model on ('CPU', 'GPU', or None for auto-detect)
-            mixed_precision: Whether to use mixed precision training
             **kwargs: Additional arguments passed to model initialization
             
         Returns:
-            Initialized model with pretrained weights
+            Loaded model instance
         """
+        # Download model if needed
         if not os.path.exists(model_name):
-            print(f"Downloading model from {model_name}")
-            cache_folder = os.getenv('HF_HUB_CACHE')
-            model_name = snapshot_download(
-                repo_id=model_name,
-                cache_dir=cache_folder,
-                ignore_patterns=['flax_model.msgpack', 'rust_model.ot', 'pytorch_model.bin']
-            )
+            print(f"Downloading model from {model_name}...")
+            model_name = snapshot_download(model_name)
             print(f"Downloaded model to {model_name}")
-
+            
         config = Phi3Config.from_pretrained(model_name)
-        model = cls(config, device=device, mixed_precision=mixed_precision, **kwargs)
+        model = cls(config, device=device, **kwargs)
         
         if os.path.exists(os.path.join(model_name, 'model.safetensors')):
             print("Loading safetensors weights...")
-            try:
-                # Load weights with CPU device
-                with tf.device('/CPU:0'):
-                    from safetensors.tensorflow import load_file
-                    ckpt = load_file(os.path.join(model_name, 'model.safetensors'))
-                    
-                    # Convert weights to TensorFlow format
-                    tf_weights = {}
-                    for name, tensor in ckpt.items():
-                        # Convert PyTorch weight names to TensorFlow format
-                        tf_name = name.replace('.', '/')
-                        # Ensure tensor is on CPU and convert to float32
-                        tf_weights[tf_name] = tf.cast(tensor, tf.float32)
-                    
-                    # Load weights into model
-                    model.load_weights(tf_weights)
-                    print("Successfully loaded weights from safetensors")
-                    
-            except Exception as e:
-                print(f"Error loading safetensors: {str(e)}")
-                print("Attempting to load TensorFlow checkpoint...")
-                try:
-                    model = tf.saved_model.load(os.path.join(model_name, 'model'))
-                except Exception as e2:
-                    print(f"Error loading TensorFlow checkpoint: {str(e2)}")
-                    raise ValueError("Failed to load model weights") from e2
+            load_safetensors(model, os.path.join(model_name, 'model.safetensors'))
         else:
-            print("No safetensors found, loading TensorFlow checkpoint...")
-            try:
-                model = tf.saved_model.load(os.path.join(model_name, 'model'))
-            except Exception as e:
-                print(f"Error loading TensorFlow checkpoint: {str(e)}")
-                raise ValueError("Failed to load model weights") from e
-                
-        print("Model loaded successfully")
+            print("Loading pickle weights...")
+            state_dict = torch.load(os.path.join(model_name, 'pytorch_model.bin'), map_location='cpu')
+            model.load_state_dict(state_dict)
+            
         return model
 
     def unpatchify(self, x, h, w):
@@ -674,95 +583,76 @@ class OmniGen(tf.keras.Model, PeftAdapterMixin):
     def call(self, x, timestep, input_ids, input_img_latents, input_image_sizes,
             attention_mask, position_ids, padding_latent=None, past_key_values=None,
             return_past_key_values=True, offload_model=False, training=False):
-        """Forward pass of the model.
-        
-        This is the main method that processes inputs through the entire model pipeline:
-        1. Patch embedding of input images/latents
-        2. Time embedding for diffusion conditioning
-        3. Processing through transformer
-        4. Final layer for output generation
-        
-        Args:
-            x: Input latents or list of latents
-            timestep: Diffusion timesteps
-            input_ids: Text input IDs
-            input_img_latents: Optional input image latents
-            input_image_sizes: Sizes of input images
-            attention_mask: Attention mask for transformer
-            position_ids: Position IDs for transformer
-            padding_latent: Optional padding latent
-            past_key_values: Optional cached key-values
-            return_past_key_values: Whether to return key-values
-            offload_model: Whether to offload model during processing
+        """Forward pass with memory optimizations."""
+        try:
+            if offload_model:
+                self.enable_cpu_offload()
+                
+            # Process inputs
+            x, num_tokens, shapes = self.patch_multiple_resolutions(x, padding_latent)
+            time_token = self.time_token(timestep, dtype=x.dtype)
+            time_token = tf.expand_dims(time_token, axis=1)
             
-        Returns:
-            Model output (image or list of images) and optionally past_key_values
-        """
-        # Process input latents
-        x_list, num_tokens, shapes = self.patch_multiple_resolutions(
-            [x] if not isinstance(x, (list, tuple)) else x,
-            padding_latent,
-            is_input_images=False
-        )
-        
-        # Process input images if provided
-        input_img_embed_list = []
-        if input_img_latents is not None:
-            input_img_embed_list, _, _ = self.patch_multiple_resolutions(
-                input_img_latents,
-                is_input_images=True
+            # Process conditional inputs
+            if input_img_latents is not None:
+                input_latents, _, _ = self.patch_multiple_resolutions(
+                    input_img_latents, is_input_images=True
+                )
+                
+            if input_ids is not None:
+                condition_embeds = self.transformer.embed_tokens(input_ids)
+                input_img_idx = 0
+                
+                for b_idx in input_image_sizes.keys():
+                    for start_idx, end_idx in input_image_sizes[b_idx]:
+                        condition_embeds = tf.tensor_scatter_nd_update(
+                            condition_embeds,
+                            [[b_idx, i] for i in range(start_idx, end_idx)],
+                            input_latents[input_img_idx]
+                        )
+                        input_img_idx += 1
+                        
+                input_emb = tf.concat([condition_embeds, time_token, x], axis=1)
+            else:
+                input_emb = tf.concat([time_token, x], axis=1)
+                
+            # Run transformer with memory management
+            output = self.transformer(
+                inputs_embeds=input_emb,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                offload_model=offload_model
             )
-        
-        # Time embedding
-        t_emb = self.t_embedder(timestep)
-        time_tokens = self.time_token(timestep)[:, None]
-        
-        # Prepare inputs for transformer
-        transformer_inputs = []
-        for x_embed, pos_embed in zip(x_list, num_tokens):
-            transformer_inputs.append(x_embed + pos_embed)
-        
-        hidden_states = tf.concat(transformer_inputs, axis=1)
-        hidden_states = tf.concat([time_tokens, hidden_states], axis=1)
-        
-        # Add input image embeddings if available
-        if input_img_embed_list:
-            input_img_embeds = tf.concat(input_img_embed_list, axis=1)
-            hidden_states = tf.concat([hidden_states, input_img_embeds], axis=1)
-        
-        # Transformer forward pass
-        outputs = self.transformer(
-            input_ids=input_ids,
-            inputs_embeds=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=return_past_key_values,
-            output_hidden_states=True
-        )
-        
-        # Process outputs
-        x = outputs.hidden_states[-1][:, 1:]  # Remove time token
-        x = self.final_layer(x, t_emb)
-        
-        # Split output for different resolutions
-        if isinstance(input_image_sizes, (list, tuple)):
-            out_list = []
-            current_idx = 0
-            for h, w in input_image_sizes:
-                h_patch, w_patch = h // self.patch_size, w // self.patch_size
-                out = x[:, current_idx:current_idx + h_patch * w_patch]
-                out = self.unpatchify(out, h, w)
-                out_list.append(out)
-                current_idx += h_patch * w_patch
-            x = out_list[0] if len(out_list) == 1 else out_list
-        else:
-            x = self.unpatchify(x, input_image_sizes[0], input_image_sizes[1])
-        
-        if return_past_key_values:
-            return x, outputs.past_key_values
-        return x
-
+            
+            # Process output
+            output, past_key_values = output.last_hidden_state, output.past_key_values
+            
+            if isinstance(x, list):
+                image_embedding = output[:, -tf.reduce_max(num_tokens):]
+                time_emb = self.t_embedder(timestep, dtype=x.dtype)
+                x = self.final_layer(image_embedding, time_emb)
+                
+                latents = []
+                for i in range(x.shape[0]):
+                    latent = x[i:i+1, :num_tokens[i]]
+                    latent = self.unpatchify(latent, shapes[i][0], shapes[i][1])
+                    latents.append(latent)
+            else:
+                image_embedding = output[:, -num_tokens:]
+                time_emb = self.t_embedder(timestep, dtype=x.dtype)
+                x = self.final_layer(image_embedding, time_emb)
+                latents = self.unpatchify(x, shapes[0], shapes[1])
+                
+            if return_past_key_values:
+                return latents, past_key_values
+            return latents
+            
+        finally:
+            if offload_model:
+                self.disable_cpu_offload()
+                self._clear_model_memory()
+                
     def forward_with_cfg(self, x, timestep, input_ids, input_img_latents, input_image_sizes,
                         attention_mask, position_ids, cfg_scale, use_img_cfg, img_cfg_scale,
                         past_key_values, use_kv_cache, offload_model):

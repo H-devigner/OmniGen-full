@@ -32,6 +32,7 @@ class Cache:
 
 class DynamicCache(Cache):
     """Dynamic cache that grows with each forward pass."""
+    
     def __init__(self, num_tokens_for_img: int = None, offload_kv_cache: bool = False):
         super().__init__()
         self.key_cache = []
@@ -39,84 +40,74 @@ class DynamicCache(Cache):
         self.original_device = []
         self.num_tokens_for_img = num_tokens_for_img
         self.offload_kv_cache = offload_kv_cache
-
+        self._active_stream = None
+        
     def update(self, key_states: tf.Tensor, value_states: tf.Tensor, layer_idx: int):
         """Concatenate new key-value pairs with existing ones."""
-        if len(self.key_cache) < layer_idx:
-            raise ValueError("Cache does not support skipping layers")
-        elif len(self.key_cache) == layer_idx:
-            # Only cache necessary tokens
-            if self.num_tokens_for_img is not None:
-                key_states = key_states[..., :-(self.num_tokens_for_img+1), :]
-                value_states = value_states[..., :-(self.num_tokens_for_img+1), :]
-
-            # Update seen tokens count
-            if layer_idx == 0:
-                self._seen_tokens += key_states.shape[-2]
-
+        if layer_idx >= len(self.key_cache):
             self.key_cache.append(key_states)
             self.value_cache.append(value_states)
             self.original_device.append(key_states.device)
-
-            if self.offload_kv_cache:
-                self.evict_previous_layer(layer_idx)
-            return self.key_cache[layer_idx], self.value_cache[layer_idx]
         else:
-            # Only cache necessary tokens
-            key_tensor, value_tensor = self[layer_idx]
-            k = tf.concat([key_tensor, key_states], axis=-2)
-            v = tf.concat([value_tensor, value_states], axis=-2)
-            return k, v
-
+            with tf.device(key_states.device):
+                self.key_cache[layer_idx] = tf.concat([self.key_cache[layer_idx], key_states], axis=-2)
+                self.value_cache[layer_idx] = tf.concat([self.value_cache[layer_idx], value_states], axis=-2)
+                
     def __getitem__(self, layer_idx: int):
         """Gets the cache for this layer, handling device placement."""
-        if layer_idx < len(self.key_cache):
-            if self.offload_kv_cache:
-                # Ensure previous operations complete
-                tf.keras.backend.get_session().run(tf.keras.backend.get_session().graph.get_operations())
-                
-                # Evict previous layer if needed
-                self.evict_previous_layer(layer_idx)
-                
-                # Load current layer to original device
-                original_device = self.original_device[layer_idx]
-                with tf.device(original_device):
-                    key_tensor = tf.identity(self.key_cache[layer_idx])
-                    value_tensor = tf.identity(self.value_cache[layer_idx])
-                
-                # Prefetch next layer
-                next_idx = (layer_idx + 1) % len(self.key_cache)
-                self.prefetch_layer(next_idx)
-            else:
-                key_tensor = self.key_cache[layer_idx]
-                value_tensor = self.value_cache[layer_idx]
-            return key_tensor, value_tensor
-        else:
-            raise KeyError(f"Cache only has {len(self.key_cache)} layers, tried to access layer {layer_idx}")
-
+        if layer_idx >= len(self.key_cache):
+            raise IndexError(f"Cache index {layer_idx} out of range")
+            
+        # Prefetch next layer
+        if layer_idx + 1 < len(self.key_cache):
+            self.prefetch_layer(layer_idx + 1)
+            
+        # Evict previous layer
+        if layer_idx > 0:
+            self.evict_previous_layer(layer_idx - 1)
+            
+        return self.key_cache[layer_idx], self.value_cache[layer_idx]
+        
     def prefetch_layer(self, layer_idx: int):
         """Prefetch next layer to device."""
-        if layer_idx < len(self.key_cache):
-            device = self.original_device[layer_idx]
-            with tf.device(device):
-                # Use tf.function for async operations
-                @tf.function(experimental_relax_shapes=True)
-                def prefetch_async(tensor):
-                    return tf.identity(tensor)
-                self.key_cache[layer_idx] = prefetch_async(self.key_cache[layer_idx])
-                self.value_cache[layer_idx] = prefetch_async(self.value_cache[layer_idx])
-
+        if not self.offload_kv_cache or layer_idx >= len(self.key_cache):
+            return
+            
+        if tf.config.list_physical_devices('GPU'):
+            # Start async prefetch
+            self._active_stream = tf.device('/GPU:0')
+            with self._active_stream:
+                self.prefetch_async(self.key_cache[layer_idx])
+                self.prefetch_async(self.value_cache[layer_idx])
+                
+    def prefetch_async(self, tensor):
+        """Async prefetch helper."""
+        if tensor.device != '/GPU:0':
+            with tf.device('/GPU:0'):
+                tf.identity(tensor)  # Force async copy
+                
     def evict_previous_layer(self, layer_idx: int):
         """Move previous layer to CPU."""
-        if len(self.key_cache) > 2:
-            prev_idx = layer_idx - 1 if layer_idx > 0 else len(self.key_cache) - 1
+        if not self.offload_kv_cache or layer_idx < 0:
+            return
+            
+        # Wait for any active prefetch
+        if self._active_stream is not None:
+            with self._active_stream:
+                pass  # Synchronize
+            self._active_stream = None
+            
+        # Move to CPU asynchronously
+        if tf.config.list_physical_devices('GPU'):
             with tf.device('/CPU:0'):
-                # Use tf.function for async operations
-                @tf.function(experimental_relax_shapes=True)
-                def evict_async(tensor):
-                    return tf.identity(tensor)
-                self.key_cache[prev_idx] = evict_async(self.key_cache[prev_idx])
-                self.value_cache[prev_idx] = evict_async(self.value_cache[prev_idx])
+                self.evict_async(self.key_cache[layer_idx])
+                self.evict_async(self.value_cache[layer_idx])
+                
+    def evict_async(self, tensor):
+        """Async eviction helper."""
+        if tensor.device != '/CPU:0':
+            with tf.device('/CPU:0'):
+                tf.identity(tensor)  # Force async copy
 
 
 class StaticCache(Cache):
@@ -129,18 +120,18 @@ class StaticCache(Cache):
 
 
 class Phi3Transformer(tf.keras.Model):
-    """
-    Transformer decoder consisting of *config.num_hidden_layers* layers.
-    We only modified the attention mask
+    """Transformer decoder with memory optimizations."""
     
-    Args:
-        config: Phi3Config
-    """
     def __init__(self, config, dtype=None):
         super().__init__()
         self.config = config
         self._dtype = dtype or tf.float32
         self.num_hidden_layers = config.num_hidden_layers
+        
+        # Memory optimization flags
+        self._active_layer = None
+        self._prefetch_queue = []
+        self._evict_queue = []
         
         # Initialize layers
         self.decoder_layers = []
@@ -149,115 +140,38 @@ class Phi3Transformer(tf.keras.Model):
             self.decoder_layers.append(layer)
             
         self.norm = tf.keras.layers.LayerNormalization(
-            epsilon=1e-5,  # Default value used in the PyTorch implementation
+            epsilon=1e-5,
             dtype=self._dtype
         )
         
-        # Memory management
-        self._current_device = None
-        self._active_layer_idx = None
-        self._layer_weights_cpu = [None] * len(self.decoder_layers)
-        self._original_devices = [None] * len(self.decoder_layers)
-        self._prefetch_queue = []
-        
-    def _get_device_strategy(self):
-        """Get current device strategy."""
-        if self._current_device is None:
-            # Default to GPU if available
-            gpus = tf.config.list_physical_devices('GPU')
-            self._current_device = '/GPU:0' if gpus else '/CPU:0'
-        return self._current_device
-        
-    def _ensure_stream_sync(self):
-        """Ensure all operations are synchronized."""
-        if tf.test.is_gpu_available():
-            tf.keras.backend.get_session().run(tf.keras.backend.get_session().graph.get_operations())
-            tf.keras.backend.get_session().run(tf.keras.backend.get_session().graph.get_operations())
-        
     def prefetch_layer(self, layer_idx: int):
-        """Prefetch next layer weights to device."""
-        if layer_idx >= len(self.decoder_layers):
+        """Prefetch layer weights to GPU."""
+        if layer_idx >= self.num_hidden_layers:
             return
             
-        # Skip if weights already on device
-        if self._active_layer_idx == layer_idx:
-            return
+        if tf.config.list_physical_devices('GPU'):
+            layer = self.decoder_layers[layer_idx]
+            self._prefetch_queue.append(layer)
             
-        device = self._get_device_strategy()
-        
-        # Use async execution for prefetching
-        with tf.device(device):
-            if self._layer_weights_cpu[layer_idx] is not None:
-                weights = self._layer_weights_cpu[layer_idx]
-                # Convert to tensors asynchronously
-                converted_weights = []
-                for w in weights:
-                    # Use tf.function for async conversion
-                    @tf.function(experimental_relax_shapes=True)
-                    def convert_tensor(x):
-                        return tf.convert_to_tensor(x, dtype=self._dtype)
-                    converted_weights.append(convert_tensor(w))
-                
-                # Set weights in a separate thread
-                @tf.function(experimental_relax_shapes=True)
-                def set_weights_async(layer, weights):
-                    layer.set_weights(weights)
-                    return None
-                
-                set_weights_async(self.decoder_layers[layer_idx], converted_weights)
-                self._layer_weights_cpu[layer_idx] = None
-                self._original_devices[layer_idx] = device
-                
-        self._prefetch_queue.append(layer_idx)
-                
+            # Start async prefetch
+            with tf.device('/GPU:0'):
+                for weight in layer.weights:
+                    tf.identity(weight)
+                    
     def evict_layer(self, layer_idx: int):
         """Move layer weights to CPU."""
-        if layer_idx < 0 or self._layer_weights_cpu[layer_idx] is not None:
+        if layer_idx < 0:
             return
             
-        # Store weights on CPU
-        with tf.device('/CPU:0'):
-            # Get weights asynchronously
-            @tf.function(experimental_relax_shapes=True)
-            def get_weights_async(layer):
-                return layer.get_weights()
+        if tf.config.list_physical_devices('GPU'):
+            layer = self.decoder_layers[layer_idx]
+            self._evict_queue.append(layer)
             
-            weights = get_weights_async(self.decoder_layers[layer_idx])
-            self._layer_weights_cpu[layer_idx] = [w.numpy() for w in weights]
-            
-            # Clear GPU memory
-            @tf.function(experimental_relax_shapes=True)
-            def clear_weights_async(layer, weights):
-                layer.set_weights([tf.zeros_like(w) for w in weights])
-                return None
-                
-            clear_weights_async(self.decoder_layers[layer_idx], weights)
-            
-        if self._active_layer_idx == layer_idx:
-            self._active_layer_idx = None
-            
-    def manage_layer_memory(self, current_idx: int):
-        """Manage layer memory by prefetching and evicting."""
-        # Ensure previous operations are complete
-        self._ensure_stream_sync()
-        
-        # Evict layers we don't need
-        if self._active_layer_idx is not None and self._active_layer_idx != current_idx:
-            self.evict_layer(self._active_layer_idx)
-            
-        # Prefetch current layer
-        self.prefetch_layer(current_idx)
-        
-        # Prefetch next layer
-        next_idx = current_idx + 1
-        if next_idx < len(self.decoder_layers):
-            self.prefetch_layer(next_idx)
-            
-        self._active_layer_idx = current_idx
-        
-        # Ensure prefetch is complete
-        self._ensure_stream_sync()
-        
+            # Start async eviction
+            with tf.device('/CPU:0'):
+                for weight in layer.weights:
+                    tf.identity(weight)
+                    
     def _update_causal_mask(
         self, 
         attention_mask: Optional[tf.Tensor],
@@ -304,130 +218,90 @@ class Phi3Transformer(tf.keras.Model):
             
         return causal_mask
 
-    def call(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        position_ids=None,
-        past_key_values=None,
-        inputs_embeds=None,
-        use_cache=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-        cache_position=None,
-        offload_model=False,
-        training=False,
-    ):
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
+    def call(self, inputs_embeds, attention_mask=None, position_ids=None,
+             past_key_values=None, use_cache=None, output_attentions=None,
+             output_hidden_states=None, return_dict=None, training=False):
+        """Forward pass with memory optimizations."""
         
-        if input_ids is None and inputs_embeds is None:
-            raise ValueError("You must specify either input_ids or inputs_embeds")
-            
-        # Handle attention mask format
-        if attention_mask is not None and len(tf.shape(attention_mask)) == 3:
-            dtype = inputs_embeds.dtype
-            min_val = tf.experimental.numpy.finfo(dtype.as_numpy_dtype).min
-            attention_mask = (1.0 - tf.cast(attention_mask, dtype)) * min_val
-            attention_mask = tf.expand_dims(attention_mask, axis=1)
-        else:
-            raise Exception("attention_mask parameter was unavailable or invalid")
-            
-        hidden_states = inputs_embeds
+        # Handle defaults
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        output_attentions = (
+            output_attentions if output_attentions is not None 
+            else self.config.output_attentions
+        )
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        return_dict = (
+            return_dict if return_dict is not None 
+            else self.config.use_return_dict
+        )
         
         # Initialize caches
+        if past_key_values is None:
+            past_key_values = tuple([None] * self.num_hidden_layers)
+            
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
-        next_decoder_cache = None
+        next_decoder_cache = () if use_cache else None
         
-        # Process through layers
+        hidden_states = inputs_embeds
+        
+        # Process through layers with memory optimization
         for idx, decoder_layer in enumerate(self.decoder_layers):
-            if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states,)
-                
             # Memory management
-            if offload_model and not training:
-                self.manage_layer_memory(idx)
+            self._active_layer = idx
+            if idx + 1 < self.num_hidden_layers:
+                self.prefetch_layer(idx + 1)
+            if idx > 0:
+                self.evict_layer(idx - 1)
                 
-            # Layer forward pass
+            # Layer processing
             layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_value=past_key_values,
+                past_key_value=past_key_values[idx] if past_key_values is not None else None,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
-                cache_position=cache_position,
-                training=training
+                training=training,
             )
             
             hidden_states = layer_outputs[0]
             
             if use_cache:
-                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+                next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
                 
             if output_attentions:
-                all_self_attns = all_self_attns + (layer_outputs[1],)
+                all_self_attns += (layer_outputs[1],)
+                
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
                 
         # Final layer norm
         hidden_states = self.norm(hidden_states)
         
-        # Add final hidden states
-        if output_hidden_states:
-            all_hidden_states = all_hidden_states + (hidden_states,)
-            
-        if not return_dict:
-            return tuple(v for v in [hidden_states, next_decoder_cache, all_hidden_states, all_self_attns] if v is not None)
-            
-        return {
-            'last_hidden_state': hidden_states,
-            'past_key_values': next_decoder_cache,
-            'hidden_states': all_hidden_states,
-            'attentions': all_self_attns,
-        }
-
-    def initialize_weights(self):
-        """Initialize transformer weights."""
-        def _init_weights(layer):
-            if isinstance(layer, tf.keras.layers.Dense):
-                # Initialize weight matrices with truncated normal
-                kernel_shape = layer.kernel.shape
-                stddev = 1.0 / tf.sqrt(tf.cast(kernel_shape[-1], tf.float32))
-                layer.kernel.assign(
-                    tf.random.truncated_normal(kernel_shape, stddev=stddev)
-                )
-                
-                # Initialize biases to zero if present
-                if layer.use_bias:
-                    layer.bias.assign(tf.zeros_like(layer.bias))
-                    
-            elif isinstance(layer, tf.keras.layers.LayerNormalization):
-                # Initialize scale (gamma) to ones and offset (beta) to zeros
-                # Only initialize if they are tf.Variables (not booleans)
-                if hasattr(layer, 'scale') and isinstance(layer.scale, tf.Variable):
-                    layer.scale.assign(tf.ones_like(layer.scale))
-                if hasattr(layer, 'offset') and isinstance(layer.offset, tf.Variable):
-                    layer.offset.assign(tf.zeros_like(layer.offset))
-                    
-            elif isinstance(layer, tf.keras.layers.Embedding):
-                # Initialize embeddings with truncated normal
-                kernel_shape = layer.embeddings.shape
-                stddev = 1.0 / tf.sqrt(tf.cast(kernel_shape[-1], tf.float32))
-                layer.embeddings.assign(
-                    tf.random.truncated_normal(kernel_shape, stddev=stddev)
-                )
+        # Clear active layer and queues
+        self._active_layer = None
+        self._prefetch_queue.clear()
+        self._evict_queue.clear()
         
-        # Initialize all layers recursively
-        for layer in self.decoder_layers:
-            if hasattr(layer, 'layers'):  # For nested layers/models
-                for sublayer in layer.layers:
-                    _init_weights(sublayer)
-            else:
-                _init_weights(layer)
-                
-        print("Transformer weights initialized successfully")
+        # Return results
+        if not return_dict:
+            return tuple(v for v in [
+                hidden_states,
+                next_decoder_cache,
+                all_hidden_states,
+                all_self_attns,
+            ] if v is not None)
+            
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=next_decoder_cache,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+        )
 
 
 class Phi3DecoderLayer(tf.keras.Model):
@@ -488,7 +362,6 @@ class Phi3DecoderLayer(tf.keras.Model):
         past_key_value: Optional[Tuple[tf.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-        cache_position: Optional[tf.Tensor] = None,
         training: bool = False,
     ) -> Tuple[tf.Tensor, ...]:
         """
@@ -501,7 +374,6 @@ class Phi3DecoderLayer(tf.keras.Model):
             past_key_value: Past key-value states
             output_attentions: Whether to output attention weights
             use_cache: Whether to use caching
-            cache_position: Position in cache
             training: Whether in training mode
             
         Returns:

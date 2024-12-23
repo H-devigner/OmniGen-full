@@ -88,47 +88,45 @@ class OmniGenPipeline:
         
     @classmethod
     def from_pretrained(cls, model_name, vae_path=None, device=None):
-        """Load pipeline from pretrained model.
+        """Load pipeline from pretrained models.
         
         Args:
-            model_name: Model name on HuggingFace Hub or path to local model
+            model_name: Name or path of the pretrained model
             vae_path: Optional path to VAE model
             device: Device to place models on ('CPU', 'GPU', or None for auto-detect)
+            
+        Returns:
+            Initialized pipeline
         """
         if not os.path.exists(model_name):
-            model_name = snapshot_download(
-                repo_id=model_name,
-                cache_dir=os.getenv('HF_HUB_CACHE'),
-                allow_patterns=["*.json", "*.safetensors"]
-            )
+            print(f"Downloading model from {model_name}...")
+            model_name = snapshot_download(model_name)
             print(f"Downloaded model to {model_name}")
-
-        # Load models with specified device and precision settings
+            
+        # Load models with specified device
         model = OmniGen.from_pretrained(
             model_name, 
             device=device,
         )
         processor = OmniGenProcessor.from_pretrained(model_name)
-
+        
         # Load or download VAE
         if vae_path is None:
-            print("Loading default SDXL VAE...")
-            vae = AutoencoderKL.from_pretrained(
-                "stabilityai/sdxl-vae",
-                from_tf=True
-            )
-        else:
-            vae = AutoencoderKL.from_pretrained(vae_path, from_tf=True)
-
-        # Create pipeline instance
-        pipeline = cls(
-            vae=vae,
+            vae_path = "stabilityai/sd-vae-ft-mse"
+            
+        if not os.path.exists(vae_path):
+            print(f"Downloading VAE from {vae_path}...")
+            vae_path = snapshot_download(vae_path)
+            print(f"Downloaded VAE to {vae_path}")
+            
+        vae = AutoencoderKL.from_pretrained(vae_path)
+        
+        return cls(
             model=model,
             processor=processor,
-            device=device,
+            vae=vae,
+            device=device
         )
-
-        return pipeline
         
     def enable_model_cpu_offload(self):
         """Move model weights to CPU to save GPU memory."""
