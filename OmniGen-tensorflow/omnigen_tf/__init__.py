@@ -1,17 +1,26 @@
-"""OmniGen TensorFlow Implementation"""
+"""OmniGen TensorFlow Implementation
+
+This module provides the TensorFlow implementation of OmniGen, matching the PyTorch
+version's functionality while leveraging TensorFlow-specific optimizations.
+"""
 
 from .model import OmniGen
-from .pipeline import OmniGenPipeline
 from .processor import OmniGenProcessor
 from .scheduler import OmniGenScheduler
-from .converter import WeightConverter
-from .transformer import Phi3Transformer
+from .pipeline import OmniGenPipeline
 
-# __all__ = [
-#     "OmniGen",
-#     "OmniGenPipeline",
-#     "OmniGenProcessor",
-#     "OmniGenScheduler",
-#     "WeightConverter",
-#     "Phi3Transformer"
-# ]
+# TensorFlow-specific components
+from .transformer import Phi3Config, Phi3Transformer
+from .converter import WeightConverter
+
+__all__ = [
+    # Core components (matching PyTorch)
+    "OmniGen",
+    "OmniGenProcessor",
+    "OmniGenScheduler",
+    "OmniGenPipeline",
+    # TensorFlow-specific
+    "Phi3Config",
+    "Phi3Transformer",
+    "WeightConverter",
+]
