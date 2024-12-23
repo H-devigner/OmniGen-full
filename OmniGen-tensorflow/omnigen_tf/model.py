@@ -17,7 +17,7 @@ from safetensors.tensorflow import load_file
 from omnigen_tf.transformer import Phi3Config, Phi3Transformer
 
 
-def modulate_tensorflow(x, shift, scale):
+def modulate(x, shift, scale):
     """Apply adaptive layer normalization modulation.
     
     Args:
@@ -369,30 +369,62 @@ class OmniGen(Model):
         """Load model from pretrained weights.
         
         Args:
-            model_name: Name or path of the pretrained model
-            **kwargs: Additional arguments to pass to the model constructor
+            model_name: Name of the model to load
+            **kwargs: Additional arguments passed to model initialization
             
         Returns:
             Initialized model with pretrained weights
         """
         if not os.path.exists(model_name):
+            print(f"Downloading model from {model_name}")
             cache_folder = os.getenv('HF_HUB_CACHE')
             model_name = snapshot_download(
                 repo_id=model_name,
                 cache_dir=cache_folder,
                 ignore_patterns=['flax_model.msgpack', 'rust_model.ot', 'pytorch_model.bin']
             )
-        
+            print(f"Downloaded model to {model_name}")
+
         config = Phi3Config.from_pretrained(model_name)
         model = cls(config, **kwargs)
         
         if os.path.exists(os.path.join(model_name, 'model.safetensors')):
-            print("Loading safetensors")
-            ckpt = load_file(os.path.join(model_name, 'model.safetensors'))
+            print("Loading safetensors weights...")
+            try:
+                # Load weights with CPU device
+                with tf.device('/CPU:0'):
+                    from safetensors.tensorflow import load_file
+                    ckpt = load_file(os.path.join(model_name, 'model.safetensors'))
+                    
+                    # Convert weights to TensorFlow format
+                    tf_weights = {}
+                    for name, tensor in ckpt.items():
+                        # Convert PyTorch weight names to TensorFlow format
+                        tf_name = name.replace('.', '/')
+                        # Ensure tensor is on CPU and convert to float32
+                        tf_weights[tf_name] = tf.cast(tensor, tf.float32)
+                    
+                    # Load weights into model
+                    model.load_weights(tf_weights)
+                    print("Successfully loaded weights from safetensors")
+                    
+            except Exception as e:
+                print(f"Error loading safetensors: {str(e)}")
+                print("Attempting to load TensorFlow checkpoint...")
+                try:
+                    model = tf.saved_model.load(os.path.join(model_name, 'model'))
+                except Exception as e2:
+                    print(f"Error loading TensorFlow checkpoint: {str(e2)}")
+                    raise ValueError("Failed to load model weights") from e2
         else:
-            ckpt = tf.saved_model.load(os.path.join(model_name, 'model'))
-            
-        model.load_weights(ckpt)
+            print("No safetensors found, loading TensorFlow checkpoint...")
+            try:
+                model = tf.saved_model.load(os.path.join(model_name, 'model'))
+            except Exception as e:
+                print(f"Error loading TensorFlow checkpoint: {str(e)}")
+                raise ValueError("Failed to load model weights") from e
+                
+        print("Model loaded successfully")
         return model
 
     def initialize_weights(self):
@@ -445,7 +477,7 @@ class OmniGen(Model):
         
         if h * w != self.pos_embed.shape[1]:
             pos_embed = get_2d_sincos_pos_embed(
-                self.config.hidden_size,
+                self.llm.config.hidden_size,
                 (h, w),
                 interpolation_scale=self.pe_interpolation,
                 base_size=64
