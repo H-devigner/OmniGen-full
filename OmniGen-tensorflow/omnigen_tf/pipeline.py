@@ -1,41 +1,15 @@
-"""OmniGen TensorFlow Pipeline
-
-This module provides the TensorFlow implementation of the OmniGen pipeline,
-matching the PyTorch version's functionality while leveraging TensorFlow-specific optimizations.
-"""
+"""OmniGen Pipeline for image generation."""
 
 import os
-import gc
 import tensorflow as tf
 import numpy as np
-from typing import Dict, List, Optional, Union
 from PIL import Image
-from safetensors import safe_open
 from huggingface_hub import snapshot_download
-from diffusers import AutoencoderKL
-from diffusers.utils import logging
+from transformers import AutoTokenizer
 
-from .processor import OmniGenProcessor
-from .scheduler import OmniGenScheduler
-from .model import OmniGen
-
-logger = logging.get_logger(__name__)
-
-EXAMPLE_DOC_STRING = """
-    Examples:
-        ```py
-        >>> from omnigen_tf import OmniGenPipeline
-        >>> pipe = OmniGenPipeline.from_pretrained("Shitao/OmniGen-v1")
-        >>> prompt = "A woman holds a bouquet of flowers and faces the camera"
-        >>> image = pipe(
-        ...     prompt,
-        ...     guidance_scale=2.5,
-        ...     num_inference_steps=50,
-        ... ).images[0]
-        >>> image.save("t2i.png")
-        ```
-"""
-
+from omnigen_tf.model import OmniGen
+from omnigen_tf.scheduler import DDIMScheduler
+from omnigen_tf.processor import OmniGenProcessor
 
 # Configure GPU memory growth before any other TensorFlow operations
 gpus = tf.config.list_physical_devices('GPU')
@@ -46,45 +20,55 @@ if gpus:
     except RuntimeError as e:
         print(f"GPU memory growth setting failed: {e}")
 
-
 class OmniGenPipeline:
     """Pipeline for text-to-image generation using OmniGen."""
     
-    def __init__(
-        self,
-        vae: AutoencoderKL,
-        model: OmniGen,
-        processor: OmniGenProcessor,
-        device: str = None,
-    ):
-        """Initialize OmniGen pipeline.
+    def __init__(self, model, processor, scheduler, device="/CPU:0"):
+        """Initialize pipeline.
         
         Args:
-            vae: VAE model for encoding/decoding images
             model: OmniGen model
-            processor: Text and image processor
-            device: Device to place models on ('CPU', 'GPU', or None for auto-detect)
+            processor: Text processor
+            scheduler: Diffusion scheduler
+            device: Device to run on
         """
-        self.vae = vae
         self.model = model
         self.processor = processor
-        
-        # Set device
-        if device is None:
-            if tf.config.list_physical_devices('GPU'):
-                device = '/GPU:0'
-            else:
-                print("No GPU found, using CPU. This may be slow!")
-                device = '/CPU:0'
+        self.scheduler = scheduler
         self.device = device
-        
-        # Enable mixed precision
-        policy = tf.keras.mixed_precision.Policy('mixed_float16')
-        tf.keras.mixed_precision.set_global_policy(policy)
-        
-        # Memory optimization flags
         self._model_on_cpu = False
         self._vae_on_cpu = False
+        
+    @classmethod
+    def from_pretrained(cls, model_name, device="/CPU:0"):
+        """Load pipeline from pretrained model.
+        
+        Args:
+            model_name: Name or path of pretrained model
+            device: Device to run on
+        """
+        # Download model if needed
+        if not os.path.exists(model_name):
+            cache_folder = os.getenv('HF_HUB_CACHE')
+            model_name = snapshot_download(
+                repo_id=model_name,
+                cache_dir=cache_folder,
+                ignore_patterns=['flax_model.msgpack', 'rust_model.ot', 'tf_model.h5']
+            )
+        
+        # Initialize components
+        model = OmniGen.from_pretrained(model_name)
+        processor = OmniGenProcessor()
+        scheduler = DDIMScheduler()
+        
+        # Create pipeline
+        pipeline = cls(model, processor, scheduler, device)
+        
+        # Move to device
+        if device:
+            pipeline._move_to_device(pipeline.model, device)
+        
+        return pipeline
         
     def _move_to_device(self, model, device):
         """Move model to specified device."""
@@ -113,180 +97,55 @@ class OmniGenPipeline:
             model.to(device)
         else:
             print(f"Warning: Unknown model type, cannot move to {device}")
-
-    def enable_cpu_offload(self):
-        """Move models to CPU to save memory."""
-        if not self._model_on_cpu:
-            # Clear GPU memory before moving
-            if tf.config.list_physical_devices('GPU'):
-                tf.keras.backend.clear_session()
-            self._move_to_device(self.model, '/CPU:0')
-            self._model_on_cpu = True
-            gc.collect()
             
-        if not self._vae_on_cpu:
-            self._move_to_device(self.vae, '/CPU:0')
-            self._vae_on_cpu = True
-            gc.collect()
-            
-    def disable_cpu_offload(self):
-        """Move models back to GPU efficiently."""
-        if self._model_on_cpu and tf.config.list_physical_devices('GPU'):
-            # Clear CPU memory
-            gc.collect()
-            self._move_to_device(self.model, '/GPU:0')
-            self._model_on_cpu = False
-            
-        if self._vae_on_cpu and tf.config.list_physical_devices('GPU'):
-            gc.collect()
-            self._move_to_device(self.vae, '/GPU:0')
-            self._vae_on_cpu = False
-            
-    @tf.function(jit_compile=True)
-    def _process_batch(self, prompt_embeds, timesteps):
-        """Process a single batch with XLA optimization."""
-        # Move to device
-        with tf.device(self.device):
-            # Generate latents
-            latents = self.model(
-                prompt_embeds,
-                timesteps,
-                training=False
-            )
-            
-            # Decode latents
-            images = self.vae.decode(latents).sample
-            
-            return images
-            
-    def __call__(self, prompt, **kwargs):
-        """Generate images with memory optimization."""
-        try:
-            # Enable CPU offload
-            self.enable_cpu_offload()
-            
-            # Process prompt
-            text_inputs = self.processor(prompt)
-            
-            # Get batch size and process in chunks
-            batch_size = text_inputs["input_ids"].shape[0]
-            max_batch_size = 4  # Adjust based on memory
-            
-            all_images = []
-            for i in range(0, batch_size, max_batch_size):
-                end_idx = min(i + max_batch_size, batch_size)
-                
-                # Get batch slice
-                batch_inputs = {
-                    k: v[i:end_idx] for k, v in text_inputs.items()
-                }
-                
-                # Process batch
-                images = self._process_batch(
-                    batch_inputs["input_ids"],
-                    batch_inputs["timesteps"]
-                )
-                
-                all_images.append(images)
-                
-                # Force cleanup
-                tf.keras.backend.clear_session()
-                
-            # Combine results
-            images = tf.concat(all_images, axis=0)
-            
-            return images
-            
-        finally:
-            # Disable CPU offload
-            self.disable_cpu_offload()
-            
-    @classmethod
-    def from_pretrained(cls, model_name, vae_path=None, device=None):
-        """Load pipeline from pretrained models.
+    def __call__(self, prompt, height=512, width=512, num_inference_steps=50, guidance_scale=7.5):
+        """Generate image from text prompt.
         
         Args:
-            model_name: Name or path of pretrained model
-            vae_path: Optional path to VAE model
-            device: Device to place models on ('CPU', 'GPU', or None for auto-detect)
-        """
-        # Set device if not provided
-        if device is None:
-            if tf.config.list_physical_devices('GPU'):
-                device = '/GPU:0'
-            else:
-                print("No GPU found, using CPU. This may be slow!")
-                device = '/CPU:0'
-                
-        # Download model if needed
-        if not os.path.exists(model_name):
-            from huggingface_hub import snapshot_download
-            model_name = snapshot_download(model_name)
-            print(f"Downloaded model to {model_name}")
-            
-        # Load models
-        with tf.device('/CPU:0'):  # Load on CPU first
-            model = OmniGen.from_pretrained(model_name)
-            processor = OmniGenProcessor.from_pretrained(model_name)
-            
-            # Load or download VAE
-            if vae_path is None:
-                vae_path = os.path.join(model_name, 'vae')
-            if not os.path.exists(vae_path):
-                print(f"Downloading VAE from {model_name}...")
-                vae_path = snapshot_download(model_name, subfolder='vae')
-            vae = AutoencoderKL.from_pretrained(vae_path)
-            
-        # Create pipeline
-        pipeline = cls(
-            vae=vae,
-            model=model,
-            processor=processor,
-            device=device
-        )
-        
-        # Move to target device if GPU
-        if device == '/GPU:0':
-            pipeline._move_to_device(pipeline.model, device)
-            pipeline._move_to_device(pipeline.vae, device)
-            
-        return pipeline
-        
-    def vae_encode(self, x: tf.Tensor, dtype: tf.dtypes.DType) -> tf.Tensor:
-        """Encode images using VAE.
-        
-        Args:
-            x: Input tensor
-            dtype: Output data type
+            prompt: Text prompt
+            height: Output image height
+            width: Output image width
+            num_inference_steps: Number of denoising steps
+            guidance_scale: Classifier-free guidance scale
             
         Returns:
-            Encoded tensor
+            PIL.Image: Generated image
         """
-        with tf.device(self.device):
-            if hasattr(self.vae.config, 'shift_factor'):
-                x = self.vae.encode(x).sample()
-                x = (x - self.vae.config.shift_factor) * self.vae.config.scaling_factor
-            else:
-                x = self.vae.encode(x).sample() * self.vae.config.scaling_factor
-            return tf.cast(x, dtype)
-
-    def merge_lora(self, lora_path: str):
-        """Merge LoRA weights into the base model.
+        # Process prompt
+        inputs = self.processor(prompt)
         
-        This method loads a LoRA checkpoint and merges its weights into the base model,
-        effectively applying the fine-tuned adaptations permanently.
+        # Get input shape
+        batch_size = inputs["input_ids"].shape[0]
         
-        Args:
-            lora_path: Path to the LoRA checkpoint
-        """
-        # Load LoRA weights
-        if not os.path.exists(lora_path):
-            lora_path = snapshot_download(
-                repo_id=lora_path,
-                cache_dir=os.getenv('HF_HUB_CACHE'),
-                allow_patterns="*.safetensors"
-            )
+        # Initialize latents
+        latents_shape = (batch_size, 4, height // 8, width // 8)
+        latents = tf.random.normal(latents_shape)
+        
+        # Set timesteps
+        self.scheduler.set_timesteps(num_inference_steps)
+        timesteps = self.scheduler.timesteps
+        
+        # Denoising loop
+        for t in timesteps:
+            # Get model prediction
+            with tf.device(self.device):
+                noise_pred = self.model(
+                    latents,
+                    t,
+                    inputs["input_ids"],
+                    inputs["attention_mask"]
+                )
             
-        # Let the model handle LoRA merging using PeftAdapterMixin
-        self.model.merge_adapter(lora_path)
-        print(f"Successfully merged LoRA weights from {lora_path}")
+            # Scheduler step
+            latents = self.scheduler.step(noise_pred, t, latents)
+            
+        # Decode latents to image
+        with tf.device(self.device):
+            image = self.model.decode_latents(latents)
+            
+        # Convert to PIL
+        image = tf.cast((image + 1.0) * 127.5, tf.uint8)
+        image = tf.transpose(image, [0, 2, 3, 1])
+        image = Image.fromarray(image[0].numpy())
+        
+        return image
