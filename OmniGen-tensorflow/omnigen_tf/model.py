@@ -420,8 +420,26 @@ class OmniGen(Model):
         if os.path.exists(config_file):
             with open(config_file, "r") as f:
                 config_dict = json.load(f)
+                # Ensure we have all required fields
+                config_dict.setdefault("model_type", "phi3")
+                config_dict.setdefault("hidden_size", 2048)
+                config_dict.setdefault("intermediate_size", 8192)
+                config_dict.setdefault("num_hidden_layers", 32)
+                config_dict.setdefault("num_attention_heads", 32)
+                config_dict.setdefault("max_position_embeddings", 2048)
+                config_dict.setdefault("layer_norm_eps", 1e-5)
+                config_dict.setdefault("hidden_dropout", 0.0)
+                config_dict.setdefault("attention_dropout", 0.0)
+                config_dict.setdefault("initializer_range", 0.02)
+                config_dict.setdefault("use_cache", True)
+                config_dict.setdefault("vocab_size", 32000)
+                config_dict.setdefault("tie_word_embeddings", False)
+                config_dict.setdefault("output_attentions", False)
+                config_dict.setdefault("output_hidden_states", False)
+                config_dict.setdefault("use_return_dict", True)
                 config = Phi3Config(**config_dict)
         else:
+            # Use default config
             config = Phi3Config()
             
         # Create model

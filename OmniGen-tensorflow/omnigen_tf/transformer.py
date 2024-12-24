@@ -1,6 +1,7 @@
 import math
 import warnings
 from typing import List, Optional, Tuple, Union, Dict
+from dataclasses import dataclass
 
 import tensorflow as tf
 from tensorflow import keras
@@ -13,43 +14,35 @@ from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
 
+@dataclass
 class Phi3Config(PretrainedConfig):
     """Configuration class for Phi3 model."""
-    model_type = "phi3"
+    model_type: str = "phi3"
+    hidden_size: int = 2048
+    intermediate_size: int = 8192
+    num_hidden_layers: int = 32
+    num_attention_heads: int = 32
+    max_position_embeddings: int = 2048
+    layer_norm_eps: float = 1e-5
+    hidden_dropout: float = 0.0
+    attention_dropout: float = 0.0
+    initializer_range: float = 0.02
+    use_cache: bool = True
+    vocab_size: int = 32000
+    tie_word_embeddings: bool = False
+    output_attentions: bool = False
+    output_hidden_states: bool = False
+    use_return_dict: bool = True
     
-    def __init__(
-        self,
-        vocab_size=51200,
-        hidden_size=2560,
-        num_hidden_layers=32,
-        num_attention_heads=32,
-        intermediate_size=10240,
-        hidden_act="gelu",
-        hidden_dropout=0.1,
-        attention_dropout=0.1,
-        max_position_embeddings=2048,
-        initializer_range=0.02,
-        layer_norm_eps=1e-5,
-        use_cache=True,
-        tie_word_embeddings=False,
-        **kwargs,
-    ):
-        super().__init__(
-            tie_word_embeddings=tie_word_embeddings,
-            **kwargs,
-        )
-        self.vocab_size = vocab_size
-        self.hidden_size = hidden_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-        self.intermediate_size = intermediate_size
-        self.hidden_act = hidden_act
-        self.hidden_dropout = hidden_dropout
-        self.attention_dropout = attention_dropout
-        self.max_position_embeddings = max_position_embeddings
-        self.initializer_range = initializer_range
-        self.layer_norm_eps = layer_norm_eps
-        self.use_cache = use_cache
+    def __post_init__(self):
+        """Initialize derived attributes."""
+        super().__post_init__()
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        if self.head_dim * self.num_attention_heads != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_attention_heads (got hidden_size={self.hidden_size} "
+                f"and num_attention_heads={self.num_attention_heads})"
+            )
 
 class Phi3Transformer(TFPreTrainedModel):
     """
