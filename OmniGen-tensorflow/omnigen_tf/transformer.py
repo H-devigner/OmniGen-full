@@ -288,7 +288,7 @@ class OmniGenTransformer(tf.keras.layers.Layer):
         self.head_dim = self.hidden_size // self.num_attention_heads
         
         # Initialize layers
-        self.layers = [OmniGenLayer(config, name=f"layers/{i}") for i in range(self.num_hidden_layers)]
+        self.layers = [OmniGenLayer(config, name=f"layer_{i}") for i in range(self.num_hidden_layers)]
         self.norm = tf.keras.layers.LayerNormalization(epsilon=1e-5, name="norm")
         
     def call(

@@ -14,6 +14,7 @@ from typing import Dict, Optional, List, Union
 from safetensors import safe_open
 from huggingface_hub import snapshot_download
 from diffusers.loaders import PeftAdapterMixin
+import json
 
 from omnigen_tf.transformer import Phi3Config, Phi3Transformer
 
@@ -30,9 +31,9 @@ class TimestepEmbedder(Model):
     def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
         self.mlp = tf.keras.Sequential([
-            layers.Dense(hidden_size, use_bias=True, name="mlp.0"),
+            layers.Dense(hidden_size, use_bias=True, name="mlp_0"),
             layers.Activation('silu'),
-            layers.Dense(hidden_size, use_bias=True, name="mlp.2")
+            layers.Dense(hidden_size, use_bias=True, name="mlp_2")
         ])
         self.frequency_embedding_size = frequency_embedding_size
 
@@ -74,7 +75,7 @@ class FinalLayer(layers.Layer):
         )
         self.adaLN_modulation = tf.keras.Sequential([
             layers.Activation('silu'),
-            layers.Dense(2 * hidden_size, use_bias=True, name="adaLN_modulation.1")
+            layers.Dense(2 * hidden_size, use_bias=True, name="adaLN_modulation_1")
         ])
 
     def call(self, x, c):
@@ -400,115 +401,64 @@ class OmniGen(Model):
         return latents
 
     @classmethod
-    def from_pretrained(cls, model_name, **kwargs):
-        """Load model from pretrained weights."""
-        if not os.path.exists(model_name):
+    def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args, **kwargs) -> "OmniGen":
+        """Load pretrained model."""
+        config = None
+        model_path = pretrained_model_name_or_path
+        
+        # Download from hub if needed
+        if not os.path.exists(pretrained_model_name_or_path):
             cache_folder = os.getenv('HF_HUB_CACHE')
-            model_name = snapshot_download(
-                repo_id=model_name,
+            model_path = snapshot_download(
+                repo_id=pretrained_model_name_or_path,
                 cache_dir=cache_folder,
-                ignore_patterns=['flax_model.msgpack', 'rust_model.ot', 'tf_model.h5']
+                ignore_patterns=['*.bin', '*.msgpack', '*.ot', '*.h5']
             )
             
-        # Load configuration
-        config = Phi3Config.from_pretrained(model_name)
-        
-        # Create model instance
-        model = cls(config, **kwargs)
-        
-        # Debug: Print model structure
-        print("\nModel Structure:")
-        for var in model.variables:
-            print(f"  {var.name} - Shape: {var.shape}")
+        # Load config
+        config_file = os.path.join(model_path, "config.json")
+        if os.path.exists(config_file):
+            with open(config_file, "r") as f:
+                config = json.load(f)
+        else:
+            config = Phi3Config.from_pretrained(model_path)
+            
+        # Create model
+        model = cls(config, *model_args, **kwargs)
         
         # Load weights
-        weights_path = os.path.join(model_name, "model.safetensors")
-        if os.path.exists(weights_path):
-            print("\nLoading safetensors weights...")
+        print("\nLoading safetensors weights...")
+        weights_file = os.path.join(model_path, "model.safetensors")
+        if not os.path.exists(weights_file):
+            weights_file = snapshot_download(
+                repo_id=pretrained_model_name_or_path,
+                cache_dir=cache_folder,
+                allow_patterns=["*.safetensors"]
+            )
+            weights_file = os.path.join(weights_file, "model.safetensors")
             
-            # Create parameter mapping dictionary
-            param_mapping = {
-                # Embedders
-                't_embedder.mlp.0.weight': 't_embedder/mlp_0/kernel',
-                't_embedder.mlp.0.bias': 't_embedder/mlp_0/bias',
-                't_embedder.mlp.2.weight': 't_embedder/mlp_2/kernel',
-                't_embedder.mlp.2.bias': 't_embedder/mlp_2/bias',
-                
-                'time_token.mlp.0.weight': 'time_token/mlp_0/kernel',
-                'time_token.mlp.0.bias': 'time_token/mlp_0/bias',
-                'time_token.mlp.2.weight': 'time_token/mlp_2/kernel',
-                'time_token.mlp.2.bias': 'time_token/mlp_2/bias',
-                
-                # Patch embedders
-                'x_embedder.proj.weight': 'x_embedder/proj/kernel',
-                'x_embedder.proj.bias': 'x_embedder/proj/bias',
-                'input_x_embedder.proj.weight': 'input_x_embedder/proj/kernel',
-                'input_x_embedder.proj.bias': 'input_x_embedder/proj/bias',
-                
-                # Final layer
-                'final_layer.norm_final.weight': 'final_layer/norm_final/gamma',
-                'final_layer.norm_final.bias': 'final_layer/norm_final/beta',
-                'final_layer.linear.weight': 'final_layer/linear/kernel',
-                'final_layer.linear.bias': 'final_layer/linear/bias',
-                'final_layer.adaLN_modulation.1.weight': 'final_layer/adaLN_modulation_1/kernel',
-                'final_layer.adaLN_modulation.1.bias': 'final_layer/adaLN_modulation_1/bias',
-                
-                # Transformer layers
-                'llm.norm.weight': 'transformer/norm/gamma',
-                'llm.norm.bias': 'transformer/norm/beta',
-                'llm.embed_tokens.weight': 'transformer/embed_tokens/kernel',
-            }
+        if os.path.exists(weights_file):
+            state_dict = safe_open(weights_file, framework="tf")
             
-            # Add transformer layer mappings
-            for i in range(32):  # Assuming 32 layers
-                layer_prefix = f'llm.layers.{i}'
-                tf_prefix = f'transformer/layers_{i}'
-                layer_map = {
-                    f'{layer_prefix}.input_layernorm.weight': f'{tf_prefix}/input_layernorm/gamma',
-                    f'{layer_prefix}.post_attention_layernorm.weight': f'{tf_prefix}/post_attention_layernorm/gamma',
-                    f'{layer_prefix}.self_attn.qkv_proj.weight': f'{tf_prefix}/self_attn/qkv_proj/kernel',
-                    f'{layer_prefix}.self_attn.o_proj.weight': f'{tf_prefix}/self_attn/o_proj/kernel',
-                    f'{layer_prefix}.mlp.gate_up_proj.weight': f'{tf_prefix}/mlp/gate_up_proj/kernel',
-                    f'{layer_prefix}.mlp.down_proj.weight': f'{tf_prefix}/mlp/down_proj/kernel',
-                }
-                param_mapping.update(layer_map)
+            # Convert weights to TensorFlow format
+            tf_weights = {}
+            for name, param in state_dict.items():
+                # Convert parameter names
+                tf_name = name.replace(".", "_")
+                if "layers" in tf_name:
+                    layer_num = int(tf_name.split("layers_")[1].split("_")[0])
+                    tf_name = tf_name.replace(f"layers_{layer_num}", f"layer_{layer_num}")
+                if tf_name is not None:
+                    tf_weights[tf_name] = param
+                    
+            # Set weights
+            model.set_weights([tf_weights[w.name] for w in model.weights if w.name in tf_weights])
             
-            # Get all model variables
-            var_dict = {}
-            for var in model.variables:
-                name = var.name.split(':')[0]
-                var_dict[name] = var
+            # Report missing parameters
+            missing_params = set(state_dict.keys()) - set(tf_weights.keys())
+            for param in missing_params:
+                print(f"Warning: Parameter {param} not found in model")
                 
-            with safe_open(weights_path, framework="tf") as f:
-                # Load and assign weights
-                for pt_name in f.keys():
-                    # Get TensorFlow name
-                    tf_name = param_mapping.get(pt_name)
-                    if tf_name is None:
-                        # Try direct conversion
-                        tf_name = pt_name.replace('.', '/')
-                        
-                    if tf_name in var_dict:
-                        tensor = f.get_tensor(pt_name)
-                        
-                        # Handle special cases
-                        if 'kernel' in tf_name and len(tensor.shape) >= 2:
-                            if 'conv' in tf_name.lower() or 'proj' in tf_name.lower():
-                                # Conv2D weights need HWIO to OIHW conversion
-                                tensor = np.transpose(tensor, (2, 3, 1, 0))
-                            else:
-                                # Dense layers need simple transpose
-                                tensor = np.transpose(tensor)
-                                
-                        try:
-                            var_dict[tf_name].assign(tensor)
-                            print(f"Assigned {pt_name} -> {tf_name}")
-                        except Exception as e:
-                            print(f"Error assigning {pt_name} -> {tf_name}: {e}")
-                            print(f"Shapes: PyTorch {tensor.shape} vs TF {var_dict[tf_name].shape}")
-                    else:
-                        print(f"Warning: Parameter {pt_name} not found in model")
-                        
         print("Model loaded successfully!")
         return model
 
