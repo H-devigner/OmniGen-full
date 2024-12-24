@@ -413,23 +413,28 @@ class OmniGen(Model):
         # Create model instance
         model = cls(config, **kwargs)
         
+        # Debug: Print model structure
+        print("\nModel Structure:")
+        for var in model.variables:
+            print(f"  {var.name} - Shape: {var.shape}")
+        
         # Load weights
         weights_path = os.path.join(model_name, "model.safetensors")
         if os.path.exists(weights_path):
-            print("Loading safetensors weights...")
+            print("\nLoading safetensors weights...")
             
             # Create parameter mapping dictionary
             param_mapping = {
                 # Embedders
-                't_embedder.mlp.0.weight': 't_embedder/mlp/0/kernel',
-                't_embedder.mlp.0.bias': 't_embedder/mlp/0/bias',
-                't_embedder.mlp.2.weight': 't_embedder/mlp/2/kernel',
-                't_embedder.mlp.2.bias': 't_embedder/mlp/2/bias',
+                't_embedder.mlp.0.weight': 't_embedder/mlp_0/kernel',
+                't_embedder.mlp.0.bias': 't_embedder/mlp_0/bias',
+                't_embedder.mlp.2.weight': 't_embedder/mlp_2/kernel',
+                't_embedder.mlp.2.bias': 't_embedder/mlp_2/bias',
                 
-                'time_token.mlp.0.weight': 'time_token/mlp/0/kernel',
-                'time_token.mlp.0.bias': 'time_token/mlp/0/bias',
-                'time_token.mlp.2.weight': 'time_token/mlp/2/kernel',
-                'time_token.mlp.2.bias': 'time_token/mlp/2/bias',
+                'time_token.mlp.0.weight': 'time_token/mlp_0/kernel',
+                'time_token.mlp.0.bias': 'time_token/mlp_0/bias',
+                'time_token.mlp.2.weight': 'time_token/mlp_2/kernel',
+                'time_token.mlp.2.bias': 'time_token/mlp_2/bias',
                 
                 # Patch embedders
                 'x_embedder.proj.weight': 'x_embedder/proj/kernel',
@@ -442,13 +447,28 @@ class OmniGen(Model):
                 'final_layer.norm_final.bias': 'final_layer/norm_final/beta',
                 'final_layer.linear.weight': 'final_layer/linear/kernel',
                 'final_layer.linear.bias': 'final_layer/linear/bias',
-                'final_layer.adaLN_modulation.1.weight': 'final_layer/adaLN_modulation/1/kernel',
-                'final_layer.adaLN_modulation.1.bias': 'final_layer/adaLN_modulation/1/bias',
+                'final_layer.adaLN_modulation.1.weight': 'final_layer/adaLN_modulation_1/kernel',
+                'final_layer.adaLN_modulation.1.bias': 'final_layer/adaLN_modulation_1/bias',
                 
-                # Transformer
+                # Transformer layers
                 'llm.norm.weight': 'transformer/norm/gamma',
                 'llm.norm.bias': 'transformer/norm/beta',
+                'llm.embed_tokens.weight': 'transformer/embed_tokens/kernel',
             }
+            
+            # Add transformer layer mappings
+            for i in range(32):  # Assuming 32 layers
+                layer_prefix = f'llm.layers.{i}'
+                tf_prefix = f'transformer/layers_{i}'
+                layer_map = {
+                    f'{layer_prefix}.input_layernorm.weight': f'{tf_prefix}/input_layernorm/gamma',
+                    f'{layer_prefix}.post_attention_layernorm.weight': f'{tf_prefix}/post_attention_layernorm/gamma',
+                    f'{layer_prefix}.self_attn.qkv_proj.weight': f'{tf_prefix}/self_attn/qkv_proj/kernel',
+                    f'{layer_prefix}.self_attn.o_proj.weight': f'{tf_prefix}/self_attn/o_proj/kernel',
+                    f'{layer_prefix}.mlp.gate_up_proj.weight': f'{tf_prefix}/mlp/gate_up_proj/kernel',
+                    f'{layer_prefix}.mlp.down_proj.weight': f'{tf_prefix}/mlp/down_proj/kernel',
+                }
+                param_mapping.update(layer_map)
             
             # Get all model variables
             var_dict = {}
@@ -456,17 +476,7 @@ class OmniGen(Model):
                 name = var.name.split(':')[0]
                 var_dict[name] = var
                 
-            # Debug: print all available variables
-            print("\nAvailable TensorFlow variables:")
-            for name in sorted(var_dict.keys()):
-                print(f"  {name}")
-            
             with safe_open(weights_path, framework="tf") as f:
-                # Debug: print all PyTorch parameters
-                print("\nPyTorch parameters to load:")
-                for name in sorted(f.keys()):
-                    print(f"  {name}")
-                
                 # Load and assign weights
                 for pt_name in f.keys():
                     # Get TensorFlow name
@@ -489,6 +499,7 @@ class OmniGen(Model):
                                 
                         try:
                             var_dict[tf_name].assign(tensor)
+                            print(f"Assigned {pt_name} -> {tf_name}")
                         except Exception as e:
                             print(f"Error assigning {pt_name} -> {tf_name}: {e}")
                             print(f"Shapes: PyTorch {tensor.shape} vs TF {var_dict[tf_name].shape}")

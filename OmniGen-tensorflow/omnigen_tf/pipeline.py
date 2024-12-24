@@ -91,18 +91,28 @@ class OmniGenPipeline:
         if not device:
             return
             
+        # Handle device string
         if isinstance(device, str):
-            device = device.name
-            
+            if device.startswith('/'):
+                device = device[1:]  # Remove leading slash
+                
         # Check if it's a TensorFlow model
         if hasattr(model, 'variables'):
+            print(f"\nMoving TensorFlow model to {device}")
             with tf.device(device):
                 for var in model.variables:
                     if isinstance(var, tf.Variable):
                         var.assign(tf.identity(var))
         # PyTorch model
         elif hasattr(model, 'to'):
+            print(f"\nMoving PyTorch model to {device}")
+            if device.upper() == 'GPU:0':
+                device = 'cuda'
+            elif device.upper() == 'CPU:0':
+                device = 'cpu'
             model.to(device)
+        else:
+            print(f"Warning: Unknown model type, cannot move to {device}")
 
     def enable_cpu_offload(self):
         """Move models to CPU to save memory."""
