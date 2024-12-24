@@ -77,29 +77,56 @@ class OmniGenPipeline:
         self._vae_on_cpu = False
         
     def _move_to_device(self, model, device):
-        """Move model to specified device."""
+        """Move model to specified device efficiently."""
+        if not isinstance(device, str):
+            device = device.name
+            
+        # Use TF's memory optimization
+        tf.config.experimental.set_memory_growth(
+            tf.config.list_physical_devices('GPU')[0], True
+        )
+        
         with tf.device(device):
+            # Move weights without creating copies
             for layer in model.layers:
                 for weight in layer.weights:
-                    weight.assign(tf.identity(weight))
-                    
+                    if weight.device != device:
+                        # Use assign without copy
+                        weight._handle_data = tf.compat.v1.IndexedSlices(
+                            weight, tf.range(tf.size(weight)), tf.shape(weight)
+                        )
+                        
+        # Force garbage collection
+        gc.collect()
+        if device == '/GPU:0':
+            # Clear GPU memory fragments
+            tf.keras.backend.clear_session()
+            
     def enable_cpu_offload(self):
         """Move models to CPU to save memory."""
         if not self._model_on_cpu:
+            # Clear GPU memory before moving
+            if tf.config.list_physical_devices('GPU'):
+                tf.keras.backend.clear_session()
             self._move_to_device(self.model, '/CPU:0')
             self._model_on_cpu = True
+            gc.collect()
             
         if not self._vae_on_cpu:
             self._move_to_device(self.vae, '/CPU:0')
             self._vae_on_cpu = True
+            gc.collect()
             
     def disable_cpu_offload(self):
-        """Move models back to GPU."""
+        """Move models back to GPU efficiently."""
         if self._model_on_cpu and tf.config.list_physical_devices('GPU'):
+            # Clear CPU memory
+            gc.collect()
             self._move_to_device(self.model, '/GPU:0')
             self._model_on_cpu = False
             
         if self._vae_on_cpu and tf.config.list_physical_devices('GPU'):
+            gc.collect()
             self._move_to_device(self.vae, '/GPU:0')
             self._vae_on_cpu = False
             

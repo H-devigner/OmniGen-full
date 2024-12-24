@@ -279,9 +279,6 @@ class OmniGen(tf.keras.Model):
     ):
         super().__init__()
         
-        # Enable mixed precision for better GPU utilization
-        tf.keras.mixed_precision.set_global_policy('mixed_float16')
-        
         # Model configuration
         self.in_channels = in_channels
         self.out_channels = in_channels
@@ -289,241 +286,35 @@ class OmniGen(tf.keras.Model):
         self.pos_embed_max_size = pos_embed_max_size
         self.pe_interpolation = pe_interpolation
         
-        # Memory management
-        self._device_buffers = {}
-        self._persistent_buffers = {}
-        self._is_on_gpu = tf.config.list_physical_devices('GPU')
-        
-        # Set compute dtype
-        self._compute_dtype = tf.float16 if self._is_on_gpu else tf.float32
-        
         hidden_size = transformer_config.hidden_size
         
         # Initialize embedders with proper dtype and memory layout
-        with tf.device('/CPU:0'):
-            self.x_embedder = PatchEmbedMR(
-                patch_size, in_channels, hidden_size,
-                dtype=self._compute_dtype
-            )
-            self.input_x_embedder = PatchEmbedMR(
-                patch_size, in_channels, hidden_size,
-                dtype=self._compute_dtype
-            )
-            
-            self.time_token = TimestepEmbedder(hidden_size)
-            self.t_embedder = TimestepEmbedder(hidden_size)
-            
-            # Create positional embeddings buffer
-            pos_embed = get_2d_sincos_pos_embed(
-                hidden_size, pos_embed_max_size,
-                interpolation_scale=self.pe_interpolation,
-                base_size=64
-            )
-            self._register_buffer(
-                "pos_embed",
-                tf.convert_to_tensor(pos_embed, dtype=self._compute_dtype)[None, ...],
-                persistent=True
-            )
-            
-            self.final_layer = FinalLayer(
-                hidden_size, patch_size, self.out_channels,
-                dtype=self._compute_dtype
-            )
-            
-            self.transformer = Phi3Transformer(
-                config=transformer_config,
-                dtype=self._compute_dtype
-            )
-            
-        self.initialize_weights()
-        
-        # Move to GPU if available
-        if self._is_on_gpu:
-            self._move_to_device('/GPU:0')
-            
-    def _register_buffer(self, name, tensor, persistent=False):
-        """Register a persistent buffer."""
-        if persistent:
-            self._persistent_buffers[name] = tensor
-        setattr(self, name, tensor)
-        
-    def _move_to_device(self, device):
-        """Move model to specified device efficiently."""
-        with tf.device(device):
-            for var in self.trainable_variables:
-                var.assign(tf.identity(var))
-            for name, buffer in self._persistent_buffers.items():
-                setattr(self, name, tf.identity(buffer))
-                
-    @tf.function(jit_compile=True, reduce_retracing=True)
-    def call(self, x, timestep, input_ids=None, input_img_latents=None,
-             input_image_sizes=None, attention_mask=None, position_ids=None,
-             training=False):
-        """Forward pass with memory optimizations."""
-        # Process in chunks to save memory
-        batch_size = tf.shape(x)[0]
-        max_batch_size = 4  # Adjust based on available memory
-        
-        outputs = []
-        for i in range(0, batch_size, max_batch_size):
-            end_idx = tf.minimum(i + max_batch_size, batch_size)
-            
-            # Get batch slice
-            x_batch = x[i:end_idx]
-            timestep_batch = timestep[i:end_idx]
-            
-            # Process embeddings
-            t_emb = self.t_embedder(timestep_batch)
-            
-            # Process latents efficiently
-            latents = self.x_embedder(x_batch)
-            height, width = tf.shape(x_batch)[2], tf.shape(x_batch)[3]
-            pos_embed = self.cropped_pos_embed(height, width)
-            latents = latents + pos_embed
-            
-            # Process input images if provided
-            if input_img_latents is not None:
-                img_batch = input_img_latents[i:end_idx]
-                input_latents = self.input_x_embedder(img_batch)
-                input_latents = input_latents + pos_embed
-            else:
-                input_latents = None
-                
-            # Run transformer with memory optimization
-            hidden_states = self.transformer(
-                input_ids=input_ids[i:end_idx] if input_ids is not None else None,
-                attention_mask=attention_mask[i:end_idx] if attention_mask is not None else None,
-                position_ids=position_ids[i:end_idx] if position_ids is not None else None,
-                inputs_embeds=latents,
-                input_image_embeds=input_latents,
-                t_emb=t_emb,
-                training=training
-            )
-            
-            # Process output
-            output = self.final_layer(hidden_states, t_emb)
-            output = self.unpatchify(output, height, width)
-            outputs.append(output)
-            
-            # Clear intermediate tensors
-            tf.keras.backend.clear_session()
-            
-        # Combine outputs efficiently
-        return tf.concat(outputs, axis=0)
-        
-    @tf.function(jit_compile=True)
-    def forward_with_cfg(self, x, timestep, input_ids=None, input_img_latents=None,
-                        input_image_sizes=None, attention_mask=None, position_ids=None,
-                        cfg_scale=7.5, use_img_cfg=False, img_cfg_scale=1.0):
-        """Classifier-free guidance with memory optimization."""
-        # Process with conditions
-        cond_out = self.call(
-            x, timestep, input_ids, input_img_latents,
-            input_image_sizes, attention_mask, position_ids
+        self.x_embedder = PatchEmbedMR(
+            patch_size, in_channels, hidden_size,
+        )
+        self.input_x_embedder = PatchEmbedMR(
+            patch_size, in_channels, hidden_size,
         )
         
-        # Process without conditions
-        uncond_out = self.call(
-            x, timestep, None, None,
-            input_image_sizes, attention_mask, position_ids
+        self.time_token = TimestepEmbedder(hidden_size)
+        self.t_embedder = TimestepEmbedder(hidden_size)
+        
+        # Create positional embeddings buffer
+        pos_embed = get_2d_sincos_pos_embed(
+            hidden_size, pos_embed_max_size,
+            interpolation_scale=self.pe_interpolation,
+            base_size=64
+        )
+        self.pos_embed = tf.convert_to_tensor(pos_embed[None])
+        
+        self.final_layer = FinalLayer(
+            hidden_size, patch_size, self.out_channels,
         )
         
-        # Apply guidance efficiently
-        output = uncond_out + cfg_scale * (cond_out - uncond_out)
+        self.transformer = Phi3Transformer(
+            config=transformer_config,
+        )
         
-        return output
-
-    def initialize_weights(self):
-        """Initialize model weights."""
-        # Helper function to initialize a single layer
-        def _init_weights(layer):
-            if isinstance(layer, tf.keras.layers.Dense):
-                # Initialize weight matrices with truncated normal
-                kernel_shape = layer.kernel.shape
-                stddev = 1.0 / tf.sqrt(tf.cast(kernel_shape[-1], tf.float32))
-                layer.kernel.assign(
-                    tf.random.truncated_normal(kernel_shape, stddev=stddev)
-                )
-                
-                # Initialize biases to zero if present
-                if layer.use_bias:
-                    layer.bias.assign(tf.zeros_like(layer.bias))
-                    
-            elif isinstance(layer, tf.keras.layers.LayerNormalization):
-                # Initialize scale (gamma) to ones and offset (beta) to zeros
-                # Only initialize if they are tf.Variables (not booleans)
-                if hasattr(layer, 'scale') and isinstance(layer.scale, tf.Variable):
-                    layer.scale.assign(tf.ones_like(layer.scale))
-                if hasattr(layer, 'offset') and isinstance(layer.offset, tf.Variable):
-                    layer.offset.assign(tf.zeros_like(layer.offset))
-                    
-            elif isinstance(layer, tf.keras.layers.Embedding):
-                # Initialize embeddings with truncated normal
-                kernel_shape = layer.embeddings.shape
-                stddev = 1.0 / tf.sqrt(tf.cast(kernel_shape[-1], tf.float32))
-                layer.embeddings.assign(
-                    tf.random.truncated_normal(kernel_shape, stddev=stddev)
-                )
-        
-        # Initialize all layers recursively
-        for layer in self.layers:
-            if hasattr(layer, 'layers'):  # For nested layers/models
-                for sublayer in layer.layers:
-                    _init_weights(sublayer)
-            else:
-                _init_weights(layer)
-                
-        # Initialize transformer separately since it's a custom model
-        if hasattr(self, 'transformer') and hasattr(self.transformer, 'initialize_weights'):
-            self.transformer.initialize_weights()
-            
-        print("Model weights initialized successfully")
-
-    @classmethod
-    def from_pretrained(cls, model_name, device=None, **kwargs):
-        """Load model from pretrained weights.
-        
-        Args:
-            model_name: Name or path of pretrained model
-            device: Device to place model on (removed - handled by pipeline)
-            **kwargs: Additional arguments to pass to model constructor
-        """
-        # Remove device from kwargs since it's handled by pipeline
-        if 'device' in kwargs:
-            del kwargs['device']
-            
-        # Download model if needed
-        if not os.path.exists(model_name):
-            from huggingface_hub import snapshot_download
-            model_name = snapshot_download(model_name)
-            print(f"Downloaded model to {model_name}")
-            
-        # Create model
-        config = Phi3Config.from_pretrained(model_name)
-        model = cls(config, **kwargs)
-        
-        # Load weights
-        if os.path.exists(os.path.join(model_name, 'model.safetensors')):
-            print("Loading safetensors weights...")
-            from safetensors.torch import load_file
-            state_dict = load_file(os.path.join(model_name, 'model.safetensors'))
-            # Convert torch state dict to TF
-            tf_state_dict = {}
-            for k, v in state_dict.items():
-                tf_state_dict[k] = tf.convert_to_tensor(v.numpy())
-            model.load_weights(tf_state_dict)
-        else:
-            print("Loading PyTorch weights...")
-            import torch
-            state_dict = torch.load(os.path.join(model_name, 'model.pt'), map_location='cpu')
-            # Convert torch state dict to TF
-            tf_state_dict = {}
-            for k, v in state_dict.items():
-                tf_state_dict[k] = tf.convert_to_tensor(v.numpy())
-            model.load_weights(tf_state_dict)
-            
-        return model
-
     def unpatchify(self, x, h, w):
         """Convert a sequence of patch embeddings back to an image.
         
@@ -559,7 +350,7 @@ class OmniGen(tf.keras.Model):
         h, w = height // self.patch_size, width // self.patch_size
         pos_embed = self.pos_embed
         
-        if h * w != self.pos_embed.shape[1]:
+        if h * w != pos_embed.shape[1]:
             pos_embed = get_2d_sincos_pos_embed(
                 self.transformer.config.hidden_size,
                 (h, w),
@@ -611,3 +402,100 @@ class OmniGen(tf.keras.Model):
             shapes_list.append((h, w))
         
         return x_list, num_tokens_list, shapes_list
+
+    @tf.function(jit_compile=True)
+    def call(self, x, timestep, input_ids=None, input_img_latents=None,
+             input_image_sizes=None, attention_mask=None, position_ids=None,
+             training=False):
+        """Forward pass matching PyTorch's memory management."""
+        # Handle input as list
+        input_is_list = isinstance(x, (list, tuple))
+        x, num_tokens, shapes = self.patch_multiple_resolutions(x, None)
+        
+        # Process timestep
+        time_token = self.time_token(timestep, dtype=x[0].dtype)
+        time_token = tf.expand_dims(time_token, 1)
+        
+        # Process input images if provided
+        if input_img_latents is not None:
+            input_latents, _, _ = self.patch_multiple_resolutions(
+                input_img_latents, is_input_images=True
+            )
+            
+        # Process input IDs and combine embeddings
+        if input_ids is not None:
+            condition_embeds = self.transformer.embed_tokens(input_ids)
+            
+            # Handle image embeddings
+            if input_img_latents is not None:
+                input_img_idx = 0
+                for b_idx in input_image_sizes:
+                    for start_idx, end_idx in input_image_sizes[b_idx]:
+                        condition_embeds = tf.tensor_scatter_nd_update(
+                            condition_embeds,
+                            [[b_idx, i] for i in range(start_idx, end_idx)],
+                            input_latents[input_img_idx]
+                        )
+                        input_img_idx += 1
+                        
+            # Combine embeddings
+            input_emb = tf.concat([condition_embeds, time_token, x[0]], axis=1)
+        else:
+            input_emb = tf.concat([time_token, x[0]], axis=1)
+            
+        # Forward through transformer
+        transformer_output = self.transformer(
+            inputs_embeds=input_emb,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            training=training
+        )
+        
+        # Process output
+        output = transformer_output.last_hidden_state
+        
+        if input_is_list:
+            # Handle list input case
+            max_tokens = tf.reduce_max(num_tokens)
+            image_embedding = output[:, -max_tokens:]
+            time_emb = self.t_embedder(timestep, dtype=x[0].dtype)
+            x = self.final_layer(image_embedding, time_emb)
+            
+            # Process each item in batch
+            latents = []
+            for i in range(tf.shape(x)[0]):
+                latent = x[i:i+1, :num_tokens[i]]
+                latent = self.unpatchify(latent, shapes[i][0], shapes[i][1])
+                latents.append(latent)
+        else:
+            # Handle single input case
+            image_embedding = output[:, -num_tokens[0]:]
+            time_emb = self.t_embedder(timestep, dtype=x[0].dtype)
+            x = self.final_layer(image_embedding, time_emb)
+            latents = self.unpatchify(x, shapes[0][0], shapes[0][1])
+            
+        return latents
+
+    @tf.function(jit_compile=True)
+    def forward_with_cfg(self, x, timestep, input_ids=None, input_img_latents=None,
+                        input_image_sizes=None, attention_mask=None, position_ids=None,
+                        cfg_scale=7.5, use_img_cfg=False, img_cfg_scale=1.0):
+        """Classifier-free guidance matching PyTorch implementation."""
+        # Process with guidance
+        model_out = self.call(
+            x, timestep, input_ids, input_img_latents,
+            input_image_sizes, attention_mask, position_ids
+        )
+        
+        if use_img_cfg:
+            # Split for image-based guidance
+            cond, uncond, img_cond = tf.split(model_out, 3, axis=0)
+            cond = uncond + img_cfg_scale * (img_cond - uncond) + cfg_scale * (cond - img_cond)
+            model_out = [cond, cond, cond]
+        else:
+            # Standard guidance
+            cond, uncond = tf.split(model_out, 2, axis=0)
+            cond = uncond + cfg_scale * (cond - uncond)
+            model_out = [cond, cond]
+            
+        return tf.concat(model_out, axis=0)
