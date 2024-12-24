@@ -9,6 +9,7 @@ import os
 import tensorflow as tf
 from tensorflow.keras import layers, Model
 import numpy as np
+import math
 from typing import Dict, Optional, List, Union
 from safetensors import safe_open
 from huggingface_hub import snapshot_download
@@ -19,26 +20,8 @@ from omnigen_tf.transformer import Phi3Config, Phi3Transformer
 
 @tf.function(jit_compile=True)
 def modulate(x, shift, scale):
-    """Apply adaptive layer normalization modulation.
-    
-    Args:
-        x: Input tensor to modulate
-        shift: Shift parameter for modulation
-        scale: Scale parameter for modulation
-    
-    Returns:
-        Modulated tensor with same shape as input
-    """
-    # Use float16 for GPU operations
-    if tf.config.list_physical_devices('GPU'):
-        x = tf.cast(x, tf.float16)
-        shift = tf.cast(shift, tf.float16)
-        scale = tf.cast(scale, tf.float16)
-    else:
-        x = tf.cast(x, tf.float32)
-        shift = tf.cast(shift, tf.float32)
-        scale = tf.cast(scale, tf.float32)
-    return x * (1.0 + scale[:, tf.newaxis]) + shift[:, tf.newaxis]
+    """Apply adaptive layer normalization modulation."""
+    return x * (1 + tf.expand_dims(scale, 1)) + tf.expand_dims(shift, 1)
 
 
 class TimestepEmbedder(Model):
@@ -49,18 +32,17 @@ class TimestepEmbedder(Model):
         self.mlp = tf.keras.Sequential([
             layers.Dense(hidden_size, use_bias=True),
             layers.Activation('silu'),
-            layers.Dense(hidden_size, use_bias=True)
+            layers.Dense(hidden_size, use_bias=True),
         ])
         self.frequency_embedding_size = frequency_embedding_size
 
     @staticmethod
     @tf.function(jit_compile=True)
     def timestep_embedding(t, dim, max_period=10000):
-        """Create sinusoidal timestep embeddings with XLA optimization."""
+        """Create sinusoidal timestep embeddings."""
         half = dim // 2
         freqs = tf.exp(
-            -tf.math.log(tf.cast(max_period, t.dtype)) * 
-            tf.range(half, dtype=t.dtype) / tf.cast(half, t.dtype)
+            -math.log(max_period) * tf.range(half, dtype=t.dtype) / half
         )
         args = tf.cast(t[:, None], dtype=freqs.dtype) * freqs[None]
         embedding = tf.concat([tf.cos(args), tf.sin(args)], axis=-1)
@@ -68,35 +50,32 @@ class TimestepEmbedder(Model):
             embedding = tf.concat([embedding, tf.zeros_like(embedding[:, :1])], axis=-1)
         return embedding
 
-    @tf.function(jit_compile=True)
     def call(self, t):
-        # Cast to appropriate precision
-        if tf.config.list_physical_devices('GPU'):
-            t = tf.cast(t, tf.float16)
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         t_emb = self.mlp(t_freq)
         return t_emb
 
 
 class FinalLayer(layers.Layer):
-    """The final layer of the DiT model."""
+    """The final layer of DiT."""
     
     def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
-        self.norm_final = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-        self.linear = layers.Dense(patch_size * patch_size * out_channels, use_bias=True)
+        self.norm_final = tf.keras.layers.LayerNormalization(
+            epsilon=1e-6, 
+            center=False, 
+            scale=False
+        )
+        self.linear = layers.Dense(
+            patch_size * patch_size * out_channels,
+            use_bias=True
+        )
         self.adaLN_modulation = tf.keras.Sequential([
             layers.Activation('silu'),
             layers.Dense(2 * hidden_size, use_bias=True)
         ])
 
-    @tf.function(jit_compile=True)
     def call(self, x, c):
-        # Cast inputs to appropriate precision for GPU
-        if tf.config.list_physical_devices('GPU'):
-            x = tf.cast(x, tf.float16)
-            c = tf.cast(c, tf.float16)
-            
         shift, scale = tf.split(self.adaLN_modulation(c), 2, axis=1)
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
@@ -104,25 +83,22 @@ class FinalLayer(layers.Layer):
 
 
 class PatchEmbedMR(layers.Layer):
-    """2D Image to Patch Embedding layer."""
+    """2D Image to Patch Embedding."""
     
     def __init__(self, patch_size=2, in_chans=4, embed_dim=768, bias=True):
         super().__init__()
-        # Configure layer with appropriate precision
         self.proj = layers.Conv2D(
             embed_dim,
             kernel_size=patch_size,
             strides=patch_size,
-            use_bias=bias,
-            name='patch_embed'
+            use_bias=bias
         )
 
-    @tf.function(jit_compile=True)
     def call(self, x):
-        # Cast input to appropriate precision for GPU
-        if tf.config.list_physical_devices('GPU'):
-            x = tf.cast(x, tf.float16)
-        return self.proj(x)
+        x = self.proj(x)
+        # NHWC -> NLC (equivalent to PyTorch's NCHW -> NLC)
+        x = tf.reshape(x, [tf.shape(x)[0], -1, tf.shape(x)[-1]])
+        return x
 
 
 class OmniGen(Model):
@@ -138,10 +114,6 @@ class OmniGen(Model):
     ):
         super().__init__()
         
-        # Enable mixed precision by default for GPU
-        if tf.config.list_physical_devices('GPU'):
-            tf.keras.mixed_precision.set_global_policy('mixed_float16')
-        
         # Model configuration
         self.in_channels = in_channels
         self.out_channels = in_channels
@@ -155,27 +127,31 @@ class OmniGen(Model):
         self.x_embedder = PatchEmbedMR(
             patch_size=patch_size,
             in_chans=in_channels,
-            embed_dim=hidden_size
+            embed_dim=hidden_size,
+            bias=True
         )
         self.input_x_embedder = PatchEmbedMR(
             patch_size=patch_size,
             in_chans=in_channels,
-            embed_dim=hidden_size
+            embed_dim=hidden_size,
+            bias=True
         )
         
         self.time_token = TimestepEmbedder(hidden_size)
         self.t_embedder = TimestepEmbedder(hidden_size)
         
-        # Create positional embeddings with proper precision
-        with tf.device('/CPU:0'):
-            pos_embed = get_2d_sincos_pos_embed(
-                hidden_size, pos_embed_max_size,
-                interpolation_scale=self.pe_interpolation,
-                base_size=64
-            )
-            self.pos_embed = tf.convert_to_tensor(pos_embed[None])
-            if tf.config.list_physical_devices('GPU'):
-                self.pos_embed = tf.cast(self.pos_embed, tf.float16)
+        # Create positional embeddings
+        pos_embed = get_2d_sincos_pos_embed(
+            hidden_size, 
+            pos_embed_max_size,
+            interpolation_scale=self.pe_interpolation,
+            base_size=64
+        )
+        self.pos_embed = tf.Variable(
+            initial_value=pos_embed[None],
+            trainable=False,
+            name="pos_embed"
+        )
         
         self.final_layer = FinalLayer(
             hidden_size=hidden_size,
@@ -186,23 +162,19 @@ class OmniGen(Model):
         self.transformer = Phi3Transformer(
             config=transformer_config
         )
+        # Disable caching to match PyTorch
+        self.transformer.config.use_cache = False
 
     @tf.function(jit_compile=True)
     def call(self, x, timestep, input_ids=None, input_img_latents=None,
              input_image_sizes=None, attention_mask=None, position_ids=None,
              training=False):
-        # Cast inputs to appropriate precision
-        dtype = tf.float16 if tf.config.list_physical_devices('GPU') else tf.float32
-        x = tf.cast(x, dtype)
-        
         # Process inputs
-        with tf.device('/CPU:0'):
-            # Handle embeddings on CPU
-            x_patches = self.x_embedder(x)
-            t_emb = self.t_embedder(timestep)
-            
-            if input_img_latents is not None:
-                input_img_patches = self.input_x_embedder(input_img_latents)
+        x_patches = self.x_embedder(x)
+        t_emb = self.t_embedder(timestep)
+        
+        if input_img_latents is not None:
+            input_img_patches = self.input_x_embedder(input_img_latents)
         
         # Move to GPU for main computation if available
         if tf.config.list_physical_devices('GPU'):
@@ -294,7 +266,11 @@ class OmniGen(Model):
                 interpolation_scale=self.pe_interpolation,
                 base_size=64
             )
-            pos_embed = tf.cast(tf.convert_to_tensor(pos_embed[None]), self.pos_embed.dtype)
+            pos_embed = tf.Variable(
+                initial_value=pos_embed[None],
+                trainable=False,
+                name="pos_embed"
+            )
         
         return pos_embed
 
@@ -366,26 +342,16 @@ class OmniGen(Model):
 
     @classmethod
     def from_pretrained(cls, model_name, **kwargs):
-        """Load model from pretrained weights.
-        
-        Args:
-            model_name: Name or path of pretrained model
-            **kwargs: Additional arguments to pass to model constructor
-            
-        Returns:
-            Initialized model with pretrained weights
-        """
-        # Download model if needed
+        """Load model from pretrained weights."""
         if not os.path.exists(model_name):
-            print(f"Downloading model from {model_name}...")
-            model_name = snapshot_download(model_name)
-            print(f"Downloaded model to {model_name}")
+            cache_folder = os.getenv('HF_HUB_CACHE')
+            model_name = snapshot_download(
+                repo_id=model_name,
+                cache_dir=cache_folder,
+                ignore_patterns=['flax_model.msgpack', 'rust_model.ot', 'tf_model.h5']
+            )
             
         # Load configuration
-        config_path = os.path.join(model_name, "config.json")
-        if not os.path.exists(config_path):
-            raise ValueError(f"Config not found at {config_path}")
-            
         config = Phi3Config.from_pretrained(model_name)
         
         # Create model instance
@@ -396,22 +362,11 @@ class OmniGen(Model):
         if os.path.exists(weights_path):
             print("Loading safetensors weights...")
             with safe_open(weights_path, framework="tf") as f:
-                state_dict = {key: tf.convert_to_tensor(f.get_tensor(key)) for key in f.keys()}
-        else:
-            # Try PyTorch weights
-            pt_path = os.path.join(model_name, "model.pt")
-            if not os.path.exists(pt_path):
-                raise ValueError(f"No weights found at {weights_path} or {pt_path}")
-                
-            print("Loading PyTorch weights...")
-            import torch
-            state_dict = torch.load(pt_path, map_location="cpu")
-            state_dict = {k: tf.convert_to_tensor(v.numpy()) for k, v in state_dict.items()}
-            
-        # Set model weights
-        model.set_weights([state_dict[key] for key in model.weights])
+                for key in f.keys():
+                    if key in model.state_dict():
+                        model.state_dict()[key].assign(f.get_tensor(key))
+                        
         print("Model loaded successfully!")
-        
         return model
 
 
