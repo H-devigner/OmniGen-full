@@ -1,57 +1,79 @@
+"""OmniGen Transformer implementation."""
+
 import math
-import warnings
-from typing import List, Optional, Tuple, Union, Dict
+from typing import Optional, Tuple, Union, Dict
 from dataclasses import dataclass, field
 
 import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
-
-from transformers.modeling_tf_utils import TFPreTrainedModel, unpack_inputs
 from transformers import PretrainedConfig
-from transformers.cache_utils import Cache, DynamicCache
-from transformers.utils import logging
 
-logger = logging.get_logger(__name__)
 
-@dataclass
 class Phi3Config(PretrainedConfig):
     """Configuration class for Phi3 model."""
-    model_type: str = field(default="phi3")
-    hidden_size: int = field(default=2048)
-    intermediate_size: int = field(default=8192)
-    num_hidden_layers: int = field(default=32)
-    num_attention_heads: int = field(default=32)
-    max_position_embeddings: int = field(default=2048)
-    layer_norm_eps: float = field(default=1e-5)
-    hidden_dropout: float = field(default=0.0)
-    attention_dropout: float = field(default=0.0)
-    initializer_range: float = field(default=0.02)
-    use_cache: bool = field(default=True)
-    vocab_size: int = field(default=32000)
-    tie_word_embeddings: bool = field(default=False)
-    output_attentions: bool = field(default=False)
-    output_hidden_states: bool = field(default=False)
-    use_return_dict: bool = field(default=True)
+    model_type = "phi3"
     
-    # Token configuration
-    bos_token_id: int = field(default=1)
-    eos_token_id: int = field(default=2)
-    pad_token_id: int = field(default=0)
-    sep_token_id: int = field(default=None)
-    cls_token_id: int = field(default=None)
-    mask_token_id: int = field(default=None)
-    unk_token_id: int = field(default=3)
-    
-    def __post_init__(self):
-        """Initialize derived attributes."""
-        super().__post_init__()
+    def __init__(
+        self,
+        hidden_size: int = 2048,
+        intermediate_size: int = 8192,
+        num_hidden_layers: int = 32,
+        num_attention_heads: int = 32,
+        max_position_embeddings: int = 2048,
+        layer_norm_eps: float = 1e-5,
+        hidden_dropout: float = 0.0,
+        attention_dropout: float = 0.0,
+        initializer_range: float = 0.02,
+        use_cache: bool = True,
+        vocab_size: int = 32000,
+        tie_word_embeddings: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        use_return_dict: bool = True,
+        bos_token_id: int = 1,
+        eos_token_id: int = 2,
+        pad_token_id: int = 0,
+        sep_token_id: Optional[int] = None,
+        cls_token_id: Optional[int] = None,
+        mask_token_id: Optional[int] = None,
+        unk_token_id: int = 3,
+        **kwargs
+    ):
+        """Initialize config."""
+        super().__init__(
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            sep_token_id=sep_token_id,
+            cls_token_id=cls_token_id,
+            mask_token_id=mask_token_id,
+            unk_token_id=unk_token_id,
+            **kwargs
+        )
+        
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.max_position_embeddings = max_position_embeddings
+        self.layer_norm_eps = layer_norm_eps
+        self.hidden_dropout = hidden_dropout
+        self.attention_dropout = attention_dropout
+        self.initializer_range = initializer_range
+        self.use_cache = use_cache
+        self.vocab_size = vocab_size
+        self.tie_word_embeddings = tie_word_embeddings
+        self.output_attentions = output_attentions
+        self.output_hidden_states = output_hidden_states
+        self.use_return_dict = use_return_dict
+        
+        # Compute derived attributes
         self.head_dim = self.hidden_size // self.num_attention_heads
         if self.head_dim * self.num_attention_heads != self.hidden_size:
             raise ValueError(
                 f"hidden_size must be divisible by num_attention_heads (got hidden_size={self.hidden_size} "
                 f"and num_attention_heads={self.num_attention_heads})"
             )
+
 
 class Phi3Transformer(TFPreTrainedModel):
     """
