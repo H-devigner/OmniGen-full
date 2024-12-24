@@ -1,7 +1,7 @@
 """OmniGen Transformer implementation."""
 
 import math
-from typing import Optional, Tuple, Union, Dict
+from typing import Optional, Tuple, Union, Dict, List, Any
 import warnings
 
 import tensorflow as tf
@@ -184,7 +184,7 @@ class Phi3Transformer(TFPreTrainedModel):
         input_ids: Optional[tf.Tensor] = None,
         attention_mask: Optional[tf.Tensor] = None,
         position_ids: Optional[tf.Tensor] = None,
-        past_key_values: Optional[List[tf.Tensor]] = None,
+        past_key_values: Optional[Tuple[Tuple[tf.Tensor, tf.Tensor], ...]] = None,
         inputs_embeds: Optional[tf.Tensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
@@ -192,7 +192,7 @@ class Phi3Transformer(TFPreTrainedModel):
         return_dict: Optional[bool] = None,
         offload_model: Optional[bool] = False,
         training: bool = False,
-    ) -> Union[Tuple, dict]:
+    ) -> Union[Tuple[Any, ...], Dict[str, Any]]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         use_cache = use_cache if use_cache is not None else self.config.use_cache
