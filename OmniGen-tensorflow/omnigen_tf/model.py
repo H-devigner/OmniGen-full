@@ -11,7 +11,7 @@ from tensorflow.keras import layers, Model
 import numpy as np
 import math
 from typing import Dict, Optional, List, Union
-from safetensors import safe_open
+from safetensors.torch import load_file
 from huggingface_hub import snapshot_download
 from diffusers.loaders import PeftAdapterMixin
 import json
@@ -432,18 +432,13 @@ class OmniGen(Model):
         model = cls(config, *model_args, **kwargs)
         
         # Load weights
-        print("\nLoading safetensors weights...")
         weights_file = os.path.join(model_path, "model.safetensors")
-        if not os.path.exists(weights_file):
-            weights_file = snapshot_download(
-                repo_id=pretrained_model_name_or_path,
-                cache_dir=cache_folder,
-                allow_patterns=["*.safetensors"]
-            )
-            weights_file = os.path.join(weights_file, "model.safetensors")
-            
         if os.path.exists(weights_file):
-            state_dict = safe_open(weights_file, framework="tf")
+            print("Loading safetensors weights...")
+            from safetensors.torch import load_file
+            
+            # Load state dict
+            state_dict = load_file(weights_file)
             
             # Convert weights to TensorFlow format
             tf_weights = {}
@@ -451,20 +446,34 @@ class OmniGen(Model):
                 # Convert parameter names
                 tf_name = name.replace(".", "_")
                 if "layers" in tf_name:
-                    layer_num = int(tf_name.split("layers_")[1].split("_")[0])
-                    tf_name = tf_name.replace(f"layers_{layer_num}", f"layer_{layer_num}")
-                if tf_name is not None:
-                    tf_weights[tf_name] = param
-                    
-            # Set weights
-            model.set_weights([tf_weights[w.name] for w in model.weights if w.name in tf_weights])
-            
-            # Report missing parameters
-            missing_params = set(state_dict.keys()) - set(tf_weights.keys())
-            for param in missing_params:
-                print(f"Warning: Parameter {param} not found in model")
+                    # Handle layer renaming
+                    parts = tf_name.split("_")
+                    layer_idx = parts[parts.index("layers") + 1]
+                    tf_name = f"transformer_layers_{layer_idx}_" + "_".join(parts[parts.index("layers") + 2:])
                 
-        print("Model loaded successfully!")
+                # Convert tensor to numpy array
+                param_np = param.numpy()
+                
+                # Handle special cases for attention layers
+                if "attn" in tf_name:
+                    if "qkv_proj" in tf_name:
+                        # Split QKV projection into separate Q, K, V
+                        hidden_size = param_np.shape[-1] // 3
+                        q, k, v = np.split(param_np, 3, axis=-1)
+                        tf_weights[tf_name.replace("qkv_proj", "q_proj")] = q
+                        tf_weights[tf_name.replace("qkv_proj", "k_proj")] = k
+                        tf_weights[tf_name.replace("qkv_proj", "v_proj")] = v
+                    else:
+                        tf_weights[tf_name] = param_np
+                else:
+                    tf_weights[tf_name] = param_np
+            
+            # Load weights into model
+            model.set_weights([tf_weights[name] for name in model.weights_map.keys()])
+            print("Weights loaded successfully!")
+        else:
+            print(f"No weights file found at {weights_file}")
+            
         return model
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0, interpolation_scale=1.0, base_size=1):
