@@ -15,6 +15,7 @@ from safetensors import safe_open
 from huggingface_hub import snapshot_download
 from diffusers.loaders import PeftAdapterMixin
 import json
+from dataclasses import fields
 
 from omnigen_tf.transformer import Phi3Config, Phi3Transformer
 
@@ -421,30 +422,44 @@ class OmniGen(Model):
             with open(config_file, "r") as f:
                 config_dict = json.load(f)
                 
-                # Remove HuggingFace special fields
-                for key in ['_name_or_path', 'architectures', 'model_type', 'torch_dtype']:
-                    config_dict.pop(key, None)
-                    
+                # Get valid config fields from Phi3Config
+                valid_fields = {
+                    field.name for field in fields(Phi3Config)
+                    if not field.name.startswith('_')
+                }
+                
+                # Filter config dict to only include valid fields
+                filtered_config = {
+                    k: v for k, v in config_dict.items()
+                    if k in valid_fields
+                }
+                
                 # Ensure we have all required fields with defaults
-                config_dict.setdefault("model_type", "phi3")
-                config_dict.setdefault("hidden_size", 2048)
-                config_dict.setdefault("intermediate_size", 8192)
-                config_dict.setdefault("num_hidden_layers", 32)
-                config_dict.setdefault("num_attention_heads", 32)
-                config_dict.setdefault("max_position_embeddings", 2048)
-                config_dict.setdefault("layer_norm_eps", 1e-5)
-                config_dict.setdefault("hidden_dropout", 0.0)
-                config_dict.setdefault("attention_dropout", 0.0)
-                config_dict.setdefault("initializer_range", 0.02)
-                config_dict.setdefault("use_cache", True)
-                config_dict.setdefault("vocab_size", 32000)
-                config_dict.setdefault("tie_word_embeddings", False)
-                config_dict.setdefault("output_attentions", False)
-                config_dict.setdefault("output_hidden_states", False)
-                config_dict.setdefault("use_return_dict", True)
+                filtered_config.setdefault("model_type", "phi3")
+                filtered_config.setdefault("hidden_size", 2048)
+                filtered_config.setdefault("intermediate_size", 8192)
+                filtered_config.setdefault("num_hidden_layers", 32)
+                filtered_config.setdefault("num_attention_heads", 32)
+                filtered_config.setdefault("max_position_embeddings", 2048)
+                filtered_config.setdefault("layer_norm_eps", 1e-5)
+                filtered_config.setdefault("hidden_dropout", 0.0)
+                filtered_config.setdefault("attention_dropout", 0.0)
+                filtered_config.setdefault("initializer_range", 0.02)
+                filtered_config.setdefault("use_cache", True)
+                filtered_config.setdefault("vocab_size", 32000)
+                filtered_config.setdefault("tie_word_embeddings", False)
+                filtered_config.setdefault("output_attentions", False)
+                filtered_config.setdefault("output_hidden_states", False)
+                filtered_config.setdefault("use_return_dict", True)
+                
+                # Token configuration defaults
+                filtered_config.setdefault("bos_token_id", 1)
+                filtered_config.setdefault("eos_token_id", 2)
+                filtered_config.setdefault("pad_token_id", 0)
+                filtered_config.setdefault("unk_token_id", 3)
                 
                 # Create config object
-                config = Phi3Config(**config_dict)
+                config = Phi3Config(**filtered_config)
         else:
             # Use default config
             config = Phi3Config()

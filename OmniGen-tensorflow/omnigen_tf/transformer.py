@@ -34,6 +34,15 @@ class Phi3Config(PretrainedConfig):
     output_hidden_states: bool = field(default=False)
     use_return_dict: bool = field(default=True)
     
+    # Token configuration
+    bos_token_id: int = field(default=1)
+    eos_token_id: int = field(default=2)
+    pad_token_id: int = field(default=0)
+    sep_token_id: int = field(default=None)
+    cls_token_id: int = field(default=None)
+    mask_token_id: int = field(default=None)
+    unk_token_id: int = field(default=3)
+    
     def __post_init__(self):
         """Initialize derived attributes."""
         super().__post_init__()
