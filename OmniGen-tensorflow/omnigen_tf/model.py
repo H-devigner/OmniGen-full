@@ -419,9 +419,10 @@ class OmniGen(Model):
         config_file = os.path.join(model_path, "config.json")
         if os.path.exists(config_file):
             with open(config_file, "r") as f:
-                config = json.load(f)
+                config_dict = json.load(f)
+                config = Phi3Config(**config_dict)
         else:
-            config = Phi3Config.from_pretrained(model_path)
+            config = Phi3Config()
             
         # Create model
         model = cls(config, *model_args, **kwargs)
