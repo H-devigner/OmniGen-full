@@ -19,6 +19,11 @@ logger = logging.get_logger(__name__)
 class Phi3Config(PretrainedConfig):
     """Configuration class for Phi3 model."""
     model_type = "phi3"
+    attribute_map = {
+        "num_attention_heads": "num_attention_heads",
+        "hidden_size": "hidden_size",
+        "num_hidden_layers": "num_hidden_layers"
+    }
     
     def __init__(
         self,
@@ -47,17 +52,6 @@ class Phi3Config(PretrainedConfig):
         **kwargs
     ):
         """Initialize config."""
-        super().__init__(
-            pad_token_id=pad_token_id,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            sep_token_id=sep_token_id,
-            cls_token_id=cls_token_id,
-            mask_token_id=mask_token_id,
-            unk_token_id=unk_token_id,
-            **kwargs
-        )
-        
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
@@ -72,7 +66,6 @@ class Phi3Config(PretrainedConfig):
         self.tie_word_embeddings = tie_word_embeddings
         self.output_attentions = output_attentions
         self.output_hidden_states = output_hidden_states
-        self.use_return_dict = use_return_dict
         
         # Compute derived attributes
         self.head_dim = self.hidden_size // self.num_attention_heads
@@ -81,6 +74,18 @@ class Phi3Config(PretrainedConfig):
                 f"hidden_size must be divisible by num_attention_heads (got hidden_size={self.hidden_size} "
                 f"and num_attention_heads={self.num_attention_heads})"
             )
+            
+        super().__init__(
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            sep_token_id=sep_token_id,
+            cls_token_id=cls_token_id,
+            mask_token_id=mask_token_id,
+            unk_token_id=unk_token_id,
+            return_dict=use_return_dict,
+            **kwargs
+        )
 
 
 class Phi3Transformer(TFPreTrainedModel):
