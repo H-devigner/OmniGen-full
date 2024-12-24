@@ -169,7 +169,73 @@ class OmniGen(Model):
         )
         # Disable caching to match PyTorch
         self.transformer.config.use_cache = False
-
+        
+        # Create weights mapping
+        self._create_weights_mapping()
+        
+    def _create_weights_mapping(self):
+        """Create mapping between PyTorch and TensorFlow weight names."""
+        self.weights_map = {}
+        
+        # Transformer mappings
+        for i in range(self.transformer.config.num_hidden_layers):
+            # Attention layers
+            self.weights_map.update({
+                f"transformer/layer_{i}/self_attn/q_proj/kernel": f"transformer.h.{i}.attn.q_proj.weight",
+                f"transformer/layer_{i}/self_attn/k_proj/kernel": f"transformer.h.{i}.attn.k_proj.weight",
+                f"transformer/layer_{i}/self_attn/v_proj/kernel": f"transformer.h.{i}.attn.v_proj.weight",
+                f"transformer/layer_{i}/self_attn/o_proj/kernel": f"transformer.h.{i}.attn.o_proj.weight",
+                # Layer norms
+                f"transformer/layer_{i}/input_layernorm/gamma": f"transformer.h.{i}.ln_1.weight",
+                f"transformer/layer_{i}/input_layernorm/beta": f"transformer.h.{i}.ln_1.bias",
+                f"transformer/layer_{i}/post_attention_layernorm/gamma": f"transformer.h.{i}.ln_2.weight",
+                f"transformer/layer_{i}/post_attention_layernorm/beta": f"transformer.h.{i}.ln_2.bias",
+                # MLP
+                f"transformer/layer_{i}/mlp/gate_up_proj/kernel": f"transformer.h.{i}.mlp.gate_up_proj.weight",
+                f"transformer/layer_{i}/mlp/down_proj/kernel": f"transformer.h.{i}.mlp.down_proj.weight",
+            })
+        
+        # Final layer norm
+        self.weights_map.update({
+            "transformer/ln_f/gamma": "transformer.ln_f.weight",
+            "transformer/ln_f/beta": "transformer.ln_f.bias",
+        })
+        
+        # Embeddings
+        self.weights_map.update({
+            "transformer/wte/embeddings": "transformer.wte.weight",
+        })
+        
+        # Timestep embedder mappings
+        self.weights_map.update({
+            "time_token/mlp_0/kernel": "time_token.mlp.0.weight",
+            "time_token/mlp_0/bias": "time_token.mlp.0.bias",
+            "time_token/mlp_2/kernel": "time_token.mlp.2.weight",
+            "time_token/mlp_2/bias": "time_token.mlp.2.bias",
+            "t_embedder/mlp_0/kernel": "t_embedder.mlp.0.weight",
+            "t_embedder/mlp_0/bias": "t_embedder.mlp.0.bias",
+            "t_embedder/mlp_2/kernel": "t_embedder.mlp.2.weight",
+            "t_embedder/mlp_2/bias": "t_embedder.mlp.2.bias",
+        })
+        
+        # Patch embedder mappings
+        self.weights_map.update({
+            "x_embedder/proj/kernel": "x_embedder.proj.weight",
+            "x_embedder/proj/bias": "x_embedder.proj.bias",
+            "input_x_embedder/proj/kernel": "input_x_embedder.proj.weight",
+            "input_x_embedder/proj/bias": "input_x_embedder.proj.bias",
+        })
+        
+        # Final layer mappings
+        self.weights_map.update({
+            "final_layer/norm_final/gamma": "final_layer.norm_final.weight",
+            "final_layer/norm_final/beta": "final_layer.norm_final.bias",
+            "final_layer/linear/kernel": "final_layer.linear.weight",
+            "final_layer/linear/bias": "final_layer.linear.bias",
+            "final_layer/adaLN_modulation_1/kernel": "final_layer.adaLN_modulation.1.weight",
+            "final_layer/adaLN_modulation_1/bias": "final_layer.adaLN_modulation.1.bias",
+        })
+        
     def initialize_weights(self):
         """Initialize model weights to match PyTorch implementation."""
         # Initialize transformer layers
@@ -442,34 +508,16 @@ class OmniGen(Model):
             
             # Convert weights to TensorFlow format
             tf_weights = {}
-            for name, param in state_dict.items():
-                # Convert parameter names
-                tf_name = name.replace(".", "_")
-                if "layers" in tf_name:
-                    # Handle layer renaming
-                    parts = tf_name.split("_")
-                    layer_idx = parts[parts.index("layers") + 1]
-                    tf_name = f"transformer_layers_{layer_idx}_" + "_".join(parts[parts.index("layers") + 2:])
-                
-                # Convert tensor to numpy array
-                param_np = param.numpy()
-                
-                # Handle special cases for attention layers
-                if "attn" in tf_name:
-                    if "qkv_proj" in tf_name:
-                        # Split QKV projection into separate Q, K, V
-                        hidden_size = param_np.shape[-1] // 3
-                        q, k, v = np.split(param_np, 3, axis=-1)
-                        tf_weights[tf_name.replace("qkv_proj", "q_proj")] = q
-                        tf_weights[tf_name.replace("qkv_proj", "k_proj")] = k
-                        tf_weights[tf_name.replace("qkv_proj", "v_proj")] = v
-                    else:
-                        tf_weights[tf_name] = param_np
-                else:
+            for pt_name, param in state_dict.items():
+                # Get corresponding TF name
+                tf_name = model.weights_map.get(pt_name)
+                if tf_name is not None:
+                    # Convert tensor to numpy array
+                    param_np = param.numpy()
                     tf_weights[tf_name] = param_np
             
             # Load weights into model
-            model.set_weights([tf_weights[name] for name in model.weights_map.keys()])
+            model.set_weights([tf_weights[w.name] for w in model.trainable_weights if w.name in tf_weights])
             print("Weights loaded successfully!")
         else:
             print(f"No weights file found at {weights_file}")
