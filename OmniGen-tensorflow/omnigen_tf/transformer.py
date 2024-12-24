@@ -245,138 +245,208 @@ class Phi3Transformer(tf.keras.Model):
         self.config = config
         self._dtype = dtype
         
-        # Initialize layers
-        self.decoder_layers = [
-            Phi3DecoderLayer(config, dtype=self._dtype)
-            for _ in range(config.num_hidden_layers)
-        ]
+        # Initialize layers with memory-efficient config
+        self.decoder_layers = []
+        for _ in range(config.num_hidden_layers):
+            layer = Phi3DecoderLayer(config, dtype=self._dtype)
+            # Set layer to CPU initially
+            with tf.device('/CPU:0'):
+                self.decoder_layers.append(layer)
         
         self.norm = layers.LayerNormalization(
             epsilon=getattr(config, 'layer_norm_eps', 1e-5),
             dtype=self._dtype,
-            center=False  # Reduce parameters
+            center=False
         )
         
-        # Enhanced cache management
-        self.cache = OptimizedDynamicCache()
+        # Initialize prefetch streams
+        self._setup_memory_optimization()
         
-        # Memory optimization settings
-        self._chunk_size = None
-        self._max_memory = 0.9  # Use 90% of available memory
-        
-        # Enable memory growth
-        if tf.config.list_physical_devices('GPU'):
+    def _setup_memory_optimization(self):
+        """Setup memory optimization configurations."""
+        self._is_gpu_available = len(tf.config.list_physical_devices('GPU')) > 0
+        if self._is_gpu_available:
+            # Enable memory growth
             for device in tf.config.list_physical_devices('GPU'):
                 try:
                     tf.config.experimental.set_memory_growth(device, True)
+                    # Set memory limit to 90% of available memory
+                    tf.config.set_logical_device_configuration(
+                        device,
+                        [tf.config.LogicalDeviceConfiguration(memory_limit=int(tf.config.experimental.get_memory_info('GPU:0')['free'] * 0.9))]
+                    )
                 except:
                     pass
+            
+            # Use mixed precision
+            tf.keras.mixed_precision.set_global_policy('mixed_float16')
         
-    def _get_optimal_chunk_size(self, total_size):
-        """Calculate optimal chunk size based on available memory."""
-        if self._chunk_size is not None:
-            return self._chunk_size
-            
-        if not tf.config.list_physical_devices('GPU'):
-            self._chunk_size = 16  # Default CPU chunk size
-            return self._chunk_size
-            
-        try:
-            # Get GPU memory info
-            gpu = tf.config.list_physical_devices('GPU')[0]
-            gpu_mem = tf.config.experimental.get_memory_info('GPU:0')
-            available_mem = gpu_mem['free'] * self._max_memory
-            
-            # Calculate size per item
-            size_per_item = total_size * 4  # Assuming float32
-            
-            # Set chunk size
-            self._chunk_size = min(32, int(available_mem / size_per_item))
-        except:
-            # Fallback if memory info not available
-            self._chunk_size = 16
-            
-        return self._chunk_size
+        # Initialize cache manager
+        self.cache_manager = self._create_cache_manager()
         
+    def _create_cache_manager(self):
+        """Create PyTorch-like cache management."""
+        return {
+            'current_device': None,
+            'active_layers': set(),
+            'prefetch_queue': [],
+            'cache': {}
+        }
+        
+    @tf.function(jit_compile=True)
+    def _move_layer_to_device(self, layer_idx: int, target_device: str, non_blocking: bool = True):
+        """Move layer weights to specified device efficiently."""
+        if layer_idx in self.cache_manager['active_layers']:
+            return
+            
+        layer = self.decoder_layers[layer_idx]
+        
+        # Use non-blocking transfers when possible
+        if non_blocking and self._is_gpu_available:
+            with tf.device(target_device):
+                # Create new tensors on target device
+                for weight in layer.trainable_weights:
+                    tf.identity(weight)
+        else:
+            with tf.device(target_device):
+                for weight in layer.trainable_weights:
+                    weight.assign(tf.identity(weight))
+                    
+        self.cache_manager['active_layers'].add(layer_idx)
+        
+    def _evict_layer(self, layer_idx: int):
+        """Move layer to CPU and clear from GPU memory."""
+        if layer_idx not in self.cache_manager['active_layers']:
+            return
+            
+        layer = self.decoder_layers[layer_idx]
+        
+        # Move to CPU efficiently
+        with tf.device('/CPU:0'):
+            for weight in layer.trainable_weights:
+                weight.assign(tf.identity(weight))
+                
+        # Clear from GPU
+        if self._is_gpu_available:
+            tf.keras.backend.clear_session()
+            
+        self.cache_manager['active_layers'].remove(layer_idx)
+        
+    def _prefetch_next_layer(self, current_idx: int, target_device: str):
+        """Prefetch next layer weights to target device."""
+        next_idx = (current_idx + 1) % len(self.decoder_layers)
+        
+        if next_idx not in self.cache_manager['active_layers']:
+            self.cache_manager['prefetch_queue'].append(next_idx)
+            self._move_layer_to_device(next_idx, target_device, non_blocking=True)
+            
+    @tf.function(reduce_retracing=True)
     def call(self, inputs_embeds, attention_mask=None, position_ids=None,
              past_key_values=None, use_cache=False, training=False):
-        """Memory-optimized forward pass."""
+        """Memory-optimized forward pass with PyTorch-like memory management."""
         
-        # Get batch size for chunking
+        # Process in optimal chunks
         batch_size = tf.shape(inputs_embeds)[0]
         chunk_size = self._get_optimal_chunk_size(tf.size(inputs_embeds))
         
-        # Process in chunks
+        # Initialize output containers
         all_hidden_states = []
         all_presents = [] if use_cache else None
         
+        # Process in chunks
         for i in range(0, batch_size, chunk_size):
             end_idx = tf.minimum(i + chunk_size, batch_size)
             
-            # Get chunk inputs
-            chunk_inputs = inputs_embeds[i:end_idx]
-            chunk_attention_mask = attention_mask[i:end_idx] if attention_mask is not None else None
-            chunk_position_ids = position_ids[i:end_idx] if position_ids is not None else None
+            # Get chunk inputs efficiently
+            chunk_inputs = tf.identity(inputs_embeds[i:end_idx])
+            chunk_attention_mask = tf.identity(attention_mask[i:end_idx]) if attention_mask is not None else None
+            chunk_position_ids = tf.identity(position_ids[i:end_idx]) if position_ids is not None else None
             
             # Process chunk
             hidden_states = chunk_inputs
             presents = [] if use_cache else None
             
-            # Layer-wise processing
+            # Layer-wise processing with memory management
+            target_device = '/GPU:0' if self._is_gpu_available else '/CPU:0'
+            
             for idx, decoder_layer in enumerate(self.decoder_layers):
+                # Memory management
+                self._move_layer_to_device(idx, target_device)
+                if idx > 0:
+                    self._evict_layer(idx - 1)
+                self._prefetch_next_layer(idx, target_device)
+                
                 # Get past key values
                 past_key_value = past_key_values[idx] if past_key_values is not None else None
                 
-                # Memory management
-                if idx > 0:
-                    self.cache.evict_layer(idx - 1)
-                if idx < len(self.decoder_layers) - 1:
-                    self.cache.prefetch_layer(idx + 1)
-                    
                 # Process layer
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=chunk_attention_mask,
-                    past_key_value=past_key_value,
-                    use_cache=use_cache,
-                    training=training
-                )
-                
-                hidden_states = layer_outputs[0]
-                if use_cache:
-                    presents.append(layer_outputs[1])
+                with tf.device(target_device):
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        attention_mask=chunk_attention_mask,
+                        past_key_value=past_key_value,
+                        use_cache=use_cache,
+                        training=training
+                    )
                     
-                # Clear layer intermediates
+                    hidden_states = layer_outputs[0]
+                    if use_cache:
+                        presents.append(layer_outputs[1])
+                
+                # Clear intermediates
                 tf.keras.backend.clear_session()
                 
             # Final normalization
-            hidden_states = self.norm(hidden_states)
+            with tf.device(target_device):
+                hidden_states = self.norm(hidden_states)
             
             # Collect results
             all_hidden_states.append(hidden_states)
             if use_cache:
                 all_presents.append(presents)
                 
-        # Combine results
-        hidden_states = tf.concat(all_hidden_states, axis=0)
-        
-        if use_cache:
-            # Efficient key-value combination
-            presents = [
-                tuple(tf.concat([p[i][j] for p in all_presents], axis=0) 
-                      for j in range(2))
-                for i in range(len(self.decoder_layers))
-            ]
+        # Combine results efficiently
+        with tf.device(target_device):
+            hidden_states = tf.concat(all_hidden_states, axis=0)
             
-            # Clear cache after use
-            self.cache.clear()
-            
+            if use_cache:
+                # Combine key-value pairs efficiently
+                presents = [
+                    tuple(tf.concat([p[i][j] for p in all_presents], axis=0)
+                          for j in range(2))
+                    for i in range(len(self.decoder_layers))
+                ]
+                
+                # Clear cache
+                self.cache_manager['cache'].clear()
+                tf.keras.backend.clear_session()
+                
+                return BaseModelOutputWithPast(
+                    last_hidden_state=hidden_states,
+                    past_key_values=presents
+                )
+                
             return BaseModelOutputWithPast(
                 last_hidden_state=hidden_states,
-                past_key_values=presents
+                past_key_values=None
             )
             
-        return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            past_key_values=None
-        )
+    def _get_optimal_chunk_size(self, total_size):
+        """Calculate optimal chunk size based on available memory."""
+        if not self._is_gpu_available:
+            return 16  # Default CPU chunk size
+            
+        try:
+            # Get GPU memory info
+            gpu_mem = tf.config.experimental.get_memory_info('GPU:0')
+            available_mem = gpu_mem['free'] * 0.9  # Use 90% of free memory
+            
+            # Calculate based on tensor size and dtype
+            bytes_per_element = 2 if self._dtype == tf.float16 else 4
+            size_per_item = total_size * bytes_per_element
+            
+            # Set chunk size with headroom
+            chunk_size = min(32, int(available_mem / (size_per_item * 2)))  # Factor of 2 for safety
+            return max(1, chunk_size)  # Ensure at least 1
+        except:
+            return 16  # Fallback chunk size
