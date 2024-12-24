@@ -499,3 +499,53 @@ class OmniGen(tf.keras.Model):
             model_out = [cond, cond]
             
         return tf.concat(model_out, axis=0)
+
+    @classmethod
+    def from_pretrained(cls, model_name, **kwargs):
+        """Load model from pretrained weights.
+        
+        Args:
+            model_name: Name or path of pretrained model
+            **kwargs: Additional arguments to pass to model constructor
+            
+        Returns:
+            Initialized model with pretrained weights
+        """
+        # Download model if needed
+        if not os.path.exists(model_name):
+            print(f"Downloading model from {model_name}...")
+            model_name = snapshot_download(model_name)
+            print(f"Downloaded model to {model_name}")
+            
+        # Load configuration
+        config_path = os.path.join(model_name, "config.json")
+        if not os.path.exists(config_path):
+            raise ValueError(f"Config not found at {config_path}")
+            
+        config = Phi3Config.from_pretrained(model_name)
+        
+        # Create model instance
+        model = cls(config, **kwargs)
+        
+        # Load weights
+        weights_path = os.path.join(model_name, "model.safetensors")
+        if os.path.exists(weights_path):
+            print("Loading safetensors weights...")
+            with safe_open(weights_path, framework="tf") as f:
+                state_dict = {key: tf.convert_to_tensor(f.get_tensor(key)) for key in f.keys()}
+        else:
+            # Try PyTorch weights
+            pt_path = os.path.join(model_name, "model.pt")
+            if not os.path.exists(pt_path):
+                raise ValueError(f"No weights found at {weights_path} or {pt_path}")
+                
+            print("Loading PyTorch weights...")
+            import torch
+            state_dict = torch.load(pt_path, map_location="cpu")
+            state_dict = {k: tf.convert_to_tensor(v.numpy()) for k, v in state_dict.items()}
+            
+        # Set model weights
+        model.set_weights([state_dict[key] for key in model.weights])
+        print("Model loaded successfully!")
+        
+        return model
