@@ -92,13 +92,16 @@ class OptimizedDynamicCache:
     
     def __init__(self):
         self.cache = {}
-        self._prefetch_stream = None
         self._current_device = None
-        self._is_gpu_available = tf.config.list_physical_devices('GPU')
+        self._is_gpu_available = len(tf.config.list_physical_devices('GPU')) > 0
         
+        # Initialize memory stream
         if self._is_gpu_available:
-            # Create separate stream for prefetching
-            self._prefetch_stream = tf.distribute.get_strategy().experimental_run_v2
+            # Use TF's async execution
+            self._async_enabled = True
+            tf.config.experimental.set_synchronous_execution(False)
+        else:
+            self._async_enabled = False
         
     def update(self, layer_idx: int, key_value: Tuple[tf.Tensor, tf.Tensor]):
         """Update cache with new key-value pair."""
@@ -115,33 +118,42 @@ class OptimizedDynamicCache:
         if not self._is_gpu_available or layer_idx not in self.cache:
             return
             
-        if self._prefetch_stream is not None:
+        if self._async_enabled:
+            # Use async execution for prefetching
             def prefetch_fn():
-                for key_value in self.cache[layer_idx]:
-                    with tf.device(device):
-                        # Non-blocking copy
+                with tf.device(device):
+                    for key_value in self.cache[layer_idx]:
+                        # Non-blocking tensor copy
                         tf.identity(key_value[0])
                         tf.identity(key_value[1])
-            
-            self._prefetch_stream(prefetch_fn)
+                        
+            # Run asynchronously
+            tf.function(prefetch_fn, experimental_compile=True)()
             
     def evict_layer(self, layer_idx: int):
-        """Move layer cache to CPU."""
+        """Move layer cache to CPU and clear GPU memory."""
         if layer_idx not in self.cache:
             return
             
-        with tf.device('/CPU:0'):
-            for key_value in self.cache[layer_idx]:
-                # Non-blocking move to CPU
-                key_value = (
-                    tf.identity(key_value[0]),
-                    tf.identity(key_value[1])
-                )
-                
-        # Clear GPU memory
+        if self._is_gpu_available:
+            # Move to CPU efficiently
+            with tf.device('/CPU:0'):
+                for i, key_value in enumerate(self.cache[layer_idx]):
+                    # Use non-blocking transfers
+                    self.cache[layer_idx][i] = (
+                        tf.identity(key_value[0]),
+                        tf.identity(key_value[1])
+                    )
+                    
+            # Clear GPU memory for this layer
+            tf.keras.backend.clear_session()
+            
+    def clear(self):
+        """Clear all cache."""
+        self.cache.clear()
         if self._is_gpu_available:
             tf.keras.backend.clear_session()
-
+            
 
 class Phi3DecoderLayer(tf.keras.layers.Layer):
     """Optimized decoder layer with memory management."""
@@ -159,9 +171,14 @@ class Phi3DecoderLayer(tf.keras.layers.Layer):
             layers.Dense(
                 config.intermediate_size,
                 activation=self._gelu,
-                dtype=self._dtype
+                dtype=self._dtype,
+                use_bias=False  # Reduce memory usage
             ),
-            layers.Dense(config.hidden_size, dtype=self._dtype),
+            layers.Dense(
+                config.hidden_size,
+                dtype=self._dtype,
+                use_bias=True
+            ),
             layers.Dropout(getattr(config, 'hidden_dropout', 0.1))
         ])
         
@@ -169,46 +186,51 @@ class Phi3DecoderLayer(tf.keras.layers.Layer):
         eps = getattr(config, 'layer_norm_eps', 1e-5)
         self.input_layernorm = layers.LayerNormalization(
             epsilon=eps,
-            dtype=self._dtype
+            dtype=self._dtype,
+            center=False  # Reduce parameters
         )
         self.post_attention_layernorm = layers.LayerNormalization(
             epsilon=eps,
-            dtype=self._dtype
+            dtype=self._dtype,
+            center=False  # Reduce parameters
         )
         
     @tf.function(jit_compile=True)
     def _gelu(self, x):
         """Memory-efficient GELU."""
-        return 0.5 * x * (1.0 + tf.tanh(tf.sqrt(2.0 / math.pi) * (x + 0.044715 * tf.pow(x, 3))))
+        return x * 0.5 * (1.0 + tf.tanh(x * 0.7978845608028654 * (1.0 + 0.044715 * x * x)))
         
     def call(self, hidden_states, attention_mask=None, past_key_value=None,
              use_cache=False, training=False):
         """Memory-optimized forward pass."""
         
-        # Layer norm first (saves memory)
-        normed_hidden_states = self.input_layernorm(hidden_states)
+        # Pre-normalize (more memory efficient)
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
         
         # Self attention
         attn_output, present = self.self_attn(
-            normed_hidden_states,
+            hidden_states,
             attention_mask=attention_mask,
             past_key_value=past_key_value,
             use_cache=use_cache,
             training=training
         )
         
-        # First residual connection
-        hidden_states = attn_output + hidden_states
+        # First residual
+        hidden_states = attn_output + residual
+        del attn_output, residual
         
-        # Layer norm second
-        normed_hidden_states = self.post_attention_layernorm(hidden_states)
+        # Second pre-norm
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
         
         # MLP
-        mlp_output = self.mlp(normed_hidden_states, training=training)
+        hidden_states = self.mlp(hidden_states, training=training)
         
-        # Second residual connection with memory cleanup
-        hidden_states = mlp_output + hidden_states
-        del mlp_output, attn_output, normed_hidden_states
+        # Second residual
+        hidden_states = hidden_states + residual
+        del residual
         
         if use_cache:
             return hidden_states, present
@@ -231,7 +253,8 @@ class Phi3Transformer(tf.keras.Model):
         
         self.norm = layers.LayerNormalization(
             epsilon=getattr(config, 'layer_norm_eps', 1e-5),
-            dtype=self._dtype
+            dtype=self._dtype,
+            center=False  # Reduce parameters
         )
         
         # Enhanced cache management
@@ -240,6 +263,14 @@ class Phi3Transformer(tf.keras.Model):
         # Memory optimization settings
         self._chunk_size = None
         self._max_memory = 0.9  # Use 90% of available memory
+        
+        # Enable memory growth
+        if tf.config.list_physical_devices('GPU'):
+            for device in tf.config.list_physical_devices('GPU'):
+                try:
+                    tf.config.experimental.set_memory_growth(device, True)
+                except:
+                    pass
         
     def _get_optimal_chunk_size(self, total_size):
         """Calculate optimal chunk size based on available memory."""
@@ -250,16 +281,21 @@ class Phi3Transformer(tf.keras.Model):
             self._chunk_size = 16  # Default CPU chunk size
             return self._chunk_size
             
-        # Get GPU memory info
-        gpu = tf.config.list_physical_devices('GPU')[0]
-        gpu_mem = tf.config.experimental.get_memory_info('GPU:0')
-        available_mem = gpu_mem['free'] * self._max_memory
-        
-        # Calculate size per item
-        size_per_item = total_size * 4  # Assuming float32
-        
-        # Set chunk size
-        self._chunk_size = min(32, int(available_mem / size_per_item))
+        try:
+            # Get GPU memory info
+            gpu = tf.config.list_physical_devices('GPU')[0]
+            gpu_mem = tf.config.experimental.get_memory_info('GPU:0')
+            available_mem = gpu_mem['free'] * self._max_memory
+            
+            # Calculate size per item
+            size_per_item = total_size * 4  # Assuming float32
+            
+            # Set chunk size
+            self._chunk_size = min(32, int(available_mem / size_per_item))
+        except:
+            # Fallback if memory info not available
+            self._chunk_size = 16
+            
         return self._chunk_size
         
     def call(self, inputs_embeds, attention_mask=None, position_ids=None,
@@ -276,32 +312,28 @@ class Phi3Transformer(tf.keras.Model):
         
         for i in range(0, batch_size, chunk_size):
             end_idx = tf.minimum(i + chunk_size, batch_size)
-            chunk_inputs = inputs_embeds[i:end_idx]
             
-            # Get chunk attention mask
-            chunk_attention_mask = None
-            if attention_mask is not None:
-                chunk_attention_mask = attention_mask[i:end_idx]
-                
-            # Get chunk position ids
-            chunk_position_ids = None
-            if position_ids is not None:
-                chunk_position_ids = position_ids[i:end_idx]
-                
+            # Get chunk inputs
+            chunk_inputs = inputs_embeds[i:end_idx]
+            chunk_attention_mask = attention_mask[i:end_idx] if attention_mask is not None else None
+            chunk_position_ids = position_ids[i:end_idx] if position_ids is not None else None
+            
             # Process chunk
             hidden_states = chunk_inputs
             presents = [] if use_cache else None
             
+            # Layer-wise processing
             for idx, decoder_layer in enumerate(self.decoder_layers):
+                # Get past key values
                 past_key_value = past_key_values[idx] if past_key_values is not None else None
                 
-                # Layer memory management
+                # Memory management
                 if idx > 0:
                     self.cache.evict_layer(idx - 1)
                 if idx < len(self.decoder_layers) - 1:
                     self.cache.prefetch_layer(idx + 1)
                     
-                # Run layer
+                # Process layer
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=chunk_attention_mask,
@@ -309,12 +341,15 @@ class Phi3Transformer(tf.keras.Model):
                     use_cache=use_cache,
                     training=training
                 )
-                hidden_states = layer_outputs[0]
                 
+                hidden_states = layer_outputs[0]
                 if use_cache:
                     presents.append(layer_outputs[1])
                     
-            # Final layer norm
+                # Clear layer intermediates
+                tf.keras.backend.clear_session()
+                
+            # Final normalization
             hidden_states = self.norm(hidden_states)
             
             # Collect results
@@ -326,11 +361,16 @@ class Phi3Transformer(tf.keras.Model):
         hidden_states = tf.concat(all_hidden_states, axis=0)
         
         if use_cache:
+            # Efficient key-value combination
             presents = [
                 tuple(tf.concat([p[i][j] for p in all_presents], axis=0) 
                       for j in range(2))
                 for i in range(len(self.decoder_layers))
             ]
+            
+            # Clear cache after use
+            self.cache.clear()
+            
             return BaseModelOutputWithPast(
                 last_hidden_state=hidden_states,
                 past_key_values=presents
