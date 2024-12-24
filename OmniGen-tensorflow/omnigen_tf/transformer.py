@@ -63,6 +63,10 @@ class Phi3Transformer(TFPreTrainedModel):
     base_model_prefix = "transformer"
     
     def __init__(self, config: Phi3Config, *args, **kwargs):
+        # Enable mixed precision by default
+        if tf.config.list_physical_devices('GPU'):
+            tf.keras.mixed_precision.set_global_policy('mixed_float16')
+            
         super().__init__(config, *args, **kwargs)
         
         self.embed_dim = config.hidden_size
@@ -70,12 +74,12 @@ class Phi3Transformer(TFPreTrainedModel):
         self.head_dim = self.embed_dim // self.num_heads
         self.max_position_embeddings = config.max_position_embeddings
         
-        # Initialize layers with CPU placement strategy
+        # Initialize layers with CPU placement and float16 dtype for GPU operations
         with tf.device('/CPU:0'):
-            self.wte = layers.Embedding(config.vocab_size, self.embed_dim)
+            self.wte = layers.Embedding(config.vocab_size, self.embed_dim, dtype='float16')
             self.drop = layers.Dropout(config.hidden_dropout)
-            self.h = [PhiDecoderLayer(config) for _ in range(config.num_hidden_layers)]
-            self.ln_f = layers.LayerNormalization(epsilon=config.layer_norm_eps)
+            self.h = [PhiDecoderLayer(config, dtype='float16') for _ in range(config.num_hidden_layers)]
+            self.ln_f = layers.LayerNormalization(epsilon=config.layer_norm_eps, dtype='float16')
         
         # Setup memory optimization
         self._setup_memory_optimization()
@@ -164,11 +168,13 @@ class Phi3Transformer(TFPreTrainedModel):
             raise ValueError("You cannot specify both input_ids and inputs_embeds")
             
         if input_ids is not None:
-            # Move embedding to CPU for efficiency
+            # Move embedding to CPU and cast to float16 for GPU operations
             with tf.device('/CPU:0'):
-                inputs_embeds = self.wte(input_ids)
+                inputs_embeds = tf.cast(self.wte(input_ids), tf.float16)
             batch_size, seq_length = tf.shape(input_ids)[0], tf.shape(input_ids)[1]
         elif inputs_embeds is not None:
+            # Cast inputs to float16 for GPU operations
+            inputs_embeds = tf.cast(inputs_embeds, tf.float16)
             batch_size, seq_length = tf.shape(inputs_embeds)[0], tf.shape(inputs_embeds)[1]
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
@@ -187,11 +193,11 @@ class Phi3Transformer(TFPreTrainedModel):
             else:
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
 
-        # Process attention mask
+        # Process attention mask with float16
         if attention_mask is not None:
             with tf.device('/CPU:0'):
-                attention_mask = tf.cast(attention_mask, dtype=inputs_embeds.dtype)
-                attention_mask = (1.0 - attention_mask) * tf.float32.min
+                attention_mask = tf.cast(attention_mask, tf.float16)
+                attention_mask = (1.0 - attention_mask) * tf.float16.min
 
         # Initialize outputs
         all_hidden_states = () if output_hidden_states else None
@@ -200,7 +206,7 @@ class Phi3Transformer(TFPreTrainedModel):
 
         # Process on CPU first
         with tf.device('/CPU:0'):
-            hidden_states = self.drop(inputs_embeds, training=training)
+            hidden_states = tf.cast(self.drop(inputs_embeds, training=training), tf.float16)
 
         # Process through layers
         for idx, layer in enumerate(self.h):
@@ -214,7 +220,7 @@ class Phi3Transformer(TFPreTrainedModel):
             # Get layer cache
             past_key_value = past_key_values[idx] if past_key_values is not None else None
 
-            # Process layer
+            # Process layer with float16
             layer_outputs = layer(
                 hidden_states,
                 attention_mask=attention_mask,
@@ -234,11 +240,11 @@ class Phi3Transformer(TFPreTrainedModel):
                 all_self_attns = all_self_attns + (layer_outputs[1],)
 
             # Clear intermediate tensors
-            if self._is_gpu_available:
+            if tf.config.list_physical_devices('GPU'):
                 tf.keras.backend.clear_session()
 
-        # Final layer norm
-        hidden_states = self.ln_f(hidden_states)
+        # Final layer norm with float16
+        hidden_states = tf.cast(self.ln_f(hidden_states), tf.float16)
 
         # Add final hidden state
         if output_hidden_states:
@@ -249,7 +255,7 @@ class Phi3Transformer(TFPreTrainedModel):
             next_decoder_cache = next_decoder_cache.to_legacy_cache()
 
         # Clear any remaining GPU memory
-        if self._is_gpu_available:
+        if tf.config.list_physical_devices('GPU'):
             tf.keras.backend.clear_session()
 
         if not return_dict:
@@ -265,17 +271,17 @@ class Phi3Transformer(TFPreTrainedModel):
 class PhiDecoderLayer(layers.Layer):
     """Phi model decoder layer."""
     
-    def __init__(self, config: Phi3Config):
+    def __init__(self, config: Phi3Config, dtype='float32'):
         super().__init__()
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
         self.scale = self.head_dim ** -0.5
         
-        self.self_attn = PhiAttention(config)
-        self.input_layernorm = layers.LayerNormalization(epsilon=config.layer_norm_eps)
-        self.mlp = PhiMLP(config)
-        self.post_attention_layernorm = layers.LayerNormalization(epsilon=config.layer_norm_eps)
+        self.self_attn = PhiAttention(config, dtype=dtype)
+        self.input_layernorm = layers.LayerNormalization(epsilon=config.layer_norm_eps, dtype=dtype)
+        self.mlp = PhiMLP(config, dtype=dtype)
+        self.post_attention_layernorm = layers.LayerNormalization(epsilon=config.layer_norm_eps, dtype=dtype)
         
     def call(
         self,
@@ -332,17 +338,17 @@ class PhiDecoderLayer(layers.Layer):
 class PhiAttention(layers.Layer):
     """Multi-head attention implementation for Phi model."""
     
-    def __init__(self, config: Phi3Config):
+    def __init__(self, config: Phi3Config, dtype='float32'):
         super().__init__()
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
         self.scale = self.head_dim ** -0.5
         
-        self.k_proj = layers.Dense(self.embed_dim, use_bias=False)
-        self.v_proj = layers.Dense(self.embed_dim, use_bias=False)
-        self.q_proj = layers.Dense(self.embed_dim, use_bias=False)
-        self.out_proj = layers.Dense(self.embed_dim, use_bias=True)
+        self.k_proj = layers.Dense(self.embed_dim, use_bias=False, dtype=dtype)
+        self.v_proj = layers.Dense(self.embed_dim, use_bias=False, dtype=dtype)
+        self.q_proj = layers.Dense(self.embed_dim, use_bias=False, dtype=dtype)
+        self.out_proj = layers.Dense(self.embed_dim, use_bias=True, dtype=dtype)
         self.dropout = layers.Dropout(config.attention_dropout)
         
     def _shape(self, tensor: tf.Tensor, seq_len: int, bsz: int):
@@ -384,7 +390,7 @@ class PhiAttention(layers.Layer):
         attn_weights = tf.matmul(query_states, tf.transpose(key_states, (0, 1, 3, 2)))
         
         if attention_mask is not None:
-            attn_weights = tf.where(attention_mask, attn_weights, tf.float32.min)
+            attn_weights = tf.where(attention_mask, attn_weights, tf.float16.min)
             
         attn_weights = tf.nn.softmax(attn_weights, axis=-1)
         attn_weights = self.dropout(attn_weights, training=training)
@@ -407,13 +413,13 @@ class PhiAttention(layers.Layer):
 class PhiMLP(layers.Layer):
     """MLP implementation for Phi model."""
     
-    def __init__(self, config: Phi3Config):
+    def __init__(self, config: Phi3Config, dtype='float32'):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         
-        self.fc1 = layers.Dense(self.intermediate_size, use_bias=False)
-        self.fc2 = layers.Dense(self.hidden_size, use_bias=True)
+        self.fc1 = layers.Dense(self.intermediate_size, use_bias=False, dtype=dtype)
+        self.fc2 = layers.Dense(self.hidden_size, use_bias=True, dtype=dtype)
         self.dropout = layers.Dropout(config.hidden_dropout)
         
     def call(self, hidden_states: tf.Tensor, training: bool = False) -> tf.Tensor:
