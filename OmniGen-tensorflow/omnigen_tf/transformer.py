@@ -1,6 +1,6 @@
 import math
 import warnings
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Dict
 
 import tensorflow as tf
 from tensorflow import keras
@@ -78,7 +78,7 @@ class Phi3Transformer(TFPreTrainedModel):
         with tf.device('/CPU:0'):
             self.wte = layers.Embedding(config.vocab_size, self.embed_dim, dtype='float16')
             self.drop = layers.Dropout(config.hidden_dropout)
-            self.h = [PhiDecoderLayer(config, dtype='float16') for _ in range(config.num_hidden_layers)]
+            self.h = [OmniGenLayer(config) for _ in range(config.num_hidden_layers)]
             self.ln_f = layers.LayerNormalization(epsilon=config.layer_norm_eps, dtype='float16')
         
         # Setup memory optimization
@@ -234,7 +234,7 @@ class Phi3Transformer(TFPreTrainedModel):
             hidden_states = layer_outputs[0]
             
             if use_cache:
-                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+                next_decoder_cache = layer_outputs[-1]
 
             if output_attentions:
                 all_self_attns = all_self_attns + (layer_outputs[1],)
@@ -268,20 +268,28 @@ class Phi3Transformer(TFPreTrainedModel):
             "attentions": all_self_attns,
         }
 
-class PhiDecoderLayer(layers.Layer):
-    """Phi model decoder layer."""
+class OmniGenLayer(tf.keras.layers.Layer):
+    """Transformer layer for OmniGen."""
     
-    def __init__(self, config: Phi3Config, dtype='float32'):
-        super().__init__()
-        self.embed_dim = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.embed_dim // self.num_heads
-        self.scale = self.head_dim ** -0.5
+    def __init__(self, config, **kwargs):
+        """Initialize layer.
         
-        self.self_attn = PhiAttention(config, dtype=dtype)
-        self.input_layernorm = layers.LayerNormalization(epsilon=config.layer_norm_eps, dtype=dtype)
-        self.mlp = PhiMLP(config, dtype=dtype)
-        self.post_attention_layernorm = layers.LayerNormalization(epsilon=config.layer_norm_eps, dtype=dtype)
+        Args:
+            config: Model configuration
+            **kwargs: Additional arguments
+        """
+        super().__init__(**kwargs)
+        
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        
+        # Initialize components
+        self.input_layernorm = tf.keras.layers.LayerNormalization(epsilon=1e-5)
+        self.self_attn = OmniGenAttention(config)
+        self.post_attention_layernorm = tf.keras.layers.LayerNormalization(epsilon=1e-5)
+        self.mlp = OmniGenMLP(config)
         
     def call(
         self,
@@ -292,22 +300,26 @@ class PhiDecoderLayer(layers.Layer):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         training: bool = False,
-    ) -> Union[Tuple[tf.Tensor], Optional[Tuple[tf.Tensor, tf.Tensor]]]:
-        """
+    ) -> Tuple[tf.Tensor, ...]:
+        """Forward pass.
+        
         Args:
-            hidden_states: (batch, seq_len, embed_dim)
-            attention_mask: (batch, 1, seq_len, seq_len)
-            position_ids: (batch, seq_len)
-            past_key_value: tuple(2 tensors) of shape (batch, num_heads, seq_len - 1, head_dim)
-            output_attentions: bool
-            use_cache: bool
-            training: bool
+            hidden_states: Input tensor
+            attention_mask: Attention mask
+            position_ids: Position IDs
+            past_key_value: Past key value for caching
+            output_attentions: Whether to output attention weights
+            use_cache: Whether to use caching
+            training: Whether in training mode
+            
+        Returns:
+            Layer outputs
         """
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
         
-        # Self Attention
-        attn_outputs = self.self_attn(
+        # Self attention
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -316,8 +328,6 @@ class PhiDecoderLayer(layers.Layer):
             use_cache=use_cache,
             training=training,
         )
-        
-        hidden_states = attn_outputs[0]
         hidden_states = residual + hidden_states
         
         # MLP
@@ -327,33 +337,49 @@ class PhiDecoderLayer(layers.Layer):
         hidden_states = residual + hidden_states
         
         outputs = (hidden_states,)
-        
         if output_attentions:
-            outputs += (attn_outputs[1],)
+            outputs += (self_attn_weights,)
         if use_cache:
-            outputs += (attn_outputs[-1],)
+            outputs += (present_key_value,)
             
         return outputs
 
-class PhiAttention(layers.Layer):
-    """Multi-head attention implementation for Phi model."""
+
+class OmniGenAttention(tf.keras.layers.Layer):
+    """Multi-head attention layer for OmniGen."""
     
-    def __init__(self, config: Phi3Config, dtype='float32'):
-        super().__init__()
-        self.embed_dim = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.embed_dim // self.num_heads
-        self.scale = self.head_dim ** -0.5
+    def __init__(self, config, **kwargs):
+        """Initialize attention layer.
         
-        self.k_proj = layers.Dense(self.embed_dim, use_bias=False, dtype=dtype)
-        self.v_proj = layers.Dense(self.embed_dim, use_bias=False, dtype=dtype)
-        self.q_proj = layers.Dense(self.embed_dim, use_bias=False, dtype=dtype)
-        self.out_proj = layers.Dense(self.embed_dim, use_bias=True, dtype=dtype)
-        self.dropout = layers.Dropout(config.attention_dropout)
+        Args:
+            config: Model configuration
+            **kwargs: Additional arguments
+        """
+        super().__init__(**kwargs)
+        
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        self.max_position_embeddings = config.max_position_embeddings
+        
+        if self.head_dim * self.num_attention_heads != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_attention_heads (got `hidden_size`: {self.hidden_size}"
+                f" and `num_attention_heads`: {self.num_attention_heads})."
+            )
+            
+        # Initialize components
+        self.qkv_proj = tf.keras.layers.Dense(3 * self.hidden_size, use_bias=False)
+        self.o_proj = tf.keras.layers.Dense(self.hidden_size, use_bias=False)
+        
+        self.attention_dropout = tf.keras.layers.Dropout(config.attention_dropout)
+        self.resid_dropout = tf.keras.layers.Dropout(config.hidden_dropout)
         
     def _shape(self, tensor: tf.Tensor, seq_len: int, bsz: int):
+        """Reshape tensor for attention computation."""
         return tf.transpose(
-            tf.reshape(tensor, (bsz, seq_len, self.num_heads, self.head_dim)), 
+            tf.reshape(tensor, (bsz, seq_len, self.num_attention_heads, self.head_dim)),
             (0, 2, 1, 3)
         )
         
@@ -363,68 +389,100 @@ class PhiAttention(layers.Layer):
         attention_mask: Optional[tf.Tensor] = None,
         position_ids: Optional[tf.Tensor] = None,
         past_key_value: Optional[Tuple[tf.Tensor]] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
         training: bool = False,
-    ) -> Union[Tuple[tf.Tensor, tf.Tensor], Tuple[tf.Tensor]]:
-        """Input shape: Batch x Time x Channel"""
+    ) -> Tuple[tf.Tensor, Optional[tf.Tensor], Optional[Tuple[tf.Tensor]]]:
+        """Forward pass.
         
-        bsz, q_len, _ = tf.shape(hidden_states)[0], tf.shape(hidden_states)[1], tf.shape(hidden_states)[2]
+        Args:
+            hidden_states: Input tensor
+            attention_mask: Attention mask
+            position_ids: Position IDs
+            past_key_value: Past key value for caching
+            output_attentions: Whether to output attention weights
+            use_cache: Whether to use caching
+            training: Whether in training mode
+            
+        Returns:
+            Attention outputs
+        """
+        bsz, q_len, _ = tf.shape(hidden_states)
         
-        query_states = self.q_proj(hidden_states) * self.scale
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        # Get query, key, value projections
+        qkv = self.qkv_proj(hidden_states)
+        qkv = tf.reshape(qkv, (bsz, q_len, 3, self.num_attention_heads, self.head_dim))
+        qkv = tf.transpose(qkv, (2, 0, 3, 1, 4))
+        q, k, v = tf.unstack(qkv, axis=0)
         
-        query_states = self._shape(query_states, q_len, bsz)
-        key_states = self._shape(key_states, q_len, bsz)
-        value_states = self._shape(value_states, q_len, bsz)
-        
+        # Handle past key values
         if past_key_value is not None:
-            key_states = tf.concat([past_key_value[0], key_states], axis=2)
-            value_states = tf.concat([past_key_value[1], value_states], axis=2)
+            k = tf.concat([past_key_value[0], k], axis=2)
+            v = tf.concat([past_key_value[1], v], axis=2)
             
         if use_cache:
-            present = (key_states, value_states)
+            present_key_value = (k, v)
             
         # Compute attention
-        attn_weights = tf.matmul(query_states, tf.transpose(key_states, (0, 1, 3, 2)))
+        attn_weights = tf.matmul(q, k, transpose_b=True)
+        attn_weights = attn_weights * tf.math.rsqrt(tf.cast(self.head_dim, attn_weights.dtype))
         
         if attention_mask is not None:
-            attn_weights = tf.where(attention_mask, attn_weights, tf.float16.min)
+            attn_weights = attn_weights + attention_mask
             
         attn_weights = tf.nn.softmax(attn_weights, axis=-1)
-        attn_weights = self.dropout(attn_weights, training=training)
+        attn_weights = self.attention_dropout(attn_weights, training=training)
         
-        attn_output = tf.matmul(attn_weights, value_states)
+        attn_output = tf.matmul(attn_weights, v)
         attn_output = tf.transpose(attn_output, (0, 2, 1, 3))
-        attn_output = tf.reshape(attn_output, (bsz, q_len, self.embed_dim))
+        attn_output = tf.reshape(attn_output, (bsz, q_len, self.hidden_size))
         
-        attn_output = self.out_proj(attn_output)
+        # Output projection
+        attn_output = self.o_proj(attn_output)
+        attn_output = self.resid_dropout(attn_output, training=training)
         
-        if not output_attentions:
-            attn_weights = None
-            
-        outputs = (attn_output, attn_weights)
+        outputs = (attn_output,)
+        if output_attentions:
+            outputs += (attn_weights,)
         if use_cache:
-            outputs += (present,)
+            outputs += (present_key_value,)
             
         return outputs
 
-class PhiMLP(layers.Layer):
-    """MLP implementation for Phi model."""
+
+class OmniGenMLP(tf.keras.layers.Layer):
+    """MLP layer for OmniGen."""
     
-    def __init__(self, config: Phi3Config, dtype='float32'):
-        super().__init__()
+    def __init__(self, config, **kwargs):
+        """Initialize MLP layer.
+        
+        Args:
+            config: Model configuration
+            **kwargs: Additional arguments
+        """
+        super().__init__(**kwargs)
+        
+        self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         
-        self.fc1 = layers.Dense(self.intermediate_size, use_bias=False, dtype=dtype)
-        self.fc2 = layers.Dense(self.hidden_size, use_bias=True, dtype=dtype)
-        self.dropout = layers.Dropout(config.hidden_dropout)
+        # Initialize components
+        self.gate_up_proj = tf.keras.layers.Dense(2 * self.intermediate_size, use_bias=False)
+        self.down_proj = tf.keras.layers.Dense(self.hidden_size, use_bias=False)
+        self.act_fn = tf.keras.activations.swish
         
-    def call(self, hidden_states: tf.Tensor, training: bool = False) -> tf.Tensor:
-        hidden_states = self.fc1(hidden_states)
-        hidden_states = tf.nn.gelu(hidden_states, approximate=False)
-        hidden_states = self.fc2(hidden_states)
-        hidden_states = self.dropout(hidden_states, training=training)
-        return hidden_states
+    def call(self, x: tf.Tensor) -> tf.Tensor:
+        """Forward pass.
+        
+        Args:
+            x: Input tensor
+            
+        Returns:
+            MLP output
+        """
+        # Split activation
+        gate_up = self.gate_up_proj(x)
+        gate, up = tf.split(gate_up, 2, axis=-1)
+        
+        # Apply activation
+        return self.down_proj(self.act_fn(gate) * up)

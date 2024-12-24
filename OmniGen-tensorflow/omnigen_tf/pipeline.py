@@ -8,7 +8,7 @@ from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer
 
 from omnigen_tf.model import OmniGen
-from omnigen_tf import scheduler
+from omnigen_tf.scheduler import OmniGenScheduler
 from omnigen_tf.processor import OmniGenProcessor
 
 # Configure GPU memory growth before any other TensorFlow operations
@@ -58,8 +58,8 @@ class OmniGenPipeline:
         
         # Initialize components
         model = OmniGen.from_pretrained(model_name)
-        processor = OmniGenProcessor()
-        scheduler = scheduler.OmniGenScheduler()
+        processor = OmniGenProcessor.from_pretrained(model_name)
+        scheduler = OmniGenScheduler()
         
         # Create pipeline
         pipeline = cls(model, processor, scheduler, device)
