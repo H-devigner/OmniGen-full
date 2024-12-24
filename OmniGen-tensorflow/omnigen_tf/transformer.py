@@ -2,10 +2,18 @@
 
 import math
 from typing import Optional, Tuple, Union, Dict
-from dataclasses import dataclass, field
+import warnings
 
 import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
 from transformers import PretrainedConfig
+from transformers.modeling_tf_utils import TFPreTrainedModel, unpack_inputs
+from transformers.cache_utils import Cache, DynamicCache
+from transformers.utils import logging
+
+logger = logging.get_logger(__name__)
 
 
 class Phi3Config(PretrainedConfig):
@@ -93,17 +101,19 @@ class Phi3Transformer(TFPreTrainedModel):
             
         super().__init__(config, *args, **kwargs)
         
+        self.config = config
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
         self.max_position_embeddings = config.max_position_embeddings
         
-        # Initialize layers with CPU placement and float16 dtype for GPU operations
-        with tf.device('/CPU:0'):
-            self.wte = layers.Embedding(config.vocab_size, self.embed_dim, dtype='float16')
-            self.drop = layers.Dropout(config.hidden_dropout)
-            self.transformer = OmniGenTransformer(config)
-            self.ln_f = layers.LayerNormalization(epsilon=config.layer_norm_eps, dtype='float16')
+        # Initialize embeddings
+        self.wte = layers.Embedding(config.vocab_size, self.embed_dim, dtype='float16')
+        self.drop = layers.Dropout(config.hidden_dropout)
+        
+        # Initialize transformer layers
+        self.transformer = OmniGenTransformer(config)
+        self.ln_f = layers.LayerNormalization(epsilon=config.layer_norm_eps, dtype='float16')
         
         # Setup memory optimization
         self._setup_memory_optimization()
@@ -293,7 +303,7 @@ class Phi3Transformer(TFPreTrainedModel):
         }
 
 
-class OmniGenTransformer(tf.keras.layers.Layer):
+class OmniGenTransformer(layers.Layer):
     """Transformer model for OmniGen."""
     
     def __init__(self, config, **kwargs):
@@ -313,7 +323,7 @@ class OmniGenTransformer(tf.keras.layers.Layer):
         
         # Initialize layers
         self.layers = [OmniGenLayer(config, name=f"layer_{i}") for i in range(self.num_hidden_layers)]
-        self.norm = tf.keras.layers.LayerNormalization(epsilon=1e-5, name="norm")
+        self.norm = layers.LayerNormalization(epsilon=1e-5, name="norm")
         
     def call(
         self,
@@ -386,10 +396,10 @@ class OmniGenTransformer(tf.keras.layers.Layer):
         }
 
 
-class OmniGenLayer(tf.keras.layers.Layer):
+class OmniGenLayer(layers.Layer):
     """Transformer layer for OmniGen."""
     
-    def __init__(self, config, **kwargs):
+    def __init__(self, config: Phi3Config, **kwargs):
         """Initialize layer."""
         super().__init__(**kwargs)
         
@@ -399,9 +409,9 @@ class OmniGenLayer(tf.keras.layers.Layer):
         self.head_dim = self.hidden_size // self.num_attention_heads
         
         # Initialize components
-        self.input_layernorm = tf.keras.layers.LayerNormalization(epsilon=1e-5, name="input_layernorm")
+        self.input_layernorm = layers.LayerNormalization(epsilon=1e-5, name="input_layernorm")
         self.self_attn = OmniGenAttention(config, name="self_attn")
-        self.post_attention_layernorm = tf.keras.layers.LayerNormalization(epsilon=1e-5, name="post_attention_layernorm")
+        self.post_attention_layernorm = layers.LayerNormalization(epsilon=1e-5, name="post_attention_layernorm")
         self.mlp = OmniGenMLP(config, name="mlp")
         
     def call(
@@ -445,10 +455,10 @@ class OmniGenLayer(tf.keras.layers.Layer):
         return outputs
 
 
-class OmniGenAttention(tf.keras.layers.Layer):
+class OmniGenAttention(layers.Layer):
     """Multi-head attention layer for OmniGen."""
     
-    def __init__(self, config, **kwargs):
+    def __init__(self, config: Phi3Config, **kwargs):
         """Initialize attention layer."""
         super().__init__(**kwargs)
         
@@ -460,16 +470,16 @@ class OmniGenAttention(tf.keras.layers.Layer):
         
         if self.head_dim * self.num_attention_heads != self.hidden_size:
             raise ValueError(
-                f"hidden_size must be divisible by num_attention_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_attention_heads`: {self.num_attention_heads})."
+                f"hidden_size must be divisible by num_attention_heads (got hidden_size={self.hidden_size} "
+                f"and num_attention_heads={self.num_attention_heads})."
             )
             
         # Initialize components
-        self.qkv_proj = tf.keras.layers.Dense(3 * self.hidden_size, use_bias=False, name="qkv_proj")
-        self.o_proj = tf.keras.layers.Dense(self.hidden_size, use_bias=False, name="o_proj")
+        self.qkv_proj = layers.Dense(3 * self.hidden_size, use_bias=False, name="qkv_proj")
+        self.o_proj = layers.Dense(self.hidden_size, use_bias=False, name="o_proj")
         
-        self.attention_dropout = tf.keras.layers.Dropout(config.attention_dropout)
-        self.resid_dropout = tf.keras.layers.Dropout(config.hidden_dropout)
+        self.attention_dropout = layers.Dropout(config.attention_dropout)
+        self.resid_dropout = layers.Dropout(config.hidden_dropout)
         
     def _shape(self, tensor: tf.Tensor, seq_len: int, bsz: int):
         """Reshape tensor for attention computation."""
@@ -532,10 +542,10 @@ class OmniGenAttention(tf.keras.layers.Layer):
         return outputs
 
 
-class OmniGenMLP(tf.keras.layers.Layer):
+class OmniGenMLP(layers.Layer):
     """MLP layer for OmniGen."""
     
-    def __init__(self, config, **kwargs):
+    def __init__(self, config: Phi3Config, **kwargs):
         """Initialize MLP layer."""
         super().__init__(**kwargs)
         
@@ -544,8 +554,8 @@ class OmniGenMLP(tf.keras.layers.Layer):
         self.intermediate_size = config.intermediate_size
         
         # Initialize components
-        self.gate_up_proj = tf.keras.layers.Dense(2 * self.intermediate_size, use_bias=False, name="gate_up_proj")
-        self.down_proj = tf.keras.layers.Dense(self.hidden_size, use_bias=False, name="down_proj")
+        self.gate_up_proj = layers.Dense(2 * self.intermediate_size, use_bias=False, name="gate_up_proj")
+        self.down_proj = layers.Dense(self.hidden_size, use_bias=False, name="down_proj")
         self.act_fn = tf.keras.activations.swish
         
     def call(self, x: tf.Tensor) -> tf.Tensor:
