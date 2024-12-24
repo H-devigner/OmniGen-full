@@ -420,7 +420,12 @@ class OmniGen(Model):
         if os.path.exists(config_file):
             with open(config_file, "r") as f:
                 config_dict = json.load(f)
-                # Ensure we have all required fields
+                
+                # Remove HuggingFace special fields
+                for key in ['_name_or_path', 'architectures', 'model_type', 'torch_dtype']:
+                    config_dict.pop(key, None)
+                    
+                # Ensure we have all required fields with defaults
                 config_dict.setdefault("model_type", "phi3")
                 config_dict.setdefault("hidden_size", 2048)
                 config_dict.setdefault("intermediate_size", 8192)
@@ -437,6 +442,8 @@ class OmniGen(Model):
                 config_dict.setdefault("output_attentions", False)
                 config_dict.setdefault("output_hidden_states", False)
                 config_dict.setdefault("use_return_dict", True)
+                
+                # Create config object
                 config = Phi3Config(**config_dict)
         else:
             # Use default config

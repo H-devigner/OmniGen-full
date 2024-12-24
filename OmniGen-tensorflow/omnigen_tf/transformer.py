@@ -1,7 +1,7 @@
 import math
 import warnings
 from typing import List, Optional, Tuple, Union, Dict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import tensorflow as tf
 from tensorflow import keras
@@ -17,22 +17,22 @@ logger = logging.get_logger(__name__)
 @dataclass
 class Phi3Config(PretrainedConfig):
     """Configuration class for Phi3 model."""
-    model_type: str = "phi3"
-    hidden_size: int = 2048
-    intermediate_size: int = 8192
-    num_hidden_layers: int = 32
-    num_attention_heads: int = 32
-    max_position_embeddings: int = 2048
-    layer_norm_eps: float = 1e-5
-    hidden_dropout: float = 0.0
-    attention_dropout: float = 0.0
-    initializer_range: float = 0.02
-    use_cache: bool = True
-    vocab_size: int = 32000
-    tie_word_embeddings: bool = False
-    output_attentions: bool = False
-    output_hidden_states: bool = False
-    use_return_dict: bool = True
+    model_type: str = field(default="phi3")
+    hidden_size: int = field(default=2048)
+    intermediate_size: int = field(default=8192)
+    num_hidden_layers: int = field(default=32)
+    num_attention_heads: int = field(default=32)
+    max_position_embeddings: int = field(default=2048)
+    layer_norm_eps: float = field(default=1e-5)
+    hidden_dropout: float = field(default=0.0)
+    attention_dropout: float = field(default=0.0)
+    initializer_range: float = field(default=0.02)
+    use_cache: bool = field(default=True)
+    vocab_size: int = field(default=32000)
+    tie_word_embeddings: bool = field(default=False)
+    output_attentions: bool = field(default=False)
+    output_hidden_states: bool = field(default=False)
+    use_return_dict: bool = field(default=True)
     
     def __post_init__(self):
         """Initialize derived attributes."""
