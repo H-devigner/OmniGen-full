@@ -482,7 +482,7 @@ class OmniGenScheduler:
         
         # Create evenly spaced timesteps
         timesteps = tf.linspace(0, self.num_train_timesteps - 1, num_inference_steps)
-        self.timesteps = tf.cast(tf.flip(timesteps), tf.int32)  # Flip for denoising
+        self.timesteps = tf.cast(tf.reverse(timesteps, axis=[0]), tf.int32)  # Flip for denoising
         
         # Create timestep map for fast lookup
         self.timestep_map = tf.zeros(self.num_train_timesteps, dtype=tf.int32)

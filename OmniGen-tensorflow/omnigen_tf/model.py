@@ -30,9 +30,9 @@ class TimestepEmbedder(Model):
     def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
         self.mlp = tf.keras.Sequential([
-            layers.Dense(hidden_size, use_bias=True),
+            layers.Dense(hidden_size, use_bias=True, name="mlp.0"),
             layers.Activation('silu'),
-            layers.Dense(hidden_size, use_bias=True),
+            layers.Dense(hidden_size, use_bias=True, name="mlp.2")
         ])
         self.frequency_embedding_size = frequency_embedding_size
 
@@ -64,15 +64,17 @@ class FinalLayer(layers.Layer):
         self.norm_final = tf.keras.layers.LayerNormalization(
             epsilon=1e-6, 
             center=False, 
-            scale=False
+            scale=False,
+            name="norm_final"
         )
         self.linear = layers.Dense(
             patch_size * patch_size * out_channels,
-            use_bias=True
+            use_bias=True,
+            name="linear"
         )
         self.adaLN_modulation = tf.keras.Sequential([
             layers.Activation('silu'),
-            layers.Dense(2 * hidden_size, use_bias=True)
+            layers.Dense(2 * hidden_size, use_bias=True, name="adaLN_modulation.1")
         ])
 
     def call(self, x, c):
@@ -91,7 +93,8 @@ class PatchEmbedMR(layers.Layer):
             embed_dim,
             kernel_size=patch_size,
             strides=patch_size,
-            use_bias=bias
+            use_bias=bias,
+            name="proj"
         )
 
     def call(self, x):

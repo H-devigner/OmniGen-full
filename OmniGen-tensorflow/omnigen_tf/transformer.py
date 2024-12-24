@@ -78,7 +78,7 @@ class Phi3Transformer(TFPreTrainedModel):
         with tf.device('/CPU:0'):
             self.wte = layers.Embedding(config.vocab_size, self.embed_dim, dtype='float16')
             self.drop = layers.Dropout(config.hidden_dropout)
-            self.h = [OmniGenLayer(config) for _ in range(config.num_hidden_layers)]
+            self.transformer = OmniGenTransformer(config)
             self.ln_f = layers.LayerNormalization(epsilon=config.layer_norm_eps, dtype='float16')
         
         # Setup memory optimization
@@ -111,7 +111,7 @@ class Phi3Transformer(TFPreTrainedModel):
             return
             
         with tf.device('/GPU:0'):
-            layer = self.h[layer_idx]
+            layer = self.transformer.layers[layer_idx]
             # Non-blocking transfer
             for weight in layer.trainable_weights:
                 tf.identity(weight)
@@ -122,7 +122,7 @@ class Phi3Transformer(TFPreTrainedModel):
             return
             
         with tf.device('/CPU:0'):
-            prev_layer = self.h[layer_idx - 1]
+            prev_layer = self.transformer.layers[layer_idx - 1]
             for weight in prev_layer.trainable_weights:
                 tf.identity(weight)
         
@@ -141,7 +141,7 @@ class Phi3Transformer(TFPreTrainedModel):
         self.evict_previous_layer(layer_idx)
         
         # Prefetch next layer
-        next_layer_idx = (layer_idx + 1) % len(self.h)
+        next_layer_idx = (layer_idx + 1) % len(self.transformer.layers)
         self.prefetch_layer(next_layer_idx)
     
     @unpack_inputs
@@ -209,7 +209,7 @@ class Phi3Transformer(TFPreTrainedModel):
             hidden_states = tf.cast(self.drop(inputs_embeds, training=training), tf.float16)
 
         # Process through layers
-        for idx, layer in enumerate(self.h):
+        for idx, layer in enumerate(self.transformer.layers):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
@@ -268,11 +268,12 @@ class Phi3Transformer(TFPreTrainedModel):
             "attentions": all_self_attns,
         }
 
-class OmniGenLayer(tf.keras.layers.Layer):
-    """Transformer layer for OmniGen."""
+
+class OmniGenTransformer(tf.keras.layers.Layer):
+    """Transformer model for OmniGen."""
     
     def __init__(self, config, **kwargs):
-        """Initialize layer.
+        """Initialize transformer.
         
         Args:
             config: Model configuration
@@ -282,14 +283,102 @@ class OmniGenLayer(tf.keras.layers.Layer):
         
         self.config = config
         self.hidden_size = config.hidden_size
+        self.num_hidden_layers = config.num_hidden_layers
+        self.num_attention_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        
+        # Initialize layers
+        self.layers = [OmniGenLayer(config, name=f"layers/{i}") for i in range(self.num_hidden_layers)]
+        self.norm = tf.keras.layers.LayerNormalization(epsilon=1e-5, name="norm")
+        
+    def call(
+        self,
+        hidden_states: tf.Tensor,
+        attention_mask: Optional[tf.Tensor] = None,
+        position_ids: Optional[tf.Tensor] = None,
+        past_key_values: Optional[Tuple[Tuple[tf.Tensor]]] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        training: bool = False,
+    ) -> Union[tf.Tensor, Tuple[tf.Tensor, ...], Dict[str, tf.Tensor]]:
+        """Forward pass."""
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        
+        # Initialize outputs
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attentions = () if output_attentions else None
+        next_decoder_cache = () if use_cache else None
+        
+        # Process through layers
+        for i, layer in enumerate(self.layers):
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+                
+            layer_outputs = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values[i] if past_key_values is not None else None,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                training=training,
+            )
+            
+            hidden_states = layer_outputs[0]
+            
+            if use_cache:
+                next_decoder_cache += (layer_outputs[-1],)
+                
+            if output_attentions:
+                all_self_attentions = all_self_attentions + (layer_outputs[1],)
+                
+        # Final layer norm
+        hidden_states = self.norm(hidden_states)
+        
+        # Add last hidden state
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+            
+        if not return_dict:
+            return tuple(v for v in [
+                hidden_states,
+                next_decoder_cache,
+                all_hidden_states,
+                all_self_attentions,
+            ] if v is not None)
+            
+        return {
+            "last_hidden_state": hidden_states,
+            "past_key_values": next_decoder_cache,
+            "hidden_states": all_hidden_states,
+            "attentions": all_self_attentions,
+        }
+
+
+class OmniGenLayer(tf.keras.layers.Layer):
+    """Transformer layer for OmniGen."""
+    
+    def __init__(self, config, **kwargs):
+        """Initialize layer."""
+        super().__init__(**kwargs)
+        
+        self.config = config
+        self.hidden_size = config.hidden_size
         self.num_attention_heads = config.num_attention_heads
         self.head_dim = self.hidden_size // self.num_attention_heads
         
         # Initialize components
-        self.input_layernorm = tf.keras.layers.LayerNormalization(epsilon=1e-5)
-        self.self_attn = OmniGenAttention(config)
-        self.post_attention_layernorm = tf.keras.layers.LayerNormalization(epsilon=1e-5)
-        self.mlp = OmniGenMLP(config)
+        self.input_layernorm = tf.keras.layers.LayerNormalization(epsilon=1e-5, name="input_layernorm")
+        self.self_attn = OmniGenAttention(config, name="self_attn")
+        self.post_attention_layernorm = tf.keras.layers.LayerNormalization(epsilon=1e-5, name="post_attention_layernorm")
+        self.mlp = OmniGenMLP(config, name="mlp")
         
     def call(
         self,
@@ -301,20 +390,7 @@ class OmniGenLayer(tf.keras.layers.Layer):
         use_cache: Optional[bool] = False,
         training: bool = False,
     ) -> Tuple[tf.Tensor, ...]:
-        """Forward pass.
-        
-        Args:
-            hidden_states: Input tensor
-            attention_mask: Attention mask
-            position_ids: Position IDs
-            past_key_value: Past key value for caching
-            output_attentions: Whether to output attention weights
-            use_cache: Whether to use caching
-            training: Whether in training mode
-            
-        Returns:
-            Layer outputs
-        """
+        """Forward pass."""
         residual = hidden_states
         
         # Self attention
@@ -349,12 +425,7 @@ class OmniGenAttention(tf.keras.layers.Layer):
     """Multi-head attention layer for OmniGen."""
     
     def __init__(self, config, **kwargs):
-        """Initialize attention layer.
-        
-        Args:
-            config: Model configuration
-            **kwargs: Additional arguments
-        """
+        """Initialize attention layer."""
         super().__init__(**kwargs)
         
         self.config = config
@@ -370,8 +441,8 @@ class OmniGenAttention(tf.keras.layers.Layer):
             )
             
         # Initialize components
-        self.qkv_proj = tf.keras.layers.Dense(3 * self.hidden_size, use_bias=False)
-        self.o_proj = tf.keras.layers.Dense(self.hidden_size, use_bias=False)
+        self.qkv_proj = tf.keras.layers.Dense(3 * self.hidden_size, use_bias=False, name="qkv_proj")
+        self.o_proj = tf.keras.layers.Dense(self.hidden_size, use_bias=False, name="o_proj")
         
         self.attention_dropout = tf.keras.layers.Dropout(config.attention_dropout)
         self.resid_dropout = tf.keras.layers.Dropout(config.hidden_dropout)
@@ -393,20 +464,7 @@ class OmniGenAttention(tf.keras.layers.Layer):
         use_cache: Optional[bool] = False,
         training: bool = False,
     ) -> Tuple[tf.Tensor, Optional[tf.Tensor], Optional[Tuple[tf.Tensor]]]:
-        """Forward pass.
-        
-        Args:
-            hidden_states: Input tensor
-            attention_mask: Attention mask
-            position_ids: Position IDs
-            past_key_value: Past key value for caching
-            output_attentions: Whether to output attention weights
-            use_cache: Whether to use caching
-            training: Whether in training mode
-            
-        Returns:
-            Attention outputs
-        """
+        """Forward pass."""
         bsz, q_len, _ = tf.shape(hidden_states)
         
         # Get query, key, value projections
@@ -454,12 +512,7 @@ class OmniGenMLP(tf.keras.layers.Layer):
     """MLP layer for OmniGen."""
     
     def __init__(self, config, **kwargs):
-        """Initialize MLP layer.
-        
-        Args:
-            config: Model configuration
-            **kwargs: Additional arguments
-        """
+        """Initialize MLP layer."""
         super().__init__(**kwargs)
         
         self.config = config
@@ -467,19 +520,12 @@ class OmniGenMLP(tf.keras.layers.Layer):
         self.intermediate_size = config.intermediate_size
         
         # Initialize components
-        self.gate_up_proj = tf.keras.layers.Dense(2 * self.intermediate_size, use_bias=False)
-        self.down_proj = tf.keras.layers.Dense(self.hidden_size, use_bias=False)
+        self.gate_up_proj = tf.keras.layers.Dense(2 * self.intermediate_size, use_bias=False, name="gate_up_proj")
+        self.down_proj = tf.keras.layers.Dense(self.hidden_size, use_bias=False, name="down_proj")
         self.act_fn = tf.keras.activations.swish
         
     def call(self, x: tf.Tensor) -> tf.Tensor:
-        """Forward pass.
-        
-        Args:
-            x: Input tensor
-            
-        Returns:
-            MLP output
-        """
+        """Forward pass."""
         # Split activation
         gate_up = self.gate_up_proj(x)
         gate, up = tf.split(gate_up, 2, axis=-1)
