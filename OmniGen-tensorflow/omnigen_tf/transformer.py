@@ -1,272 +1,30 @@
 import math
 import warnings
-from typing import List, Optional, Tuple, Union, Dict
+from typing import List, Optional, Tuple, Union
 
 import tensorflow as tf
-from tensorflow.keras import layers, Model
-from transformers import Phi3Config
-from transformers.modeling_outputs import BaseModelOutputWithPast
+from tensorflow import keras
+from tensorflow.keras import layers
+
+from transformers import TFPhi3Model, Phi3Config
+from transformers.cache_utils import Cache, DynamicCache
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
 
-
-class OptimizedMultiHeadAttention(tf.keras.layers.Layer):
-    """Optimized multi-head attention implementation."""
-    
-    def __init__(self, config, dtype=tf.float32):
-        super().__init__()
-        self.num_heads = config.num_attention_heads
-        self.head_dim = config.hidden_size // self.num_heads
-        self.hidden_size = config.hidden_size
-        self.dropout = getattr(config, 'attention_dropout', 0.0)
-        self._dtype = dtype
-        
-        # Initialize QKV projections
-        self.q_proj = layers.Dense(self.hidden_size, use_bias=False, dtype=self._dtype)
-        self.k_proj = layers.Dense(self.hidden_size, use_bias=False, dtype=self._dtype)
-        self.v_proj = layers.Dense(self.hidden_size, use_bias=False, dtype=self._dtype)
-        self.out_proj = layers.Dense(self.hidden_size, use_bias=True, dtype=self._dtype)
-        
-    @tf.function(jit_compile=True)
-    def _split_heads(self, tensor):
-        """Split heads for parallel computation."""
-        batch_size = tf.shape(tensor)[0]
-        tensor = tf.reshape(tensor, (batch_size, -1, self.num_heads, self.head_dim))
-        return tf.transpose(tensor, perm=[0, 2, 1, 3])
-        
-    @tf.function(jit_compile=True)
-    def call(self, hidden_states, attention_mask=None, past_key_value=None, 
-             use_cache=False, training=False):
-        """Optimized attention computation."""
-        batch_size = tf.shape(hidden_states)[0]
-        seq_length = tf.shape(hidden_states)[1]
-        
-        # Compute Q, K, V
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
-        
-        # Handle cached key/values
-        if past_key_value is not None:
-            key_states = tf.concat([past_key_value[0], key_states], axis=1)
-            value_states = tf.concat([past_key_value[1], value_states], axis=1)
-            
-        if use_cache:
-            present = (key_states, value_states)
-        else:
-            present = None
-            
-        # Split heads
-        query_states = self._split_heads(query_states)
-        key_states = self._split_heads(key_states)
-        value_states = self._split_heads(value_states)
-        
-        # Compute attention scores efficiently
-        scale = tf.cast(1.0 / tf.math.sqrt(tf.cast(self.head_dim, self._dtype)), self._dtype)
-        attention_scores = tf.matmul(query_states, key_states, transpose_b=True) * scale
-        
-        # Apply attention mask
-        if attention_mask is not None:
-            attention_mask = tf.cast(attention_mask, self._dtype)
-            attention_scores = tf.where(attention_mask, attention_scores, 
-                                      tf.fill(tf.shape(attention_scores), tf.cast(-1e9, self._dtype)))
-            
-        # Compute attention probabilities
-        attention_probs = tf.nn.softmax(attention_scores, axis=-1)
-        attention_probs = tf.keras.layers.Dropout(self.dropout)(attention_probs, training=training)
-        
-        # Compute context
-        context = tf.matmul(attention_probs, value_states)
-        context = tf.transpose(context, perm=[0, 2, 1, 3])
-        context = tf.reshape(context, (batch_size, seq_length, self.hidden_size))
-        
-        # Output projection
-        outputs = self.out_proj(context)
-        
-        return outputs, present
-
-
-class OptimizedDynamicCache:
-    """Optimized dynamic cache for transformer layers with prefetching."""
-    
-    def __init__(self):
-        self.cache = {}
-        self._current_device = None
+class Phi3Transformer(TFPhi3Model):
+    """
+    Transformer decoder consisting of *config.num_hidden_layers* layers.
+    We only modified the attention mask and added memory optimization.
+    Args:
+        config: Phi3Config
+    """
+    def __init__(self, config: Phi3Config, *args, **kwargs):
+        super().__init__(config, *args, **kwargs)
         self._is_gpu_available = len(tf.config.list_physical_devices('GPU')) > 0
         
-        # Initialize memory stream
+        # Setup memory optimization
         if self._is_gpu_available:
-            # Use TF's async execution
-            self._async_enabled = True
-            tf.config.experimental.set_synchronous_execution(False)
-        else:
-            self._async_enabled = False
-        
-    def update(self, layer_idx: int, key_value: Tuple[tf.Tensor, tf.Tensor]):
-        """Update cache with new key-value pair."""
-        if layer_idx not in self.cache:
-            self.cache[layer_idx] = []
-        self.cache[layer_idx].append(key_value)
-        
-    def get(self, layer_idx: int) -> Optional[Tuple[tf.Tensor, tf.Tensor]]:
-        """Get cached values for layer."""
-        return self.cache.get(layer_idx)
-        
-    def prefetch_layer(self, layer_idx: int, device: str = '/GPU:0'):
-        """Prefetch layer data to device."""
-        if not self._is_gpu_available or layer_idx not in self.cache:
-            return
-            
-        if self._async_enabled:
-            # Use async execution for prefetching
-            def prefetch_fn():
-                with tf.device(device):
-                    for key_value in self.cache[layer_idx]:
-                        # Non-blocking tensor copy
-                        tf.identity(key_value[0])
-                        tf.identity(key_value[1])
-                        
-            # Run asynchronously
-            tf.function(prefetch_fn, experimental_compile=True)()
-            
-    def evict_layer(self, layer_idx: int):
-        """Move layer cache to CPU and clear GPU memory."""
-        if layer_idx not in self.cache:
-            return
-            
-        if self._is_gpu_available:
-            # Move to CPU efficiently
-            with tf.device('/CPU:0'):
-                for i, key_value in enumerate(self.cache[layer_idx]):
-                    # Use non-blocking transfers
-                    self.cache[layer_idx][i] = (
-                        tf.identity(key_value[0]),
-                        tf.identity(key_value[1])
-                    )
-                    
-            # Clear GPU memory for this layer
-            tf.keras.backend.clear_session()
-            
-    def clear(self):
-        """Clear all cache."""
-        self.cache.clear()
-        if self._is_gpu_available:
-            tf.keras.backend.clear_session()
-            
-
-class Phi3DecoderLayer(tf.keras.layers.Layer):
-    """Optimized decoder layer with memory management."""
-    
-    def __init__(self, config: Phi3Config, dtype=None):
-        super().__init__()
-        self.config = config
-        self._dtype = dtype or tf.float32
-        
-        # Initialize attention with memory optimization
-        self.self_attn = OptimizedMultiHeadAttention(config, dtype=self._dtype)
-        
-        # Initialize MLP with optimal chunk size
-        self.mlp = tf.keras.Sequential([
-            layers.Dense(
-                config.intermediate_size,
-                activation=self._gelu,
-                dtype=self._dtype,
-                use_bias=False  # Reduce memory usage
-            ),
-            layers.Dense(
-                config.hidden_size,
-                dtype=self._dtype,
-                use_bias=True
-            ),
-            layers.Dropout(getattr(config, 'hidden_dropout', 0.1))
-        ])
-        
-        # Layer norms with memory-efficient epsilon
-        eps = getattr(config, 'layer_norm_eps', 1e-5)
-        self.input_layernorm = layers.LayerNormalization(
-            epsilon=eps,
-            dtype=self._dtype,
-            center=False  # Reduce parameters
-        )
-        self.post_attention_layernorm = layers.LayerNormalization(
-            epsilon=eps,
-            dtype=self._dtype,
-            center=False  # Reduce parameters
-        )
-        
-    @tf.function(jit_compile=True)
-    def _gelu(self, x):
-        """Memory-efficient GELU."""
-        return x * 0.5 * (1.0 + tf.tanh(x * 0.7978845608028654 * (1.0 + 0.044715 * x * x)))
-        
-    def call(self, hidden_states, attention_mask=None, past_key_value=None,
-             use_cache=False, training=False):
-        """Memory-optimized forward pass."""
-        
-        # Pre-normalize (more memory efficient)
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        
-        # Self attention
-        attn_output, present = self.self_attn(
-            hidden_states,
-            attention_mask=attention_mask,
-            past_key_value=past_key_value,
-            use_cache=use_cache,
-            training=training
-        )
-        
-        # First residual
-        hidden_states = attn_output + residual
-        del attn_output, residual
-        
-        # Second pre-norm
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        
-        # MLP
-        hidden_states = self.mlp(hidden_states, training=training)
-        
-        # Second residual
-        hidden_states = hidden_states + residual
-        del residual
-        
-        if use_cache:
-            return hidden_states, present
-        return hidden_states, None
-
-
-class Phi3Transformer(tf.keras.Model):
-    """Optimized transformer with advanced memory management."""
-    
-    def __init__(self, config: Phi3Config, dtype=tf.float32):
-        super().__init__()
-        self.config = config
-        self._dtype = dtype
-        
-        # Initialize layers with memory-efficient config
-        self.decoder_layers = []
-        for _ in range(config.num_hidden_layers):
-            layer = Phi3DecoderLayer(config, dtype=self._dtype)
-            # Set layer to CPU initially
-            with tf.device('/CPU:0'):
-                self.decoder_layers.append(layer)
-        
-        self.norm = layers.LayerNormalization(
-            epsilon=getattr(config, 'layer_norm_eps', 1e-5),
-            dtype=self._dtype,
-            center=False
-        )
-        
-        # Initialize prefetch streams
-        self._setup_memory_optimization()
-        
-    def _setup_memory_optimization(self):
-        """Setup memory optimization configurations."""
-        self._is_gpu_available = len(tf.config.list_physical_devices('GPU')) > 0
-        if self._is_gpu_available:
-            # Enable memory growth
             for device in tf.config.list_physical_devices('GPU'):
                 try:
                     tf.config.experimental.set_memory_growth(device, True)
@@ -278,175 +36,194 @@ class Phi3Transformer(tf.keras.Model):
                 except:
                     pass
             
-            # Use mixed precision
+            # Use mixed precision for better memory efficiency
             tf.keras.mixed_precision.set_global_policy('mixed_float16')
         
-        # Initialize cache manager
-        self.cache_manager = self._create_cache_manager()
-        
-    def _create_cache_manager(self):
-        """Create PyTorch-like cache management."""
-        return {
-            'current_device': None,
-            'active_layers': set(),
-            'prefetch_queue': [],
-            'cache': {}
-        }
-        
-    @tf.function(jit_compile=True)
-    def _move_layer_to_device(self, layer_idx: int, target_device: str, non_blocking: bool = True):
-        """Move layer weights to specified device efficiently."""
-        if layer_idx in self.cache_manager['active_layers']:
-            return
-            
-        layer = self.decoder_layers[layer_idx]
-        
-        # Use non-blocking transfers when possible
-        if non_blocking and self._is_gpu_available:
-            with tf.device(target_device):
-                # Create new tensors on target device
-                for weight in layer.trainable_weights:
-                    tf.identity(weight)
-        else:
-            with tf.device(target_device):
-                for weight in layer.trainable_weights:
-                    weight.assign(tf.identity(weight))
-                    
-        self.cache_manager['active_layers'].add(layer_idx)
-        
-    def _evict_layer(self, layer_idx: int):
-        """Move layer to CPU and clear from GPU memory."""
-        if layer_idx not in self.cache_manager['active_layers']:
-            return
-            
-        layer = self.decoder_layers[layer_idx]
-        
-        # Move to CPU efficiently
-        with tf.device('/CPU:0'):
-            for weight in layer.trainable_weights:
-                weight.assign(tf.identity(weight))
-                
-        # Clear from GPU
+        # Initialize prefetch stream
+        self.prefetch_stream = None
         if self._is_gpu_available:
-            tf.keras.backend.clear_session()
-            
-        self.cache_manager['active_layers'].remove(layer_idx)
-        
-    def _prefetch_next_layer(self, current_idx: int, target_device: str):
-        """Prefetch next layer weights to target device."""
-        next_idx = (current_idx + 1) % len(self.decoder_layers)
-        
-        if next_idx not in self.cache_manager['active_layers']:
-            self.cache_manager['prefetch_queue'].append(next_idx)
-            self._move_layer_to_device(next_idx, target_device, non_blocking=True)
-            
-    @tf.function(reduce_retracing=True)
-    def call(self, inputs_embeds, attention_mask=None, position_ids=None,
-             past_key_values=None, use_cache=False, training=False):
-        """Memory-optimized forward pass with PyTorch-like memory management."""
-        
-        # Process in optimal chunks
-        batch_size = tf.shape(inputs_embeds)[0]
-        chunk_size = self._get_optimal_chunk_size(tf.size(inputs_embeds))
-        
-        # Initialize output containers
-        all_hidden_states = []
-        all_presents = [] if use_cache else None
-        
-        # Process in chunks
-        for i in range(0, batch_size, chunk_size):
-            end_idx = tf.minimum(i + chunk_size, batch_size)
-            
-            # Get chunk inputs efficiently
-            chunk_inputs = tf.identity(inputs_embeds[i:end_idx])
-            chunk_attention_mask = tf.identity(attention_mask[i:end_idx]) if attention_mask is not None else None
-            chunk_position_ids = tf.identity(position_ids[i:end_idx]) if position_ids is not None else None
-            
-            # Process chunk
-            hidden_states = chunk_inputs
-            presents = [] if use_cache else None
-            
-            # Layer-wise processing with memory management
-            target_device = '/GPU:0' if self._is_gpu_available else '/CPU:0'
-            
-            for idx, decoder_layer in enumerate(self.decoder_layers):
-                # Memory management
-                self._move_layer_to_device(idx, target_device)
-                if idx > 0:
-                    self._evict_layer(idx - 1)
-                self._prefetch_next_layer(idx, target_device)
-                
-                # Get past key values
-                past_key_value = past_key_values[idx] if past_key_values is not None else None
-                
-                # Process layer
-                with tf.device(target_device):
-                    layer_outputs = decoder_layer(
-                        hidden_states,
-                        attention_mask=chunk_attention_mask,
-                        past_key_value=past_key_value,
-                        use_cache=use_cache,
-                        training=training
-                    )
-                    
-                    hidden_states = layer_outputs[0]
-                    if use_cache:
-                        presents.append(layer_outputs[1])
-                
-                # Clear intermediates
-                tf.keras.backend.clear_session()
-                
-            # Final normalization
-            with tf.device(target_device):
-                hidden_states = self.norm(hidden_states)
-            
-            # Collect results
-            all_hidden_states.append(hidden_states)
-            if use_cache:
-                all_presents.append(presents)
-                
-        # Combine results efficiently
-        with tf.device(target_device):
-            hidden_states = tf.concat(all_hidden_states, axis=0)
-            
-            if use_cache:
-                # Combine key-value pairs efficiently
-                presents = [
-                    tuple(tf.concat([p[i][j] for p in all_presents], axis=0)
-                          for j in range(2))
-                    for i in range(len(self.decoder_layers))
-                ]
-                
-                # Clear cache
-                self.cache_manager['cache'].clear()
-                tf.keras.backend.clear_session()
-                
-                return BaseModelOutputWithPast(
-                    last_hidden_state=hidden_states,
-                    past_key_values=presents
-                )
-                
-            return BaseModelOutputWithPast(
-                last_hidden_state=hidden_states,
-                past_key_values=None
-            )
-            
-    def _get_optimal_chunk_size(self, total_size):
-        """Calculate optimal chunk size based on available memory."""
+            tf.config.experimental.set_synchronous_execution(False)
+    
+    def prefetch_layer(self, layer_idx: int, device: str = '/GPU:0'):
+        """Starts prefetching the next layer cache"""
         if not self._is_gpu_available:
-            return 16  # Default CPU chunk size
+            return
+            
+        layer = self.layers[layer_idx]
+        with tf.device(device):
+            for weight in layer.trainable_weights:
+                tf.identity(weight, name=f"prefetch_{layer_idx}")
+
+    def evict_previous_layer(self, layer_idx: int):
+        """Moves the previous layer cache to the CPU"""
+        if not self._is_gpu_available or layer_idx <= 0:
+            return
+            
+        prev_layer = self.layers[layer_idx - 1]
+        with tf.device('/CPU:0'):
+            for weight in prev_layer.trainable_weights:
+                tf.identity(weight, name=f"evict_{layer_idx-1}")
+        
+        # Clear GPU memory
+        tf.keras.backend.clear_session()
+            
+    def get_offload_layer(self, layer_idx: int, device: str = '/GPU:0'):
+        """Manages layer offloading for memory efficiency"""
+        # Make sure the current layer is ready
+        tf.keras.backend.clear_session()
+        self.evict_previous_layer(layer_idx)
+        
+        # Prefetch next layer
+        next_layer_idx = (layer_idx + 1) % len(self.layers)
+        self.prefetch_layer(next_layer_idx, device)
+        
+    def _get_chunk_size(self, total_size: int) -> int:
+        """Calculate optimal chunk size based on available memory"""
+        if not self._is_gpu_available:
+            return 16
             
         try:
-            # Get GPU memory info
             gpu_mem = tf.config.experimental.get_memory_info('GPU:0')
             available_mem = gpu_mem['free'] * 0.9  # Use 90% of free memory
             
             # Calculate based on tensor size and dtype
-            bytes_per_element = 2 if self._dtype == tf.float16 else 4
+            bytes_per_element = 2  # Using mixed precision (float16)
             size_per_item = total_size * bytes_per_element
             
             # Set chunk size with headroom
-            chunk_size = min(32, int(available_mem / (size_per_item * 2)))  # Factor of 2 for safety
-            return max(1, chunk_size)  # Ensure at least 1
+            chunk_size = min(32, int(available_mem / (size_per_item * 2)))
+            return max(1, chunk_size)
         except:
-            return 16  # Fallback chunk size
+            return 16
+    
+    def call(
+        self,
+        input_ids: Optional[tf.Tensor] = None,
+        attention_mask: Optional[tf.Tensor] = None,
+        position_ids: Optional[tf.Tensor] = None,
+        past_key_values: Optional[List[tf.Tensor]] = None,
+        inputs_embeds: Optional[tf.Tensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[tf.Tensor] = None,
+        offload_model: Optional[bool] = False,
+        training: bool = False,
+    ) -> Union[Tuple, BaseModelOutputWithPast]:
+        # Get defaults from config
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if self.gradient_checkpointing and training:
+            if use_cache:
+                logger.warning_once(
+                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+                )
+                use_cache = False
+
+        # Handle caching
+        return_legacy_cache = False
+        if use_cache and not isinstance(past_key_values, Cache):
+            return_legacy_cache = True
+            if past_key_values is None:
+                past_key_values = DynamicCache()
+            else:
+                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+                logger.warning_once(
+                    "Legacy cache format detected. Please use Cache class from transformers.cache_utils"
+                )
+
+        # Process inputs
+        if attention_mask is not None and len(tf.shape(attention_mask)) == 3:
+            attention_mask = (1 - attention_mask) * tf.float32.min
+            attention_mask = tf.expand_dims(attention_mask, axis=1)
+        
+        # Process in chunks for memory efficiency
+        batch_size = tf.shape(inputs_embeds)[0]
+        chunk_size = self._get_chunk_size(tf.size(inputs_embeds))
+        
+        # Initialize outputs
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+        next_decoder_cache = None
+        
+        # Process in chunks
+        hidden_states_chunks = []
+        
+        for i in range(0, batch_size, chunk_size):
+            end_idx = tf.minimum(i + chunk_size, batch_size)
+            
+            # Get chunk inputs
+            chunk_inputs = tf.identity(inputs_embeds[i:end_idx])
+            chunk_mask = tf.identity(attention_mask[i:end_idx]) if attention_mask is not None else None
+            chunk_positions = tf.identity(position_ids[i:end_idx]) if position_ids is not None else None
+            
+            # Process chunk
+            hidden_states = chunk_inputs
+            
+            # Layer-wise processing
+            for idx, layer in enumerate(self.layers):
+                if output_hidden_states:
+                    all_hidden_states = all_hidden_states + (hidden_states,)
+
+                # Memory management for offloading
+                if offload_model and not training:
+                    self.get_offload_layer(idx, device=tf.device.current_device_name())
+                
+                # Get layer cache
+                past_key_value = past_key_values[idx] if past_key_values is not None else None
+                
+                # Process layer
+                layer_outputs = layer(
+                    hidden_states,
+                    attention_mask=chunk_mask,
+                    position_ids=chunk_positions,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    training=training
+                )
+                
+                hidden_states = layer_outputs[0]
+                
+                if use_cache:
+                    next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+                    
+                if output_attentions:
+                    all_self_attns = all_self_attns + (layer_outputs[1],)
+                
+                # Clear intermediates
+                if self._is_gpu_available:
+                    tf.keras.backend.clear_session()
+            
+            # Final layer norm
+            hidden_states = self.final_layernorm(hidden_states)
+            hidden_states_chunks.append(hidden_states)
+        
+        # Combine chunks
+        hidden_states = tf.concat(hidden_states_chunks, axis=0)
+        
+        # Add final hidden state
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+        
+        # Handle cache
+        next_cache = next_decoder_cache if use_cache else None
+        if return_legacy_cache and next_cache is not None:
+            next_cache = next_cache.to_legacy_cache()
+        
+        if not return_dict:
+            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+        
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=next_cache,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+        )
