@@ -362,9 +362,24 @@ class OmniGen(Model):
         if os.path.exists(weights_path):
             print("Loading safetensors weights...")
             with safe_open(weights_path, framework="tf") as f:
+                # Create a mapping of weight names
+                param_mapping = {}
+                for var in model.trainable_variables + model.non_trainable_variables:
+                    name = var.name.split(':')[0]  # Remove the ':0' suffix
+                    param_mapping[name] = var
+                
+                # Load and assign weights
                 for key in f.keys():
-                    if key in model.state_dict():
-                        model.state_dict()[key].assign(f.get_tensor(key))
+                    # Convert PyTorch parameter names to TensorFlow names
+                    tf_name = key.replace('.', '/')
+                    if tf_name in param_mapping:
+                        tensor = f.get_tensor(key)
+                        # Handle any necessary transpositions
+                        if len(tensor.shape) >= 2 and 'kernel' in tf_name:
+                            tensor = np.transpose(tensor)
+                        param_mapping[tf_name].assign(tensor)
+                    else:
+                        print(f"Warning: Parameter {key} not found in model")
                         
         print("Model loaded successfully!")
         return model
