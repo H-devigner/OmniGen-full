@@ -46,13 +46,10 @@ class TimestepEmbedder(Model):
     
     def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
-        # Use float16 for GPU operations
-        dtype = tf.float16 if tf.config.list_physical_devices('GPU') else tf.float32
-        
         self.mlp = tf.keras.Sequential([
-            layers.Dense(hidden_size, use_bias=True, dtype=dtype),
-            layers.Activation('silu', dtype=dtype),
-            layers.Dense(hidden_size, use_bias=True, dtype=dtype)
+            layers.Dense(hidden_size, use_bias=True),
+            layers.Activation('silu'),
+            layers.Dense(hidden_size, use_bias=True)
         ])
         self.frequency_embedding_size = frequency_embedding_size
 
@@ -73,9 +70,10 @@ class TimestepEmbedder(Model):
 
     @tf.function(jit_compile=True)
     def call(self, t):
-        # Use appropriate precision based on device
-        dtype = tf.float16 if tf.config.list_physical_devices('GPU') else tf.float32
-        t_freq = tf.cast(self.timestep_embedding(t, self.frequency_embedding_size), dtype)
+        # Cast to appropriate precision
+        if tf.config.list_physical_devices('GPU'):
+            t = tf.cast(t, tf.float16)
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         t_emb = self.mlp(t_freq)
         return t_emb
 
@@ -85,20 +83,21 @@ class FinalLayer(layers.Layer):
     
     def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
-        # Use float16 for GPU operations
-        dtype = tf.float16 if tf.config.list_physical_devices('GPU') else tf.float32
-        
-        self.norm_final = tf.keras.layers.LayerNormalization(epsilon=1e-6, dtype=dtype)
-        self.linear = layers.Dense(patch_size * patch_size * out_channels, 
-                                 use_bias=True, dtype=dtype)
+        self.norm_final = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.linear = layers.Dense(patch_size * patch_size * out_channels, use_bias=True)
         self.adaLN_modulation = tf.keras.Sequential([
-            layers.Activation('silu', dtype=dtype),
-            layers.Dense(2 * hidden_size, use_bias=True, dtype=dtype)
+            layers.Activation('silu'),
+            layers.Dense(2 * hidden_size, use_bias=True)
         ])
 
     @tf.function(jit_compile=True)
     def call(self, x, c):
-        shift, scale = self.adaLN_modulation(c).chunk(2, axis=1)
+        # Cast inputs to appropriate precision for GPU
+        if tf.config.list_physical_devices('GPU'):
+            x = tf.cast(x, tf.float16)
+            c = tf.cast(c, tf.float16)
+            
+        shift, scale = tf.split(self.adaLN_modulation(c), 2, axis=1)
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x
@@ -109,22 +108,20 @@ class PatchEmbedMR(layers.Layer):
     
     def __init__(self, patch_size=2, in_chans=4, embed_dim=768, bias=True):
         super().__init__()
-        # Use float16 for GPU operations
-        dtype = tf.float16 if tf.config.list_physical_devices('GPU') else tf.float32
-        
+        # Configure layer with appropriate precision
         self.proj = layers.Conv2D(
             embed_dim,
             kernel_size=patch_size,
             strides=patch_size,
             use_bias=bias,
-            name='patch_embed',
-            dtype=dtype
+            name='patch_embed'
         )
 
     @tf.function(jit_compile=True)
     def call(self, x):
-        # Ensure input is in correct precision
-        x = tf.cast(x, self.proj.dtype)
+        # Cast input to appropriate precision for GPU
+        if tf.config.list_physical_devices('GPU'):
+            x = tf.cast(x, tf.float16)
         return self.proj(x)
 
 
@@ -154,14 +151,16 @@ class OmniGen(Model):
         
         hidden_size = transformer_config.hidden_size
         
-        # Initialize embedders with float16 for GPU
-        dtype = tf.float16 if tf.config.list_physical_devices('GPU') else tf.float32
-        
+        # Initialize embedders
         self.x_embedder = PatchEmbedMR(
-            patch_size, in_channels, hidden_size, dtype=dtype
+            patch_size=patch_size,
+            in_chans=in_channels,
+            embed_dim=hidden_size
         )
         self.input_x_embedder = PatchEmbedMR(
-            patch_size, in_channels, hidden_size, dtype=dtype
+            patch_size=patch_size,
+            in_chans=in_channels,
+            embed_dim=hidden_size
         )
         
         self.time_token = TimestepEmbedder(hidden_size)
@@ -174,13 +173,14 @@ class OmniGen(Model):
                 interpolation_scale=self.pe_interpolation,
                 base_size=64
             )
-            self.pos_embed = tf.cast(
-                tf.convert_to_tensor(pos_embed[None]), 
-                dtype=dtype
-            )
+            self.pos_embed = tf.convert_to_tensor(pos_embed[None])
+            if tf.config.list_physical_devices('GPU'):
+                self.pos_embed = tf.cast(self.pos_embed, tf.float16)
         
         self.final_layer = FinalLayer(
-            hidden_size, patch_size, self.out_channels
+            hidden_size=hidden_size,
+            patch_size=patch_size,
+            out_channels=self.out_channels
         )
         
         self.transformer = Phi3Transformer(
