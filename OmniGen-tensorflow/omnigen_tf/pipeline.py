@@ -87,29 +87,23 @@ class OmniGenPipeline:
         self._vae_on_cpu = False
         
     def _move_to_device(self, model, device):
-        """Move model to specified device efficiently."""
-        if not isinstance(device, str):
+        """Move model to specified device."""
+        if not device:
+            return
+            
+        if isinstance(device, str):
             device = device.name
             
-        # Use TF's memory optimization
-        tf.config.experimental.set_memory_growth(
-            tf.config.list_physical_devices('GPU')[0], True
-        )
-        
-        with tf.device(device):
-            # Move weights without creating copies
-            for layer in model.layers:
-                if hasattr(layer, 'kernel'):
-                    layer.kernel = tf.identity(layer.kernel)
-                if hasattr(layer, 'bias'):
-                    layer.bias = tf.identity(layer.bias)
-                        
-        # Force garbage collection
-        gc.collect()
-        if device == '/GPU:0':
-            # Clear GPU memory fragments
-            tf.keras.backend.clear_session()
-            
+        # Check if it's a TensorFlow model
+        if hasattr(model, 'variables'):
+            with tf.device(device):
+                for var in model.variables:
+                    if isinstance(var, tf.Variable):
+                        var.assign(tf.identity(var))
+        # PyTorch model
+        elif hasattr(model, 'to'):
+            model.to(device)
+
     def enable_cpu_offload(self):
         """Move models to CPU to save memory."""
         if not self._model_on_cpu:

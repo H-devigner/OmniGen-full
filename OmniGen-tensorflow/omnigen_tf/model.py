@@ -420,20 +420,16 @@ class OmniGen(Model):
             
             # Create parameter mapping dictionary
             param_mapping = {
-                # LLM parameters
-                'llm.norm.weight': 'transformer/layer_norm/gamma',
-                'llm.norm.bias': 'transformer/layer_norm/beta',
-                
                 # Embedders
-                't_embedder.mlp.0.weight': 't_embedder/mlp/dense/kernel',
-                't_embedder.mlp.0.bias': 't_embedder/mlp/dense/bias',
-                't_embedder.mlp.2.weight': 't_embedder/mlp/dense_1/kernel',
-                't_embedder.mlp.2.bias': 't_embedder/mlp/dense_1/bias',
+                't_embedder.mlp.0.weight': 't_embedder/mlp/0/kernel',
+                't_embedder.mlp.0.bias': 't_embedder/mlp/0/bias',
+                't_embedder.mlp.2.weight': 't_embedder/mlp/2/kernel',
+                't_embedder.mlp.2.bias': 't_embedder/mlp/2/bias',
                 
-                'time_token.mlp.0.weight': 'time_token/mlp/dense/kernel',
-                'time_token.mlp.0.bias': 'time_token/mlp/dense/bias',
-                'time_token.mlp.2.weight': 'time_token/mlp/dense_1/kernel',
-                'time_token.mlp.2.bias': 'time_token/mlp/dense_1/bias',
+                'time_token.mlp.0.weight': 'time_token/mlp/0/kernel',
+                'time_token.mlp.0.bias': 'time_token/mlp/0/bias',
+                'time_token.mlp.2.weight': 'time_token/mlp/2/kernel',
+                'time_token.mlp.2.bias': 'time_token/mlp/2/bias',
                 
                 # Patch embedders
                 'x_embedder.proj.weight': 'x_embedder/proj/kernel',
@@ -446,8 +442,12 @@ class OmniGen(Model):
                 'final_layer.norm_final.bias': 'final_layer/norm_final/beta',
                 'final_layer.linear.weight': 'final_layer/linear/kernel',
                 'final_layer.linear.bias': 'final_layer/linear/bias',
-                'final_layer.adaLN_modulation.1.weight': 'final_layer/adaLN_modulation/dense/kernel',
-                'final_layer.adaLN_modulation.1.bias': 'final_layer/adaLN_modulation/dense/bias',
+                'final_layer.adaLN_modulation.1.weight': 'final_layer/adaLN_modulation/1/kernel',
+                'final_layer.adaLN_modulation.1.bias': 'final_layer/adaLN_modulation/1/bias',
+                
+                # Transformer
+                'llm.norm.weight': 'transformer/norm/gamma',
+                'llm.norm.bias': 'transformer/norm/beta',
             }
             
             # Get all model variables
@@ -455,8 +455,18 @@ class OmniGen(Model):
             for var in model.variables:
                 name = var.name.split(':')[0]
                 var_dict[name] = var
+                
+            # Debug: print all available variables
+            print("\nAvailable TensorFlow variables:")
+            for name in sorted(var_dict.keys()):
+                print(f"  {name}")
             
             with safe_open(weights_path, framework="tf") as f:
+                # Debug: print all PyTorch parameters
+                print("\nPyTorch parameters to load:")
+                for name in sorted(f.keys()):
+                    print(f"  {name}")
+                
                 # Load and assign weights
                 for pt_name in f.keys():
                     # Get TensorFlow name
@@ -477,14 +487,16 @@ class OmniGen(Model):
                                 # Dense layers need simple transpose
                                 tensor = np.transpose(tensor)
                                 
-                        # Assign the processed tensor
-                        var_dict[tf_name].assign(tensor)
+                        try:
+                            var_dict[tf_name].assign(tensor)
+                        except Exception as e:
+                            print(f"Error assigning {pt_name} -> {tf_name}: {e}")
+                            print(f"Shapes: PyTorch {tensor.shape} vs TF {var_dict[tf_name].shape}")
                     else:
                         print(f"Warning: Parameter {pt_name} not found in model")
                         
         print("Model loaded successfully!")
         return model
-
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0, interpolation_scale=1.0, base_size=1):
     """
