@@ -165,180 +165,236 @@ class OmniGen(Model):
         # Disable caching to match PyTorch
         self.transformer.config.use_cache = False
 
-    @tf.function(jit_compile=True)
-    def call(self, x, timestep, input_ids=None, input_img_latents=None,
-             input_image_sizes=None, attention_mask=None, position_ids=None,
-             training=False):
-        # Process inputs
-        x_patches = self.x_embedder(x)
-        t_emb = self.t_embedder(timestep)
+    def initialize_weights(self):
+        """Initialize model weights to match PyTorch implementation."""
+        # Initialize transformer layers
+        def _basic_init(module):
+            if isinstance(module, layers.Dense):
+                # Xavier uniform initialization
+                limit = tf.sqrt(6. / float(module.input_dim + module.units))
+                module.kernel.assign(tf.random.uniform(
+                    module.kernel.shape, -limit, limit
+                ))
+                if module.use_bias:
+                    module.bias.assign(tf.zeros_like(module.bias))
+                    
+        for layer in self.layers:
+            if hasattr(layer, 'kernel'):
+                _basic_init(layer)
         
-        if input_img_latents is not None:
-            input_img_patches = self.input_x_embedder(input_img_latents)
-        
-        # Move to GPU for main computation if available
-        if tf.config.list_physical_devices('GPU'):
-            with tf.device('/GPU:0'):
-                return self._process_on_gpu(
-                    x_patches, t_emb, input_ids, input_img_patches,
-                    input_image_sizes, attention_mask, position_ids,
-                    training
-                )
-        else:
-            return self._process_on_cpu(
-                x_patches, t_emb, input_ids, input_img_patches,
-                input_image_sizes, attention_mask, position_ids,
-                training
-            )
+        # Initialize patch_embed like Dense (instead of Conv2D)
+        for embedder in [self.x_embedder, self.input_x_embedder]:
+            w = embedder.proj.kernel
+            # Reshape to 2D for Xavier initialization
+            w_flat = tf.reshape(w, [w.shape[0], -1])
+            limit = tf.sqrt(6. / float(w_flat.shape[0] + w_flat.shape[1]))
+            w_init = tf.random.uniform(w_flat.shape, -limit, limit)
+            # Reshape back to 4D
+            embedder.proj.kernel.assign(tf.reshape(w_init, w.shape))
+            embedder.proj.bias.assign(tf.zeros_like(embedder.proj.bias))
 
-    @tf.function(jit_compile=True)
-    def _process_on_gpu(self, x_patches, t_emb, input_ids, input_img_patches,
-                       input_image_sizes, attention_mask, position_ids, training):
-        # Process with float16 on GPU
-        hidden_states = self.transformer(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            inputs_embeds=x_patches,
-            training=training
+        # Initialize timestep embedding MLP with normal distribution
+        std = 0.02
+        for embedder in [self.t_embedder, self.time_token]:
+            for layer in embedder.mlp.layers:
+                if isinstance(layer, layers.Dense):
+                    layer.kernel.assign(tf.random.normal(
+                        layer.kernel.shape, mean=0.0, stddev=std
+                    ))
+
+        # Zero-out output layers
+        self.final_layer.adaLN_modulation.layers[-1].kernel.assign(
+            tf.zeros_like(self.final_layer.adaLN_modulation.layers[-1].kernel)
         )
-        
-        # Final processing
-        output = self.final_layer(hidden_states, t_emb)
-        
-        # Clear GPU memory
-        tf.keras.backend.clear_session()
-        
-        return output
-
-    def _process_on_cpu(self, x_patches, t_emb, input_ids, input_img_patches,
-                       input_image_sizes, attention_mask, position_ids, training):
-        # Process with float32 on CPU
-        hidden_states = self.transformer(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            inputs_embeds=x_patches,
-            training=training
+        self.final_layer.adaLN_modulation.layers[-1].bias.assign(
+            tf.zeros_like(self.final_layer.adaLN_modulation.layers[-1].bias)
         )
-        
-        return self.final_layer(hidden_states, t_emb)
+        self.final_layer.linear.kernel.assign(
+            tf.zeros_like(self.final_layer.linear.kernel)
+        )
+        self.final_layer.linear.bias.assign(
+            tf.zeros_like(self.final_layer.linear.bias)
+        )
 
+    @tf.function(jit_compile=True)
     def unpatchify(self, x, h, w):
-        """Convert a sequence of patch embeddings back to an image.
-        
-        Args:
-            x: Input tensor
-            h: Output image height
-            w: Output image width
-            
-        Returns:
-            Tensor of shape [N, H, W, C] containing the reconstructed image
         """
-        c = self.in_channels
-        p = self.patch_size
+        x: (N, T, patch_size**2 * C)
+        imgs: (N, C, H, W)
+        """
+        c = self.out_channels
+        batch_size = tf.shape(x)[0]
         
-        x = tf.reshape(x, [-1, h // p, w // p, p * p * c])
-        x = tf.nn.depth_to_space(x, p)  # Equivalent to torch.pixel_shuffle
-        return x
+        # Reshape to match PyTorch's dimensions
+        x = tf.reshape(x, [
+            batch_size,
+            h // self.patch_size,
+            w // self.patch_size,
+            self.patch_size,
+            self.patch_size,
+            c
+        ])
+        
+        # Equivalent to PyTorch's einsum('nhwpqc->nchpwq')
+        x = tf.transpose(x, [0, 5, 1, 3, 2, 4])
+        
+        # Final reshape to get output shape
+        imgs = tf.reshape(x, [batch_size, c, h, w])
+        return imgs
 
     def cropped_pos_embed(self, height, width):
-        """Crop positional embeddings for the given image size.
+        """Crops positional embeddings for SD3 compatibility."""
+        if self.pos_embed_max_size is None:
+            raise ValueError("`pos_embed_max_size` must be set for cropping.")
+
+        height = height // self.patch_size
+        width = width // self.patch_size
         
-        This ensures compatibility with different input sizes by either:
-        1. Using the stored embeddings if sizes match
-        2. Generating new embeddings for the specific size
-        
-        Args:
-            height: Image height
-            width: Image width
-            
-        Returns:
-            Positional embeddings of appropriate size
-        """
-        h, w = height // self.patch_size, width // self.patch_size
-        pos_embed = self.pos_embed
-        
-        if h * w != pos_embed.shape[1]:
-            pos_embed = get_2d_sincos_pos_embed(
-                self.transformer.config.hidden_size,
-                (h, w),
-                interpolation_scale=self.pe_interpolation,
-                base_size=64
+        if height > self.pos_embed_max_size:
+            raise ValueError(
+                f"Height ({height}) cannot be greater than `pos_embed_max_size`: {self.pos_embed_max_size}."
             )
-            pos_embed = tf.Variable(
-                initial_value=pos_embed[None],
-                trainable=False,
-                name="pos_embed"
+        if width > self.pos_embed_max_size:
+            raise ValueError(
+                f"Width ({width}) cannot be greater than `pos_embed_max_size`: {self.pos_embed_max_size}."
             )
+
+        top = (self.pos_embed_max_size - height) // 2
+        left = (self.pos_embed_max_size - width) // 2
         
-        return pos_embed
+        # Reshape and crop
+        spatial_pos_embed = tf.reshape(
+            self.pos_embed,
+            [1, self.pos_embed_max_size, self.pos_embed_max_size, -1]
+        )
+        spatial_pos_embed = spatial_pos_embed[:, top:top + height, left:left + width, :]
+        spatial_pos_embed = tf.reshape(
+            spatial_pos_embed,
+            [1, -1, tf.shape(spatial_pos_embed)[-1]]
+        )
+        return spatial_pos_embed
 
     def patch_multiple_resolutions(self, latents, padding_latent=None, is_input_images=False):
-        """Process latents of multiple resolutions.
-        
-        This method handles input images or latents of different sizes by:
-        1. Embedding each resolution separately
-        2. Computing appropriate positional embeddings
-        3. Optionally handling padding latents
-        
-        Args:
-            latents: List of input tensors at different resolutions
-            padding_latent: Optional padding latent to append
-            is_input_images: Whether inputs are images (True) or latents (False)
+        """Handle multiple resolution inputs."""
+        if isinstance(latents, list):
+            return_list = False
+            if padding_latent is None:
+                padding_latent = [None] * len(latents)
+                return_list = True
+                
+            patched_latents, num_tokens, shapes = [], [], []
+            for latent, padding in zip(latents, padding_latent):
+                height, width = tf.shape(latent)[-2], tf.shape(latent)[-1]
+                
+                if is_input_images:
+                    latent = self.input_x_embedder(latent)
+                else:
+                    latent = self.x_embedder(latent)
+                    
+                pos_embed = self.cropped_pos_embed(height, width)
+                latent = latent + pos_embed
+                
+                if padding is not None:
+                    latent = tf.concat([latent, padding], axis=-2)
+                    
+                patched_latents.append(latent)
+                num_tokens.append(tf.shape(pos_embed)[1])
+                shapes.append([height, width])
+                
+            if not return_list:
+                latents = tf.concat(patched_latents, axis=0)
+            else:
+                latents = patched_latents
+        else:
+            height, width = tf.shape(latents)[-2], tf.shape(latents)[-1]
             
-        Returns:
-            Tuple of (embedded_latents, positional_embeddings)
-        """
-        embedder = self.input_x_embedder if is_input_images else self.x_embedder
-        batch_size = tf.shape(latents[0])[0]
-        
-        # Process each resolution
-        x_list = []
-        pos_embed_list = []
-        num_tokens_list = []
-        shapes_list = []
-        
-        for idx, x in enumerate(latents):
-            h, w = tf.shape(x)[1], tf.shape(x)[2]
-            x_embed = embedder(x)
-            pos_embed = self.cropped_pos_embed(h, w)
+            if is_input_images:
+                latents = self.input_x_embedder(latents)
+            else:
+                latents = self.x_embedder(latents)
+                
+            pos_embed = self.cropped_pos_embed(height, width)
+            latents = latents + pos_embed
+            num_tokens = tf.shape(latents)[1]
+            shapes = [height, width]
             
-            if padding_latent is not None and idx == len(latents) - 1:
-                padding_embed = embedder(padding_latent)
-                x_embed = tf.concat([x_embed, padding_embed], axis=1)
-                pos_embed = tf.concat([pos_embed, pos_embed], axis=1)
-            
-            x_list.append(x_embed)
-            pos_embed_list.append(pos_embed)
-            num_tokens_list.append(tf.shape(x_embed)[1])
-            shapes_list.append((h, w))
-        
-        return x_list, num_tokens_list, shapes_list
+        return latents, num_tokens, shapes
 
     @tf.function(jit_compile=True)
-    def forward_with_cfg(self, x, timestep, input_ids=None, input_img_latents=None,
-                        input_image_sizes=None, attention_mask=None, position_ids=None,
-                        cfg_scale=7.5, use_img_cfg=False, img_cfg_scale=1.0):
-        """Classifier-free guidance matching PyTorch implementation."""
-        # Process with guidance
-        model_out = self.call(
-            x, timestep, input_ids, input_img_latents,
-            input_image_sizes, attention_mask, position_ids
+    def call(self, x, timestep, input_ids=None, input_img_latents=None,
+            input_image_sizes=None, attention_mask=None, position_ids=None,
+            padding_latent=None, past_key_values=None, return_past_key_values=True,
+            offload_model=False, training=False):
+        """Forward pass of the model."""
+        input_is_list = isinstance(x, list)
+        x, num_tokens, shapes = self.patch_multiple_resolutions(x, padding_latent)
+        
+        # Get time token
+        time_token = self.time_token(timestep)
+        time_token = tf.expand_dims(time_token, 1)
+        
+        if input_img_latents is not None:
+            input_latents, _, _ = self.patch_multiple_resolutions(
+                input_img_latents, is_input_images=True
+            )
+            
+        if input_ids is not None:
+            condition_embeds = self.transformer.embed_tokens(input_ids)
+            input_img_inx = 0
+            
+            for b_inx in input_image_sizes.keys():
+                for start_inx, end_inx in input_image_sizes[b_inx]:
+                    condition_embeds = tf.tensor_scatter_nd_update(
+                        condition_embeds,
+                        [[b_inx, i] for i in range(start_inx, end_inx)],
+                        input_latents[input_img_inx]
+                    )
+                    input_img_inx += 1
+                    
+            if input_img_latents is not None:
+                tf.debugging.assert_equal(
+                    input_img_inx,
+                    len(input_latents),
+                    "Number of input images doesn't match"
+                )
+            
+            input_emb = tf.concat([condition_embeds, time_token, x], axis=1)
+        else:
+            input_emb = tf.concat([time_token, x], axis=1)
+            
+        # Run through transformer
+        output = self.transformer(
+            inputs_embeds=input_emb,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            training=training
         )
         
-        if use_img_cfg:
-            # Split for image-based guidance
-            cond, uncond, img_cond = tf.split(model_out, 3, axis=0)
-            cond = uncond + img_cfg_scale * (img_cond - uncond) + cfg_scale * (cond - img_cond)
-            model_out = [cond, cond, cond]
+        if return_past_key_values:
+            output, past_key_values = output.last_hidden_state, output.past_key_values
         else:
-            # Standard guidance
-            cond, uncond = tf.split(model_out, 2, axis=0)
-            cond = uncond + cfg_scale * (cond - uncond)
-            model_out = [cond, cond]
+            output = output.last_hidden_state
             
-        return tf.concat(model_out, axis=0)
+        if input_is_list:
+            image_embedding = output[:, -tf.reduce_max(num_tokens):]
+            time_emb = self.t_embedder(timestep)
+            x = self.final_layer(image_embedding, time_emb)
+            
+            latents = []
+            for i in range(tf.shape(x)[0]):
+                latent = x[i:i+1, :num_tokens[i]]
+                latent = self.unpatchify(latent, shapes[i][0], shapes[i][1])
+                latents.append(latent)
+        else:
+            image_embedding = output[:, -num_tokens:]
+            time_emb = self.t_embedder(timestep)
+            x = self.final_layer(image_embedding, time_emb)
+            latents = self.unpatchify(x, shapes[0], shapes[1])
+            
+        if return_past_key_values:
+            return latents, past_key_values
+        return latents
 
     @classmethod
     def from_pretrained(cls, model_name, **kwargs):
@@ -361,25 +417,70 @@ class OmniGen(Model):
         weights_path = os.path.join(model_name, "model.safetensors")
         if os.path.exists(weights_path):
             print("Loading safetensors weights...")
-            with safe_open(weights_path, framework="tf") as f:
-                # Create a mapping of weight names
-                param_mapping = {}
-                for var in model.trainable_variables + model.non_trainable_variables:
-                    name = var.name.split(':')[0]  # Remove the ':0' suffix
-                    param_mapping[name] = var
+            
+            # Create parameter mapping dictionary
+            param_mapping = {
+                # LLM parameters
+                'llm.norm.weight': 'transformer/layer_norm/gamma',
+                'llm.norm.bias': 'transformer/layer_norm/beta',
                 
+                # Embedders
+                't_embedder.mlp.0.weight': 't_embedder/mlp/dense/kernel',
+                't_embedder.mlp.0.bias': 't_embedder/mlp/dense/bias',
+                't_embedder.mlp.2.weight': 't_embedder/mlp/dense_1/kernel',
+                't_embedder.mlp.2.bias': 't_embedder/mlp/dense_1/bias',
+                
+                'time_token.mlp.0.weight': 'time_token/mlp/dense/kernel',
+                'time_token.mlp.0.bias': 'time_token/mlp/dense/bias',
+                'time_token.mlp.2.weight': 'time_token/mlp/dense_1/kernel',
+                'time_token.mlp.2.bias': 'time_token/mlp/dense_1/bias',
+                
+                # Patch embedders
+                'x_embedder.proj.weight': 'x_embedder/proj/kernel',
+                'x_embedder.proj.bias': 'x_embedder/proj/bias',
+                'input_x_embedder.proj.weight': 'input_x_embedder/proj/kernel',
+                'input_x_embedder.proj.bias': 'input_x_embedder/proj/bias',
+                
+                # Final layer
+                'final_layer.norm_final.weight': 'final_layer/norm_final/gamma',
+                'final_layer.norm_final.bias': 'final_layer/norm_final/beta',
+                'final_layer.linear.weight': 'final_layer/linear/kernel',
+                'final_layer.linear.bias': 'final_layer/linear/bias',
+                'final_layer.adaLN_modulation.1.weight': 'final_layer/adaLN_modulation/dense/kernel',
+                'final_layer.adaLN_modulation.1.bias': 'final_layer/adaLN_modulation/dense/bias',
+            }
+            
+            # Get all model variables
+            var_dict = {}
+            for var in model.variables:
+                name = var.name.split(':')[0]
+                var_dict[name] = var
+            
+            with safe_open(weights_path, framework="tf") as f:
                 # Load and assign weights
-                for key in f.keys():
-                    # Convert PyTorch parameter names to TensorFlow names
-                    tf_name = key.replace('.', '/')
-                    if tf_name in param_mapping:
-                        tensor = f.get_tensor(key)
-                        # Handle any necessary transpositions
-                        if len(tensor.shape) >= 2 and 'kernel' in tf_name:
-                            tensor = np.transpose(tensor)
-                        param_mapping[tf_name].assign(tensor)
+                for pt_name in f.keys():
+                    # Get TensorFlow name
+                    tf_name = param_mapping.get(pt_name)
+                    if tf_name is None:
+                        # Try direct conversion
+                        tf_name = pt_name.replace('.', '/')
+                        
+                    if tf_name in var_dict:
+                        tensor = f.get_tensor(pt_name)
+                        
+                        # Handle special cases
+                        if 'kernel' in tf_name and len(tensor.shape) >= 2:
+                            if 'conv' in tf_name.lower() or 'proj' in tf_name.lower():
+                                # Conv2D weights need HWIO to OIHW conversion
+                                tensor = np.transpose(tensor, (2, 3, 1, 0))
+                            else:
+                                # Dense layers need simple transpose
+                                tensor = np.transpose(tensor)
+                                
+                        # Assign the processed tensor
+                        var_dict[tf_name].assign(tensor)
                     else:
-                        print(f"Warning: Parameter {key} not found in model")
+                        print(f"Warning: Parameter {pt_name} not found in model")
                         
         print("Model loaded successfully!")
         return model

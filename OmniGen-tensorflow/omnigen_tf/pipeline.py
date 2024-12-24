@@ -37,6 +37,16 @@ EXAMPLE_DOC_STRING = """
 """
 
 
+# Configure GPU memory growth before any other TensorFlow operations
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+    except RuntimeError as e:
+        print(f"GPU memory growth setting failed: {e}")
+
+
 class OmniGenPipeline:
     """Pipeline for text-to-image generation using OmniGen."""
     
@@ -89,12 +99,10 @@ class OmniGenPipeline:
         with tf.device(device):
             # Move weights without creating copies
             for layer in model.layers:
-                for weight in layer.weights:
-                    if weight.device != device:
-                        # Use assign without copy
-                        weight._handle_data = tf.compat.v1.IndexedSlices(
-                            weight, tf.range(tf.size(weight)), tf.shape(weight)
-                        )
+                if hasattr(layer, 'kernel'):
+                    layer.kernel = tf.identity(layer.kernel)
+                if hasattr(layer, 'bias'):
+                    layer.bias = tf.identity(layer.bias)
                         
         # Force garbage collection
         gc.collect()
