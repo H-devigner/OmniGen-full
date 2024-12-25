@@ -16,6 +16,7 @@ from huggingface_hub import snapshot_download
 from diffusers.loaders import PeftAdapterMixin
 import json
 from dataclasses import fields
+import gc
 
 from omnigen_tf.transformer import Phi3Config, Phi3Transformer
 
@@ -190,6 +191,31 @@ class OmniGen(Model):
             patch_size=patch_size,
             out_channels=self.out_channels
         )
+        
+        # Memory optimization flags
+        self.memory_efficient = False
+        self.gradient_checkpointing = False
+        self.chunk_size = None
+        
+    def enable_memory_efficient_inference(self):
+        """Enable memory efficient inference mode."""
+        self.memory_efficient = True
+        self.transformer.use_mixed_precision = True
+        self.transformer.enable_gradient_checkpointing()
+        self.chunk_size = 64  # Default chunk size, can be adjusted
+        self.transformer.set_chunk_size(self.chunk_size)
+        
+    def disable_memory_efficient_inference(self):
+        """Disable memory efficient inference mode."""
+        self.memory_efficient = False
+        self.transformer.use_mixed_precision = False
+        self.transformer.disable_gradient_checkpointing()
+        self.transformer.set_chunk_size(None)
+        
+    def set_chunk_size(self, chunk_size: int):
+        """Set chunk size for processing large inputs."""
+        self.chunk_size = chunk_size
+        self.transformer.set_chunk_size(chunk_size)
         
     def _create_weights_mapping(self):
         """Create mapping between PyTorch and TensorFlow weight names."""
@@ -421,45 +447,76 @@ class OmniGen(Model):
         pos_embed = tf.convert_to_tensor(pos_embed, dtype=tf.float32)
         return pos_embed
 
-    def __call__(self, latents, timestep, input_ids=None, attention_mask=None):
-        """Forward pass.
+    def call(
+        self,
+        latents,
+        timestep,
+        input_ids=None,
+        attention_mask=None,
+        training=False,
+    ):
+        """Forward pass with memory optimizations."""
         
-        Args:
-            latents: Input latents
-            timestep: Current timestep
-            input_ids: Text token IDs
-            attention_mask: Attention mask for text tokens
+        # Set up memory efficient inference if enabled
+        if self.memory_efficient and not training:
+            # Use mixed precision
+            if tf.keras.mixed_precision.global_policy().name != 'mixed_float16':
+                tf.keras.mixed_precision.set_global_policy('mixed_float16')
+                
+            # Clear memory before inference
+            tf.keras.backend.clear_session()
             
-        Returns:
-            Predicted noise
-        """
-        # Clear memory
-        tf.keras.backend.clear_session()
+            # Run garbage collection
+            gc.collect()
+            
+            # Configure GPU memory growth
+            gpus = tf.config.list_physical_devices('GPU')
+            if gpus:
+                try:
+                    for gpu in gpus:
+                        tf.config.experimental.set_memory_growth(gpu, True)
+                except RuntimeError as e:
+                    print(f"GPU memory growth error: {e}")
+                    
+        # Process in chunks if needed
+        if self.chunk_size is not None and isinstance(latents, list):
+            all_latents = []
+            for x in latents:
+                if x.shape[1] > self.chunk_size:
+                    x = self._chunked_forward(x, timestep, input_ids, attention_mask, training)
+                else:
+                    x = self._normal_forward(x, timestep, input_ids, attention_mask, training)
+                all_latents.append(x)
+            return all_latents
+        else:
+            if isinstance(latents, list):
+                latents = tf.concat(latents, axis=0)
+            if latents.shape[1] > self.chunk_size:
+                return self._chunked_forward(latents, timestep, input_ids, attention_mask, training)
+            else:
+                return self._normal_forward(latents, timestep, input_ids, attention_mask, training)
+        
+    def _normal_forward(
+        self,
+        latents,
+        timestep,
+        input_ids=None,
+        attention_mask=None,
+        training=False,
+    ):
+        """Normal forward pass."""
         
         # Get batch size
         batch_size = tf.shape(latents)[0]
         
         # Get input shape
-        if isinstance(latents, list):
-            shapes = [(x.shape[1], x.shape[2]) for x in latents]
-            num_tokens = [h * w // (self.patch_size ** 2) for h, w in shapes]
-            max_num_tokens = max(num_tokens)
-            input_is_list = True
-        else:
-            h, w = latents.shape[1:3]
-            num_tokens = h * w // (self.patch_size ** 2)
-            shapes = (h, w)
-            input_is_list = False
+        h, w = latents.shape[1:3]
+        num_tokens = h * w // (self.patch_size ** 2)
+        shapes = (h, w)
+        input_is_list = False
             
         # Process inputs
-        if input_is_list:
-            # Handle list of latents
-            x = [self.x_embedder(lat) for lat in latents]
-            max_len = max([xi.shape[1] for xi in x])
-            x = [tf.pad(xi, [[0,0], [0, max_len - xi.shape[1]], [0,0]]) for xi in x]
-            x = tf.concat(x, axis=0)
-        else:
-            x = self.x_embedder(latents)
+        x = self.x_embedder(latents)
             
         # Get position embeddings
         pos_embed = self.get_pos_embed(shapes[0], shapes[1])
@@ -474,29 +531,62 @@ class OmniGen(Model):
             t,
             input_ids,
             attention_mask,
-            training=False
+            training=training,
         )
         
         # Process output
-        if input_is_list:
-            image_embedding = output[:, -tf.reduce_max(num_tokens):]
-            time_emb = self.time_token(timestep)
-            x = self.final_layer(image_embedding, time_emb)
+        image_embedding = output[:, -num_tokens:]
+        time_emb = self.time_token(timestep)
+        x = self.final_layer(image_embedding, time_emb)
             
-            latents = []
-            for i, (h, w) in enumerate(shapes):
-                latent = self.unpatchify(x[i:i+1], h, w)
-                latents.append(latent)
-        else:
-            image_embedding = output[:, -num_tokens:]
-            time_emb = self.time_token(timestep)
-            x = self.final_layer(image_embedding, time_emb)
-            latents = self.unpatchify(x, shapes[0], shapes[1])
+        latents = self.unpatchify(x, shapes[0], shapes[1])
             
-        # Clear memory again
-        tf.keras.backend.clear_session()
+        # Clean up memory if needed
+        if self.memory_efficient and not training:
+            tf.keras.backend.clear_session()
+            gc.collect()
             
         return latents
+        
+    def _chunked_forward(
+        self,
+        latents,
+        timestep,
+        input_ids=None,
+        attention_mask=None,
+        training=False,
+    ):
+        """Process input in chunks to save memory."""
+        
+        # Split inputs into chunks
+        input_chunks = tf.split(
+            latents,
+            num_or_size_splits=math.ceil(latents.shape[1]/self.chunk_size),
+            axis=1
+        )
+        
+        # Process each chunk
+        output_chunks = []
+        for chunk in input_chunks:
+            # Get corresponding attention mask and position ids for chunk
+            if attention_mask is not None:
+                chunk_mask = attention_mask[:, :chunk.shape[1]]
+            else:
+                chunk_mask = None
+                
+            # Process chunk
+            chunk_output = self._normal_forward(chunk, timestep, input_ids, chunk_mask, training)
+            
+            # Store chunk output
+            output_chunks.append(chunk_output)
+            
+            # Clear memory after each chunk
+            if self.memory_efficient:
+                tf.keras.backend.clear_session()
+                gc.collect()
+                
+        # Combine chunks
+        return output_chunks
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args, **kwargs) -> "OmniGen":

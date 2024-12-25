@@ -92,28 +92,27 @@ class Phi3Transformer(TFPreTrainedModel):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers.
     Matches PyTorch's implementation while optimizing for TensorFlow.
-    
-    Args:
-        config: Phi3Config
     """
     config_class = Phi3Config
     base_model_prefix = "transformer"
     
-    def __init__(self, config: Phi3Config, *args, **kwargs):
-        # Enable mixed precision by default
-        if tf.config.list_physical_devices('GPU'):
-            tf.keras.mixed_precision.set_global_policy('mixed_float16')
-            
-        super().__init__(config, *args, **kwargs)
+    def __init__(self, config, **kwargs):
+        """Initialize transformer."""
+        super().__init__(**kwargs)
         
         self.config = config
-        self.embed_dim = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.embed_dim // self.num_heads
-        self.max_position_embeddings = config.max_position_embeddings
+        self.hidden_size = config.hidden_size
+        self.num_hidden_layers = config.num_hidden_layers
+        self.num_attention_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        
+        # Enable memory optimization flags
+        self.gradient_checkpointing = False
+        self.use_mixed_precision = True
+        self.chunk_size = None  # For chunked processing
         
         # Initialize embeddings
-        self.wte = layers.Embedding(config.vocab_size, self.embed_dim, dtype='float16')
+        self.wte = layers.Embedding(config.vocab_size, self.hidden_size, dtype='float16')
         self.drop = layers.Dropout(config.hidden_dropout)
         
         # Initialize transformer layers
@@ -312,12 +311,7 @@ class OmniGenTransformer(layers.Layer):
     """Transformer model for OmniGen."""
     
     def __init__(self, config, **kwargs):
-        """Initialize transformer.
-        
-        Args:
-            config: Model configuration
-            **kwargs: Additional arguments
-        """
+        """Initialize transformer."""
         super().__init__(**kwargs)
         
         self.config = config
@@ -326,10 +320,39 @@ class OmniGenTransformer(layers.Layer):
         self.num_attention_heads = config.num_attention_heads
         self.head_dim = self.hidden_size // self.num_attention_heads
         
+        # Enable memory optimization flags
+        self.gradient_checkpointing = False
+        self.use_mixed_precision = True
+        self.chunk_size = None  # For chunked processing
+        
         # Initialize layers
         self.layers = [OmniGenLayer(config, name=f"layer_{i}") for i in range(self.num_hidden_layers)]
         self.norm = layers.LayerNormalization(epsilon=1e-5, name="norm")
         
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing for memory efficiency."""
+        self.gradient_checkpointing = True
+        
+    def disable_gradient_checkpointing(self):
+        """Disable gradient checkpointing."""
+        self.gradient_checkpointing = False
+        
+    def set_chunk_size(self, chunk_size: Optional[int]):
+        """Set chunk size for processing large inputs."""
+        self.chunk_size = chunk_size
+        
+    def process_in_chunks(self, fn, inputs, chunk_size):
+        """Process input in chunks to save memory."""
+        if chunk_size is None or inputs.shape[1] <= chunk_size:
+            return fn(inputs)
+            
+        chunks = tf.split(inputs, 
+                         num_or_size_splits=math.ceil(inputs.shape[1]/chunk_size),
+                         axis=1)
+        output_chunks = [fn(chunk) for chunk in chunks]
+        return tf.concat(output_chunks, axis=1)
+        
+    @unpack_inputs
     def call(
         self,
         hidden_states,
@@ -337,67 +360,147 @@ class OmniGenTransformer(layers.Layer):
         position_ids=None,
         past_key_value=None,
         output_attentions=False,
+        use_cache=False,
         training=False,
     ):
         """Forward pass of transformer with memory optimization."""
-        # Memory optimization: use mixed precision
-        policy = tf.keras.mixed_precision.global_policy()
-        if policy.name == 'mixed_float16':
-            hidden_states = tf.cast(hidden_states, tf.float16)
-            
-        residual = hidden_states
         
-        # Layer norm
+        # Enable mixed precision if flag is set
+        if self.use_mixed_precision:
+            policy = tf.keras.mixed_precision.Policy('mixed_float16')
+            hidden_states = tf.cast(hidden_states, policy.compute_dtype)
+            if attention_mask is not None:
+                attention_mask = tf.cast(attention_mask, policy.compute_dtype)
+        
+        # Process in chunks if chunk size is set
+        if self.chunk_size is not None:
+            def chunk_forward(chunk):
+                outputs = self._forward_pass(
+                    chunk, attention_mask, position_ids,
+                    past_key_value, output_attentions,
+                    use_cache, training
+                )
+                return outputs[0] if isinstance(outputs, tuple) else outputs
+                
+            hidden_states = self.process_in_chunks(
+                chunk_forward, hidden_states, self.chunk_size
+            )
+            return hidden_states
+            
+        return self._forward_pass(
+            hidden_states, attention_mask, position_ids,
+            past_key_value, output_attentions,
+            use_cache, training
+        )
+        
+    def _forward_pass(
+        self,
+        hidden_states,
+        attention_mask,
+        position_ids,
+        past_key_value,
+        output_attentions,
+        use_cache,
+        training,
+    ):
+        """Core forward pass implementation."""
+        
+        all_hidden_states = () if output_attentions else None
+        all_self_attns = () if output_attentions else None
+        next_decoder_cache = () if use_cache else None
+        
+        # Use gradient checkpointing if enabled
+        layer_fn = self._checkpointed_layer if self.gradient_checkpointing else self._regular_layer
+        
+        for idx, decoder_layer in enumerate(self.layers):
+            if output_attentions:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+                
+            past_key_value_layer = past_key_value[idx] if past_key_value is not None else None
+            
+            hidden_states, layer_self_attn, present_key_value = layer_fn(
+                decoder_layer,
+                hidden_states,
+                attention_mask,
+                position_ids,
+                past_key_value_layer,
+                output_attentions,
+                use_cache,
+                training,
+            )
+            
+            if use_cache:
+                next_decoder_cache = next_decoder_cache + (present_key_value,)
+                
+            if output_attentions:
+                all_self_attns = all_self_attns + (layer_self_attn,)
+                
         hidden_states = self.norm(hidden_states)
         
-        # Self attention
-        attn_outputs = self.layers[0].self_attn(
-            hidden_states=hidden_states,
+        # Convert back to float32 for output
+        if self.use_mixed_precision:
+            hidden_states = tf.cast(hidden_states, tf.float32)
+            
+        if output_attentions:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+            
+        if not use_cache:
+            return hidden_states
+            
+        return hidden_states, next_decoder_cache
+        
+    def _checkpointed_layer(
+        self,
+        layer,
+        hidden_states,
+        attention_mask,
+        position_ids,
+        past_key_value,
+        output_attentions,
+        use_cache,
+        training,
+    ):
+        """Run layer with gradient checkpointing."""
+        
+        def create_custom_forward():
+            def custom_forward(*inputs):
+                return layer(inputs[0], 
+                           attention_mask=inputs[1],
+                           position_ids=inputs[2],
+                           output_attentions=output_attentions,
+                           use_cache=use_cache,
+                           training=training)
+            return custom_forward
+            
+        layer_outputs = tf.recompute_grad(create_custom_forward())(
+            hidden_states,
+            attention_mask,
+            position_ids,
+        )
+        
+        return layer_outputs
+        
+    def _regular_layer(
+        self,
+        layer,
+        hidden_states,
+        attention_mask,
+        position_ids,
+        past_key_value,
+        output_attentions,
+        use_cache,
+        training,
+    ):
+        """Run layer normally."""
+        return layer(
+            hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
+            use_cache=use_cache,
             training=training,
         )
-        
-        # Add residual connection
-        hidden_states = attn_outputs[0]
-        hidden_states = residual + hidden_states
-        
-        # MLP
-        residual = hidden_states
-        hidden_states = self.layers[0].post_attention_layernorm(hidden_states)
-        
-        # Memory optimization: process MLP in chunks if needed
-        if tf.reduce_prod(tf.shape(hidden_states)) > 1024 * 1024:
-            chunk_size = 1024  # Adjust based on available memory
-            chunks = []
-            
-            for i in range(0, tf.shape(hidden_states)[1], chunk_size):
-                chunk = hidden_states[:, i:i+chunk_size, :]
-                chunk = self.layers[0].mlp(chunk, training=training)
-                chunks.append(chunk)
-                
-            hidden_states = tf.concat(chunks, axis=1)
-        else:
-            hidden_states = self.layers[0].mlp(hidden_states, training=training)
-        
-        # Add residual connection
-        hidden_states = residual + hidden_states
-        
-        # Convert back to original dtype if needed
-        if policy.name == 'mixed_float16':
-            hidden_states = tf.cast(hidden_states, tf.float32)
-        
-        outputs = (hidden_states,)
-        
-        if output_attentions:
-            outputs += (attn_outputs[1],)
-            
-        if past_key_value is not None:
-            outputs += (attn_outputs[2],)
-            
-        return outputs
 
 
 class OmniGenLayer(layers.Layer):
