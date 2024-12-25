@@ -87,7 +87,7 @@ class FinalLayer(layers.Layer):
         return x
 
 
-class PatchEmbedMR(layers.Layer):
+class PatchEmbed(layers.Layer):
     """2D Image to Patch Embedding."""
     
     def __init__(self, embed_dim=768, patch_size=16, in_chans=3, **kwargs):
@@ -133,70 +133,72 @@ class PatchEmbedMR(layers.Layer):
         return h * w
 
 
+class TimeToken(layers.Layer):
+    """Time token layer."""
+    
+    def __init__(self, embed_dim, **kwargs):
+        super().__init__(**kwargs)
+        self.mlp = tf.keras.Sequential([
+            layers.Dense(embed_dim, use_bias=True, name="mlp_0"),
+            layers.Activation('silu'),
+            layers.Dense(embed_dim, use_bias=True, name="mlp_2")
+        ])
+
+    def call(self, t):
+        t = self.mlp(t)
+        return t
+
+
 class OmniGen(Model):
     """Diffusion model with a Transformer backbone."""
     
     def __init__(
         self,
-        transformer_config: Phi3Config,
+        transformer_config,
         patch_size=16,
         in_channels=4,
-        pe_interpolation: float = 1.0,
-        pos_embed_max_size: int = 192,
+        pe_interpolation='bicubic',
+        pos_embed_max_size=1024,
+        **kwargs
     ):
-        super().__init__()
+        """Initialize model."""
+        super().__init__(**kwargs)
         
-        # Save configuration
+        # Initialize transformer with config
+        if not isinstance(transformer_config, Phi3Config):
+            transformer_config = Phi3Config(**transformer_config)
+            
         self.transformer = Phi3Transformer(transformer_config)
         self.transformer_config = transformer_config
+        
+        # Save configuration
         self.patch_size = patch_size
         self.in_channels = in_channels
-        self.out_channels = in_channels
         self.pe_interpolation = pe_interpolation
         self.pos_embed_max_size = pos_embed_max_size
         
-        hidden_size = transformer_config.hidden_size
-        
-        # Create embedders
-        self.x_embedder = PatchEmbedMR(
-            embed_dim=hidden_size,
+        # Initialize components
+        self.x_embedder = PatchEmbed(
             patch_size=patch_size,
-            in_chans=in_channels
-        )
-        self.input_x_embedder = PatchEmbedMR(
-            embed_dim=hidden_size,
-            patch_size=patch_size,
-            in_chans=in_channels
+            in_channels=in_channels,
+            embed_dim=transformer_config.hidden_size
         )
         
-        # Create time embedder
-        self.time_token = TimestepEmbedder(hidden_size)
-        
-        # Create positional embeddings
-        pos_embed = get_2d_sincos_pos_embed(
-            hidden_size, 
-            pos_embed_max_size,
-            interpolation_scale=pe_interpolation,
-            base_size=64
-        )
-        self.pos_embed = tf.Variable(
-            initial_value=pos_embed[None],
-            trainable=False,
-            name="pos_embed"
+        self.time_token = TimeToken(
+            embed_dim=transformer_config.hidden_size
         )
         
-        # Create final layer
         self.final_layer = FinalLayer(
-            hidden_size=hidden_size,
             patch_size=patch_size,
-            out_channels=self.out_channels
+            in_channels=in_channels,
+            embed_dim=transformer_config.hidden_size
         )
         
         # Memory optimization flags
         self.memory_efficient = False
         self.gradient_checkpointing = False
         self.chunk_size = None
-        
+
     def enable_memory_efficient_inference(self):
         """Enable memory efficient inference mode."""
         self.memory_efficient = True
@@ -262,8 +264,6 @@ class OmniGen(Model):
         self.weights_map.update({
             "x_embedder/proj/kernel": "x_embedder.proj.weight",
             "x_embedder/proj/bias": "x_embedder.proj.bias",
-            "input_x_embedder/proj/kernel": "input_x_embedder.proj.weight",
-            "input_x_embedder/proj/bias": "input_x_embedder.proj.bias",
         })
         
         # Final layer mappings
@@ -294,7 +294,7 @@ class OmniGen(Model):
                 _basic_init(layer)
         
         # Initialize patch_embed like Dense (instead of Conv2D)
-        for embedder in [self.x_embedder, self.input_x_embedder]:
+        for embedder in [self.x_embedder]:
             w = embedder.proj.kernel
             # Reshape to 2D for Xavier initialization
             w_flat = tf.reshape(w, [w.shape[0], -1])
@@ -333,7 +333,7 @@ class OmniGen(Model):
         x: (N, T, patch_size**2 * C)
         imgs: (N, C, H, W)
         """
-        c = self.out_channels
+        c = self.in_channels
         batch_size = tf.shape(x)[0]
         
         # Reshape to match PyTorch's dimensions
@@ -370,7 +370,7 @@ class OmniGen(Model):
                 
                 # Apply embedding (keeping NHWC format)
                 if is_input_images:
-                    x = self.input_x_embedder(x)  # Returns [B, N, C]
+                    x = self.x_embedder(x)  # Returns [B, N, C]
                 else:
                     x = self.x_embedder(x)  # Returns [B, N, C]
                 
@@ -410,7 +410,7 @@ class OmniGen(Model):
             
             # Apply embedding (keeping NHWC format)
             if is_input_images:
-                latents = self.input_x_embedder(latents)  # Returns [B, N, C]
+                latents = self.x_embedder(latents)  # Returns [B, N, C]
             else:
                 latents = self.x_embedder(latents)  # Returns [B, N, C]
             

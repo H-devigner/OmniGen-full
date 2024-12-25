@@ -6,6 +6,7 @@ import numpy as np
 from PIL import Image
 from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer
+import json
 
 from omnigen_tf.model import OmniGen
 from omnigen_tf.scheduler import OmniGenScheduler
@@ -141,9 +142,20 @@ class OmniGenPipeline:
                 ignore_patterns=['flax_model.msgpack', 'rust_model.ot', 'tf_model.h5']
             )
             
-        # Initialize components
-        model = OmniGen.from_pretrained(model_name)
+        # Load config
+        config_path = os.path.join(model_name, "config.json")
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+        else:
+            config = {}
+            
+        # Initialize components with config
+        model = OmniGen.from_pretrained(model_name, transformer_config=config)
         processor = OmniGenProcessor.from_pretrained(model_name)
         scheduler = OmniGenScheduler()
+        
+        # Enable memory optimizations by default
+        model.enable_memory_efficient_inference()
         
         return cls(model, processor, scheduler)

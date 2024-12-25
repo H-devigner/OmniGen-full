@@ -98,7 +98,8 @@ class Phi3Transformer(TFPreTrainedModel):
     
     def __init__(self, config, **kwargs):
         """Initialize transformer."""
-        super().__init__(**kwargs)
+        # Initialize parent class with config
+        super().__init__(config, **kwargs)
         
         self.config = config
         self.hidden_size = config.hidden_size
