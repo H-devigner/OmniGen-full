@@ -110,10 +110,13 @@ class OmniGenPipeline:
                 latent_model_input = tf.concat([latents] * 2, axis=0)
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
                 
+                # Convert timestep to scalar
+                timestep = tf.cast(t, tf.int32)
+                
                 # Predict noise residual
                 noise_pred = self.model(
                     latents=latent_model_input,
-                    timestep=t,
+                    timestep=timestep,
                     input_ids=input_ids,
                     attention_mask=attention_mask
                 )
@@ -128,7 +131,7 @@ class OmniGenPipeline:
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
                 
                 # Compute previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents)
+                latents = self.scheduler.step(noise_pred, timestep, latents)
                 
             # Scale and decode the image latents
             latents = latents * 0.18215

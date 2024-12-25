@@ -114,20 +114,40 @@ class PatchEmbed(layers.Layer):
         return (h // self.patch_size) * (w // self.patch_size)
 
 
-class TimeToken(layers.Layer):
-    """Time token layer."""
+class TimeToken(tf.keras.layers.Layer):
+    """Time token embedding layer."""
     
-    def __init__(self, embed_dim, **kwargs):
+    def __init__(self, hidden_size=2048, **kwargs):
+        """Initialize layer."""
         super().__init__(**kwargs)
+        self.hidden_size = hidden_size
+        
+        # Create MLP for time embedding
         self.mlp = tf.keras.Sequential([
-            layers.Dense(embed_dim, use_bias=True, name="mlp_0"),
-            layers.Activation('silu'),
-            layers.Dense(embed_dim, use_bias=True, name="mlp_2")
+            tf.keras.layers.Dense(hidden_size, activation='gelu'),
+            tf.keras.layers.Dense(hidden_size)
         ])
         
     def call(self, t):
         """Forward pass."""
+        # Reshape timestep to [batch_size, 1]
+        if len(tf.shape(t)) == 0:
+            t = tf.expand_dims(t, 0)  # Add batch dimension
+        if len(tf.shape(t)) == 1:
+            t = tf.expand_dims(t, 1)  # Add feature dimension
+            
+        # Convert to float32
+        t = tf.cast(t, tf.float32)
+        
         return self.mlp(t)
+        
+    def get_config(self):
+        """Get layer configuration."""
+        config = super().get_config()
+        config.update({
+            'hidden_size': self.hidden_size
+        })
+        return config
 
 
 class FinalLayer(layers.Layer):
@@ -480,19 +500,18 @@ class OmniGen(Model):
         batch_size = tf.shape(latents)[0]
         
         # Get input shape
-        h, w = latents.shape[1:3]
-        num_tokens = h * w // (self.patch_size ** 2)
-        shapes = (h, w)
-        input_is_list = False
-            
+        shapes = tf.shape(latents)
+        
         # Process inputs
         x = self.x_embedder(latents)
-            
+        
         # Get position embeddings
-        pos_embed = self.get_pos_embed(shapes[0], shapes[1])
+        pos_embed = self.get_pos_embed(shapes[1], shapes[2])
         
         # Add time embedding
-        t = self.time_token(timestep)
+        # Expand timestep to match batch size
+        t = tf.fill([batch_size], timestep)
+        t = self.time_token(t)
         
         # Run through transformer
         output = self.transformer(
@@ -506,20 +525,8 @@ class OmniGen(Model):
         if isinstance(output, tuple):
             output = output[0]
             
-        # Process output
-        image_embedding = output[:, -num_tokens:]
-        time_emb = self.time_token(timestep)
-        x = self.final_layer(image_embedding, time_emb)
-            
-        latents = self.unpatchify(x, shapes[0], shapes[1])
-            
-        # Clean up memory if needed
-        if self.memory_efficient and not training:
-            tf.keras.backend.clear_session()
-            gc.collect()
-            
-        return latents
-        
+        return output
+
     def call(
         self,
         latents,
