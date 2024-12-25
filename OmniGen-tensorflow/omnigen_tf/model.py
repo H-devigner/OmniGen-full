@@ -59,78 +59,59 @@ class TimestepEmbedder(Model):
         return t_emb
 
 
-class FinalLayer(layers.Layer):
-    """The final layer of DiT."""
-    
-    def __init__(self, hidden_size, patch_size, out_channels):
-        super().__init__()
-        self.norm_final = tf.keras.layers.LayerNormalization(
-            epsilon=1e-6, 
-            center=False, 
-            scale=False,
-            name="norm_final"
-        )
-        self.linear = layers.Dense(
-            patch_size * patch_size * out_channels,
-            use_bias=True,
-            name="linear"
-        )
-        self.adaLN_modulation = tf.keras.Sequential([
-            layers.Activation('silu'),
-            layers.Dense(2 * hidden_size, use_bias=True, name="adaLN_modulation_1")
-        ])
-
-    def call(self, x, c):
-        shift, scale = tf.split(self.adaLN_modulation(c), 2, axis=1)
-        x = modulate(self.norm_final(x), shift, scale)
-        x = self.linear(x)
-        return x
-
-
 class PatchEmbed(layers.Layer):
     """2D Image to Patch Embedding."""
     
-    def __init__(self, embed_dim=768, patch_size=16, in_chans=3, **kwargs):
+    def __init__(self, embed_dim=768, patch_size=16, in_channels=3, **kwargs):
         """Initialize patch embedding layer."""
         super().__init__(**kwargs)
         self.embed_dim = embed_dim
         self.patch_size = patch_size
-        self.in_chans = in_chans
+        self.in_channels = in_channels
         
         # Initialize projection layer
-        self.proj = tf.keras.layers.Conv2D(
+        self.proj = layers.Conv2D(
             filters=embed_dim,
             kernel_size=patch_size,
             strides=patch_size,
             padding='valid',
-            data_format='channels_last',  # NHWC format
             name='proj'
         )
         
     def call(self, x):
         """Forward pass."""
-        # Input should be in NHWC format
-        # Get input dimensions
-        batch_size = tf.shape(x)[0]
-        height = tf.shape(x)[1]
-        width = tf.shape(x)[2]
+        # Rearrange input to NCHW format
+        if x.shape[-1] == self.in_channels:  # NHWC format
+            x = tf.transpose(x, [0, 3, 1, 2])
+            
+        B, C, H, W = x.shape
         
-        # Calculate output dimensions
-        h = height // self.patch_size
-        w = width // self.patch_size
+        # Ensure input dimensions are compatible with patch size
+        if H % self.patch_size != 0 or W % self.patch_size != 0:
+            raise ValueError(
+                f"Input image dimensions ({H}, {W}) must be divisible by "
+                f"patch size ({self.patch_size})"
+            )
+            
+        # Convert back to NHWC for Conv2D
+        x = tf.transpose(x, [0, 2, 3, 1])
         
-        # Apply projection
-        x = self.proj(x)  # Shape: [B, H/P, W/P, C]
+        # Apply patch embedding
+        x = self.proj(x)
         
-        # Reshape to (batch, num_patches, embed_dim)
-        x = tf.reshape(x, [batch_size, h * w, self.embed_dim])
+        # Reshape to (B, N, C)
+        x = tf.reshape(x, [B, -1, self.embed_dim])
+        
         return x
-
-    def get_output_length(self, height, width):
-        """Get the number of patches that will be output."""
-        h = height // self.patch_size
-        w = width // self.patch_size
-        return h * w
+        
+    def get_num_patches(self, h, w):
+        """Get number of patches for given input dimensions."""
+        if h % self.patch_size != 0 or w % self.patch_size != 0:
+            raise ValueError(
+                f"Input image dimensions ({h}, {w}) must be divisible by "
+                f"patch size ({self.patch_size})"
+            )
+        return (h // self.patch_size) * (w // self.patch_size)
 
 
 class TimeToken(layers.Layer):
@@ -143,14 +124,37 @@ class TimeToken(layers.Layer):
             layers.Activation('silu'),
             layers.Dense(embed_dim, use_bias=True, name="mlp_2")
         ])
-
+        
     def call(self, t):
-        t = self.mlp(t)
-        return t
+        """Forward pass."""
+        return self.mlp(t)
+
+
+class FinalLayer(layers.Layer):
+    """Final layer for image generation."""
+    
+    def __init__(self, patch_size, in_channels, embed_dim, **kwargs):
+        super().__init__(**kwargs)
+        self.patch_size = patch_size
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        
+        # Initialize projection layer
+        self.proj = layers.Dense(patch_size * patch_size * in_channels, name="proj")
+        
+    def call(self, x, time_emb):
+        """Forward pass."""
+        # Add time embedding
+        x = x + time_emb[:, None, :]
+        
+        # Project to patch space
+        x = self.proj(x)
+        
+        return x
 
 
 class OmniGen(Model):
-    """Diffusion model with a Transformer backbone."""
+    """OmniGen model implementation."""
     
     def __init__(
         self,
@@ -224,58 +228,67 @@ class OmniGen(Model):
         self.weights_map = {}
         
         # Transformer mappings
-        for i in range(self.transformer.config.num_hidden_layers):
-            # Attention layers
-            self.weights_map.update({
-                f"transformer/layer_{i}/self_attn/q_proj/kernel": f"transformer.h.{i}.attn.q_proj.weight",
-                f"transformer/layer_{i}/self_attn/k_proj/kernel": f"transformer.h.{i}.attn.k_proj.weight",
-                f"transformer/layer_{i}/self_attn/v_proj/kernel": f"transformer.h.{i}.attn.v_proj.weight",
-                f"transformer/layer_{i}/self_attn/o_proj/kernel": f"transformer.h.{i}.attn.o_proj.weight",
-                # Layer norms
-                f"transformer/layer_{i}/input_layernorm/gamma": f"transformer.h.{i}.ln_1.weight",
-                f"transformer/layer_{i}/input_layernorm/beta": f"transformer.h.{i}.ln_1.bias",
-                f"transformer/layer_{i}/post_attention_layernorm/gamma": f"transformer.h.{i}.ln_2.weight",
-                f"transformer/layer_{i}/post_attention_layernorm/beta": f"transformer.h.{i}.ln_2.bias",
-                # MLP
-                f"transformer/layer_{i}/mlp/gate_up_proj/kernel": f"transformer.h.{i}.mlp.gate_up_proj.weight",
-                f"transformer/layer_{i}/mlp/down_proj/kernel": f"transformer.h.{i}.mlp.down_proj.weight",
-            })
-        
-        # Final layer norm
-        self.weights_map.update({
-            "transformer/ln_f/gamma": "transformer.ln_f.weight",
-            "transformer/ln_f/beta": "transformer.ln_f.bias",
-        })
-        
-        # Embeddings
         self.weights_map.update({
             "transformer/wte/embeddings": "transformer.wte.weight",
+            "transformer/norm/gamma": "transformer.norm.weight",
+            "transformer/norm/beta": "transformer.norm.bias",
         })
         
-        # Timestep embedder mappings
+        # Layer mappings
+        for i in range(self.transformer_config.num_hidden_layers):
+            layer_map = {
+                f"transformer/layer_{i}/input_layernorm/gamma": f"transformer.layers.{i}.input_layernorm.weight",
+                f"transformer/layer_{i}/input_layernorm/beta": f"transformer.layers.{i}.input_layernorm.bias",
+                f"transformer/layer_{i}/self_attn/qkv_proj/kernel": f"transformer.layers.{i}.self_attn.qkv_proj.weight",
+                f"transformer/layer_{i}/self_attn/qkv_proj/bias": f"transformer.layers.{i}.self_attn.qkv_proj.bias",
+                f"transformer/layer_{i}/self_attn/o_proj/kernel": f"transformer.layers.{i}.self_attn.o_proj.weight",
+                f"transformer/layer_{i}/self_attn/o_proj/bias": f"transformer.layers.{i}.self_attn.o_proj.bias",
+                f"transformer/layer_{i}/post_attention_layernorm/gamma": f"transformer.layers.{i}.post_attention_layernorm.weight",
+                f"transformer/layer_{i}/post_attention_layernorm/beta": f"transformer.layers.{i}.post_attention_layernorm.bias",
+                f"transformer/layer_{i}/mlp/gate_up_proj/kernel": f"transformer.layers.{i}.mlp.gate_up_proj.weight",
+                f"transformer/layer_{i}/mlp/gate_up_proj/bias": f"transformer.layers.{i}.mlp.gate_up_proj.bias",
+                f"transformer/layer_{i}/mlp/down_proj/kernel": f"transformer.layers.{i}.mlp.down_proj.weight",
+                f"transformer/layer_{i}/mlp/down_proj/bias": f"transformer.layers.{i}.mlp.down_proj.bias",
+            }
+            self.weights_map.update(layer_map)
+            
+        # Other components mappings
         self.weights_map.update({
+            "x_embedder/proj/kernel": "x_embedder.proj.weight",
+            "x_embedder/proj/bias": "x_embedder.proj.bias",
             "time_token/mlp_0/kernel": "time_token.mlp.0.weight",
             "time_token/mlp_0/bias": "time_token.mlp.0.bias",
             "time_token/mlp_2/kernel": "time_token.mlp.2.weight",
             "time_token/mlp_2/bias": "time_token.mlp.2.bias",
+            "final_layer/proj/kernel": "final_layer.proj.weight",
+            "final_layer/proj/bias": "final_layer.proj.bias",
         })
+
+    def load_weights_from_safetensors(self, weights_file):
+        """Load weights from safetensors file."""
+        print("Loading safetensors weights...")
+        from safetensors.torch import load_file
         
-        # Patch embedder mappings
-        self.weights_map.update({
-            "x_embedder/proj/kernel": "x_embedder.proj.weight",
-            "x_embedder/proj/bias": "x_embedder.proj.bias",
-        })
+        # Load state dict
+        state_dict = load_file(weights_file)
         
-        # Final layer mappings
-        self.weights_map.update({
-            "final_layer/norm_final/gamma": "final_layer.norm_final.weight",
-            "final_layer/norm_final/beta": "final_layer.norm_final.bias",
-            "final_layer/linear/kernel": "final_layer.linear.weight",
-            "final_layer/linear/bias": "final_layer.linear.bias",
-            "final_layer/adaLN_modulation_1/kernel": "final_layer.adaLN_modulation.1.weight",
-            "final_layer/adaLN_modulation_1/bias": "final_layer.adaLN_modulation.1.bias",
-        })
-        
+        # Convert weights to TensorFlow format
+        tf_weights = {}
+        for pt_name, param in state_dict.items():
+            # Get corresponding TF name
+            tf_name = self.weights_map.get(pt_name)
+            if tf_name is not None:
+                # Convert tensor to numpy array
+                param_np = param.numpy()
+                tf_weights[tf_name] = param_np
+                
+        # Load weights into model
+        for w in self.trainable_weights:
+            if w.name in tf_weights:
+                w.assign(tf_weights[w.name])
+                
+        print("Weights loaded successfully!")
+
     def initialize_weights(self):
         """Initialize model weights to match PyTorch implementation."""
         # Initialize transformer layers
@@ -314,17 +327,11 @@ class OmniGen(Model):
                     ))
 
         # Zero-out output layers
-        self.final_layer.adaLN_modulation.layers[-1].kernel.assign(
-            tf.zeros_like(self.final_layer.adaLN_modulation.layers[-1].kernel)
+        self.final_layer.proj.kernel.assign(
+            tf.zeros_like(self.final_layer.proj.kernel)
         )
-        self.final_layer.adaLN_modulation.layers[-1].bias.assign(
-            tf.zeros_like(self.final_layer.adaLN_modulation.layers[-1].bias)
-        )
-        self.final_layer.linear.kernel.assign(
-            tf.zeros_like(self.final_layer.linear.kernel)
-        )
-        self.final_layer.linear.bias.assign(
-            tf.zeros_like(self.final_layer.linear.bias)
+        self.final_layer.proj.bias.assign(
+            tf.zeros_like(self.final_layer.proj.bias)
         )
 
     @tf.function(jit_compile=True)
