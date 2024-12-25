@@ -589,59 +589,42 @@ class OmniGen(Model):
         return output_chunks
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args, **kwargs) -> "OmniGen":
+    def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs) -> "OmniGen":
         """Load pretrained model."""
-        config = None
+        # Get model path
         model_path = pretrained_model_name_or_path
-        
-        # Download from hub if needed
-        if not os.path.exists(pretrained_model_name_or_path):
+        if not os.path.exists(model_path):
             cache_folder = os.getenv('HF_HUB_CACHE')
             model_path = snapshot_download(
                 repo_id=pretrained_model_name_or_path,
                 cache_dir=cache_folder,
-                ignore_patterns=['*.bin', '*.msgpack', '*.ot', '*.h5']
+                ignore_patterns=['flax_model.msgpack', 'rust_model.ot', 'tf_model.h5']
             )
             
         # Load config
-        config_file = os.path.join(model_path, "config.json")
-        if os.path.exists(config_file):
-            with open(config_file, "r") as f:
+        config_path = os.path.join(model_path, "config.json")
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
                 config_dict = json.load(f)
-                
-                # Create config object with the loaded dictionary
-                config = Phi3Config(**config_dict)
         else:
-            # Use default config
-            config = Phi3Config()
+            config_dict = {}
             
+        # Update config with any provided kwargs
+        transformer_config = kwargs.pop('transformer_config', {})
+        config_dict.update(transformer_config)
+        
+        # Create config
+        config = Phi3Config(**config_dict)
+        
         # Create model
-        model = cls(config, *model_args, **kwargs)
+        model = cls(transformer_config=config, **kwargs)
         
         # Load weights
         weights_file = os.path.join(model_path, "model.safetensors")
         if os.path.exists(weights_file):
-            print("Loading safetensors weights...")
-            from safetensors.torch import load_file
-            
-            # Load state dict
-            state_dict = load_file(weights_file)
-            
-            # Convert weights to TensorFlow format
-            tf_weights = {}
-            for pt_name, param in state_dict.items():
-                # Get corresponding TF name
-                tf_name = model.weights_map.get(pt_name)
-                if tf_name is not None:
-                    # Convert tensor to numpy array
-                    param_np = param.numpy()
-                    tf_weights[tf_name] = param_np
-            
-            # Load weights into model
-            model.set_weights([tf_weights[w.name] for w in model.trainable_weights if w.name in tf_weights])
-            print("Weights loaded successfully!")
+            model.load_weights_from_safetensors(weights_file)
         else:
-            print(f"No weights file found at {weights_file}")
+            print(f"No weights found at {weights_file}")
             
         return model
 
