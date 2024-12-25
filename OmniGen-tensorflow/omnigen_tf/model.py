@@ -202,7 +202,10 @@ class OmniGen(Model):
         self.memory_efficient = False
         self.gradient_checkpointing = False
         self.chunk_size = None
-
+        
+        # Create weights mapping
+        self._create_weights_mapping()
+        
     def enable_memory_efficient_inference(self):
         """Enable memory efficient inference mode."""
         self.memory_efficient = True
