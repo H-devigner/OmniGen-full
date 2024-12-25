@@ -209,7 +209,7 @@ class OmniGen(Model):
     def enable_memory_efficient_inference(self):
         """Enable memory efficient inference mode."""
         self.memory_efficient = True
-        self.transformer.use_mixed_precision = True
+        self.gradient_checkpointing = True
         self.transformer.enable_gradient_checkpointing()
         self.chunk_size = 64  # Default chunk size, can be adjusted
         self.transformer.set_chunk_size(self.chunk_size)
@@ -217,8 +217,9 @@ class OmniGen(Model):
     def disable_memory_efficient_inference(self):
         """Disable memory efficient inference mode."""
         self.memory_efficient = False
-        self.transformer.use_mixed_precision = False
+        self.gradient_checkpointing = False
         self.transformer.disable_gradient_checkpointing()
+        self.chunk_size = None
         self.transformer.set_chunk_size(None)
         
     def set_chunk_size(self, chunk_size: int):

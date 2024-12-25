@@ -108,7 +108,7 @@ class Phi3Transformer(TFPreTrainedModel):
         self.head_dim = self.hidden_size // self.num_attention_heads
         
         # Enable memory optimization flags
-        self.gradient_checkpointing = False
+        self.gradient_checkpointing_enabled = False
         self.use_mixed_precision = True
         self.chunk_size = None  # For chunked processing
         
@@ -183,6 +183,53 @@ class Phi3Transformer(TFPreTrainedModel):
         next_layer_idx = (layer_idx + 1) % len(self.transformer.layers)
         self.prefetch_layer(next_layer_idx)
     
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing for memory efficiency."""
+        self.gradient_checkpointing_enabled = True
+        
+    def disable_gradient_checkpointing(self):
+        """Disable gradient checkpointing."""
+        self.gradient_checkpointing_enabled = False
+        
+    def set_chunk_size(self, chunk_size: Optional[int]):
+        """Set chunk size for processing large inputs."""
+        self.chunk_size = chunk_size
+        
+    def process_in_chunks(self, hidden_states):
+        """Process hidden states in chunks to save memory."""
+        if not self.chunk_size or hidden_states.shape[1] <= self.chunk_size:
+            return hidden_states
+            
+        chunks = tf.split(
+            hidden_states,
+            num_or_size_splits=[self.chunk_size] * (hidden_states.shape[1] // self.chunk_size) + [hidden_states.shape[1] % self.chunk_size],
+            axis=1
+        )
+        
+        # Remove empty chunks
+        chunks = [chunk for chunk in chunks if chunk.shape[1] > 0]
+        
+        # Process each chunk
+        processed_chunks = []
+        for chunk in chunks:
+            processed_chunk = self._process_chunk(chunk)
+            processed_chunks.append(processed_chunk)
+            
+        # Concatenate chunks
+        return tf.concat(processed_chunks, axis=1)
+        
+    def _process_chunk(self, hidden_states):
+        """Process a single chunk through the transformer layers."""
+        # Apply transformer layers
+        for layer in self.transformer.layers:
+            if self.gradient_checkpointing_enabled:
+                hidden_states = tf.stop_gradient(hidden_states)
+            hidden_states = layer(hidden_states)
+            
+        # Apply final normalization
+        hidden_states = self.ln_f(hidden_states)
+        return hidden_states
+        
     @unpack_inputs
     def call(
         self,
@@ -322,7 +369,7 @@ class OmniGenTransformer(layers.Layer):
         self.head_dim = self.hidden_size // self.num_attention_heads
         
         # Enable memory optimization flags
-        self.gradient_checkpointing = False
+        self.gradient_checkpointing_enabled = False
         self.use_mixed_precision = True
         self.chunk_size = None  # For chunked processing
         
@@ -332,26 +379,50 @@ class OmniGenTransformer(layers.Layer):
         
     def enable_gradient_checkpointing(self):
         """Enable gradient checkpointing for memory efficiency."""
-        self.gradient_checkpointing = True
+        self.gradient_checkpointing_enabled = True
         
     def disable_gradient_checkpointing(self):
         """Disable gradient checkpointing."""
-        self.gradient_checkpointing = False
+        self.gradient_checkpointing_enabled = False
         
     def set_chunk_size(self, chunk_size: Optional[int]):
         """Set chunk size for processing large inputs."""
         self.chunk_size = chunk_size
         
-    def process_in_chunks(self, fn, inputs, chunk_size):
-        """Process input in chunks to save memory."""
-        if chunk_size is None or inputs.shape[1] <= chunk_size:
-            return fn(inputs)
+    def process_in_chunks(self, hidden_states):
+        """Process hidden states in chunks to save memory."""
+        if not self.chunk_size or hidden_states.shape[1] <= self.chunk_size:
+            return hidden_states
             
-        chunks = tf.split(inputs, 
-                         num_or_size_splits=math.ceil(inputs.shape[1]/chunk_size),
-                         axis=1)
-        output_chunks = [fn(chunk) for chunk in chunks]
-        return tf.concat(output_chunks, axis=1)
+        chunks = tf.split(
+            hidden_states,
+            num_or_size_splits=[self.chunk_size] * (hidden_states.shape[1] // self.chunk_size) + [hidden_states.shape[1] % self.chunk_size],
+            axis=1
+        )
+        
+        # Remove empty chunks
+        chunks = [chunk for chunk in chunks if chunk.shape[1] > 0]
+        
+        # Process each chunk
+        processed_chunks = []
+        for chunk in chunks:
+            processed_chunk = self._process_chunk(chunk)
+            processed_chunks.append(processed_chunk)
+            
+        # Concatenate chunks
+        return tf.concat(processed_chunks, axis=1)
+        
+    def _process_chunk(self, hidden_states):
+        """Process a single chunk through the transformer layers."""
+        # Apply transformer layers
+        for layer in self.layers:
+            if self.gradient_checkpointing_enabled:
+                hidden_states = tf.stop_gradient(hidden_states)
+            hidden_states = layer(hidden_states)
+            
+        # Apply final normalization
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
         
     @unpack_inputs
     def call(
@@ -411,7 +482,7 @@ class OmniGenTransformer(layers.Layer):
         next_decoder_cache = () if use_cache else None
         
         # Use gradient checkpointing if enabled
-        layer_fn = self._checkpointed_layer if self.gradient_checkpointing else self._regular_layer
+        layer_fn = self._checkpointed_layer if self.gradient_checkpointing_enabled else self._regular_layer
         
         for idx, decoder_layer in enumerate(self.layers):
             if output_attentions:
