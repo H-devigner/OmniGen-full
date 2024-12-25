@@ -516,7 +516,7 @@ class OmniGen(Model):
         text_embeds = tf.repeat(text_embeds, batch_size, axis=0)  # Shape: [batch_size, seq_len, hidden_size]
         
         # Combine image and text embeddings
-        combined_embeds = tf.concat([text_embeds, x], axis=1)
+        hidden_states = tf.concat([text_embeds, x], axis=1)
         
         # Create combined attention mask if needed
         if attention_mask is not None:
@@ -531,7 +531,7 @@ class OmniGen(Model):
         
         # Run through transformer
         output = self.transformer(
-            inputs_embeds=combined_embeds,
+            hidden_states=hidden_states,
             attention_mask=combined_attention,
             training=training
         )
