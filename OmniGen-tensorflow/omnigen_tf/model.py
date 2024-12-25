@@ -456,17 +456,11 @@ class OmniGen(Model):
             return latents, num_tokens, [(orig_h, orig_w)]
             
     def get_pos_embed(self, height, width):
-        """Get position embeddings for given dimensions."""
-        # Convert to concrete values if tensors
-        if isinstance(height, tf.Tensor):
-            height = tf.cast(height, tf.int32)
-        if isinstance(width, tf.Tensor):
-            width = tf.cast(width, tf.int32)
-            
-        # Calculate number of patches
+        """Get position embeddings."""
+        # Convert to patches
         height = height // self.patch_size
         width = width // self.patch_size
-            
+        
         # Get base position embeddings
         pos_embed = get_2d_sincos_pos_embed(
             self.transformer.config.hidden_size,
@@ -505,8 +499,9 @@ class OmniGen(Model):
         # Process inputs
         x = self.x_embedder(latents)
         
-        # Get position embeddings
-        pos_embed = self.get_pos_embed(shapes[1], shapes[2])
+        # Get position embeddings for actual spatial dimensions
+        h, w = tf.cast(shapes[1], tf.int32), tf.cast(shapes[2], tf.int32)
+        pos_embed = self.get_pos_embed(h, w)
         
         # Add time embedding
         # Expand timestep to match batch size
@@ -526,7 +521,7 @@ class OmniGen(Model):
             output = output[0]
             
         return output
-
+        
     def call(
         self,
         latents,
@@ -616,51 +611,56 @@ class OmniGen(Model):
             
         return model
 
-def get_2d_sincos_pos_embed(embed_dim, grid_size_h, grid_size_w=None, cls_token=False, interpolation_scale=1.0, base_size=1):
-    """2D sine-cosine position embedding.
+def get_2d_sincos_pos_embed(
+    embed_dim,
+    grid_size_h,
+    grid_size_w=None,
+    cls_token=False,
+    interpolation_scale=1.0,
+    base_size=16
+):
+    """Get 2D sine-cosine positional embeddings.
     
     Args:
-        embed_dim: embedding dimension.
-        grid_size_h: number of patches in height.
-        grid_size_w: number of patches in width. If None, use grid_size_h.
-        cls_token: whether to add a cls token.
-        interpolation_scale: scale factor for interpolation
-        base_size: base grid size for interpolation
+        embed_dim: Output dimension for each position
+        grid_size_h: Number of patches in height
+        grid_size_w: Number of patches in width (default: same as height)
+        cls_token: If True, add a classification token
+        interpolation_scale: Scale factor for interpolation
+        base_size: Base size for scaling calculations
         
     Returns:
-        pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (with cls token)
+        pos_embed: Position embeddings, shape (H*W, D) or (1+H*W, D)
     """
     if grid_size_w is None:
         grid_size_w = grid_size_h
         
-    # Apply interpolation scaling
-    grid_size_h = int(grid_size_h * (base_size / interpolation_scale))
-    grid_size_w = int(grid_size_w * (base_size / interpolation_scale))
-        
+    # No interpolation scaling for now
     grid_h = np.arange(grid_size_h, dtype=np.float32)
     grid_w = np.arange(grid_size_w, dtype=np.float32)
-    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
+    grid = np.meshgrid(grid_w, grid_h)  # Here we reverse the order
     grid = np.stack(grid, axis=0)
-    
     grid = grid.reshape([2, 1, grid_size_h, grid_size_w])
+    
+    # Get positional embeddings
     pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
     if cls_token:
         pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
     return pos_embed
 
 def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
-    """2D sine-cosine position embedding from grid."""
+    """Get 2D sine-cosine positional embeddings from grid."""
     assert embed_dim % 2 == 0
     
-    # use half of dimensions to encode grid_h
+    # Use half the dimensions for each grid
     emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
     emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
     
-    emb = np.concatenate([emb_h, emb_w], axis=1) # (H*W, D)
-    return emb
+    pos_embed = np.concatenate([emb_h, emb_w], axis=1)  # (H*W, D)
+    return pos_embed
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
-    """1D sine-cosine position embedding from grid."""
+    """Get 1D sine-cosine positional embeddings from grid."""
     assert embed_dim % 2 == 0
     omega = np.arange(embed_dim // 2, dtype=np.float32)
     omega /= embed_dim / 2.
@@ -669,8 +669,8 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     pos = pos.reshape(-1)  # (M,)
     out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
     
-    emb_sin = np.sin(out) # (M, D/2)
-    emb_cos = np.cos(out) # (M, D/2)
+    emb_sin = np.sin(out)  # (M, D/2)
+    emb_cos = np.cos(out)  # (M, D/2)
     
     emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
     return emb
