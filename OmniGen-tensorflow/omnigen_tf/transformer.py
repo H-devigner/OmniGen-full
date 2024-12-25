@@ -757,13 +757,17 @@ class OmniGenAttention(layers.Layer):
             
         # Compute attention scores
         scale = tf.cast(1.0 / tf.math.sqrt(tf.cast(self.head_dim, tf.float32)), hidden_states.dtype)
-        attn_weights = tf.matmul(q, k, transpose_b=True) * scale
+        attn_weights = tf.matmul(q, k, transpose_b=True) * scale  # [batch_size, num_heads, seq_length, seq_length]
         
         # Add attention mask if provided
         if attention_mask is not None:
-            attention_mask = tf.expand_dims(attention_mask, axis=[1])  # [batch_size, 1, seq_length]
+            # Expand attention_mask: [batch_size, seq_length] -> [batch_size, 1, 1, seq_length]
+            attention_mask = tf.expand_dims(tf.expand_dims(attention_mask, axis=1), axis=1)
             attention_mask = tf.cast(attention_mask, attn_weights.dtype)
-            attn_weights = attn_weights + (1.0 - attention_mask) * -10000.0
+            
+            # Convert mask of 0s and 1s to mask of -inf and 0s
+            attention_mask = (1.0 - attention_mask) * tf.cast(-10000.0, attention_mask.dtype)
+            attn_weights = attn_weights + attention_mask
             
         # Normalize attention weights
         attn_weights = tf.nn.softmax(attn_weights, axis=-1)
