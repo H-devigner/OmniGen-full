@@ -17,38 +17,33 @@ logger = logging.get_logger(__name__)
 
 
 class Phi3Config(PretrainedConfig):
-    """Configuration class for Phi3 model."""
-    model_type = "phi3"
-    attribute_map = {
-        "num_attention_heads": "num_attention_heads",
-        "hidden_size": "hidden_size",
-        "num_hidden_layers": "num_hidden_layers"
-    }
+    """Configuration class for Phi-2 model."""
+    model_type = "phi"
     
     def __init__(
         self,
-        hidden_size: int = 2048,
-        intermediate_size: int = 8192,
-        num_hidden_layers: int = 32,
-        num_attention_heads: int = 32,
-        max_position_embeddings: int = 2048,
-        layer_norm_eps: float = 1e-5,
-        hidden_dropout: float = 0.0,
-        attention_dropout: float = 0.0,
-        initializer_range: float = 0.02,
-        use_cache: bool = True,
-        vocab_size: int = 32000,
-        tie_word_embeddings: bool = False,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
-        use_return_dict: bool = True,
-        bos_token_id: int = 1,
-        eos_token_id: int = 2,
-        pad_token_id: int = 0,
-        sep_token_id: Optional[int] = None,
-        cls_token_id: Optional[int] = None,
-        mask_token_id: Optional[int] = None,
-        unk_token_id: int = 3,
+        hidden_size=2048,
+        intermediate_size=8192,
+        num_hidden_layers=24,
+        num_attention_heads=32,
+        max_position_embeddings=2048,
+        layer_norm_eps=1e-5,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        initializer_range=0.02,
+        use_cache=True,
+        vocab_size=51200,
+        tie_word_embeddings=False,
+        output_attentions=False,
+        output_hidden_states=False,
+        use_return_dict=True,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+        sep_token_id=None,
+        cls_token_id=None,
+        mask_token_id=None,
+        unk_token_id=None,
         **kwargs
     ):
         """Initialize config."""
@@ -57,7 +52,7 @@ class Phi3Config(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
         self.max_position_embeddings = max_position_embeddings
-        self.layer_norm_eps = layer_norm_eps
+        self.layer_norm_epsilon = layer_norm_eps
         self.hidden_dropout = hidden_dropout
         self.attention_dropout = attention_dropout
         self.initializer_range = initializer_range
@@ -67,7 +62,7 @@ class Phi3Config(PretrainedConfig):
         self.output_attentions = output_attentions
         self.output_hidden_states = output_hidden_states
         
-        # Compute derived attributes
+        # Compute head dimensions
         self.head_dim = self.hidden_size // self.num_attention_heads
         if self.head_dim * self.num_attention_heads != self.hidden_size:
             raise ValueError(
@@ -75,6 +70,7 @@ class Phi3Config(PretrainedConfig):
                 f"and num_attention_heads={self.num_attention_heads})"
             )
             
+        # Initialize parent class
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -83,9 +79,35 @@ class Phi3Config(PretrainedConfig):
             cls_token_id=cls_token_id,
             mask_token_id=mask_token_id,
             unk_token_id=unk_token_id,
-            return_dict=use_return_dict,
             **kwargs
         )
+        
+    def to_dict(self):
+        """Convert config to dictionary."""
+        output = {
+            'hidden_size': self.hidden_size,
+            'intermediate_size': self.intermediate_size,
+            'num_hidden_layers': self.num_hidden_layers,
+            'num_attention_heads': self.num_attention_heads,
+            'max_position_embeddings': self.max_position_embeddings,
+            'layer_norm_eps': self.layer_norm_epsilon,
+            'hidden_dropout': self.hidden_dropout,
+            'attention_dropout': self.attention_dropout,
+            'initializer_range': self.initializer_range,
+            'use_cache': self.use_cache,
+            'vocab_size': self.vocab_size,
+            'tie_word_embeddings': self.tie_word_embeddings,
+            'output_attentions': self.output_attentions,
+            'output_hidden_states': self.output_hidden_states,
+            'pad_token_id': self.pad_token_id,
+            'bos_token_id': self.bos_token_id,
+            'eos_token_id': self.eos_token_id,
+            'sep_token_id': self.sep_token_id,
+            'cls_token_id': self.cls_token_id,
+            'mask_token_id': self.mask_token_id,
+            'unk_token_id': self.unk_token_id,
+        }
+        return output
 
 
 class Phi3Transformer(TFPreTrainedModel):
@@ -118,7 +140,7 @@ class Phi3Transformer(TFPreTrainedModel):
         
         # Initialize transformer layers
         self.transformer = OmniGenTransformer(config)
-        self.ln_f = layers.LayerNormalization(epsilon=config.layer_norm_eps, dtype='float16')
+        self.ln_f = layers.LayerNormalization(epsilon=config.layer_norm_epsilon, dtype='float16')
         
         # Setup memory optimization
         self._setup_memory_optimization()
