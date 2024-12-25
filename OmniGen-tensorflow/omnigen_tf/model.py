@@ -506,14 +506,16 @@ class OmniGen(Model):
         # Add time embedding
         # Expand timestep to match batch size
         t = tf.fill([batch_size], timestep)
-        t = self.time_token(t)
+        time_embed = self.time_token(t)
+        
+        # Combine embeddings with time embedding
+        x = x + tf.expand_dims(time_embed, axis=1)  # Add time embedding to each position
         
         # Run through transformer
         output = self.transformer(
             input_ids=input_ids,
             attention_mask=attention_mask,
             inputs_embeds=x,
-            time_embedding=t,
             training=training
         )
         
