@@ -530,7 +530,17 @@ class OmniGen(Model):
             combined_attention = None
         
         # Run through transformer
-        output = self.transformer.transformer(hidden_states, attention_mask=combined_attention, training=training)
+        output = self.transformer.transformer(
+            hidden_states,
+            attention_mask=combined_attention,
+            position_ids=None,
+            past_key_value=None,
+            output_attentions=False,
+            output_hidden_states=False,
+            use_cache=False,
+            return_dict=False,
+            training=training
+        )
         
         if isinstance(output, tuple):
             output = output[0]
