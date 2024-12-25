@@ -89,19 +89,28 @@ class FinalLayer(layers.Layer):
 class PatchEmbedMR(layers.Layer):
     """2D Image to Patch Embedding."""
     
-    def __init__(self, patch_size=2, in_chans=4, embed_dim=768, bias=True):
-        super().__init__()
-        self.proj = layers.Conv2D(
-            embed_dim,
+    def __init__(self, embed_dim=768, patch_size=16, in_chans=3, **kwargs):
+        """Initialize patch embedding layer."""
+        super().__init__(**kwargs)
+        self.embed_dim = embed_dim
+        self.patch_size = patch_size
+        self.in_chans = in_chans
+        
+        # Initialize projection layer
+        self.proj = tf.keras.layers.Conv2D(
+            filters=embed_dim,
             kernel_size=patch_size,
             strides=patch_size,
-            use_bias=bias,
-            name="proj"
+            padding='valid',
+            data_format='channels_last',  # NHWC format
+            name='proj'
         )
-
+        
     def call(self, x):
+        """Forward pass."""
+        # Input should be in NHWC format
         x = self.proj(x)
-        # NHWC -> NLC (equivalent to PyTorch's NCHW -> NLC)
+        # Reshape to (batch, sequence_length, channels)
         x = tf.reshape(x, [tf.shape(x)[0], -1, tf.shape(x)[-1]])
         return x
 
@@ -130,16 +139,14 @@ class OmniGen(Model):
         
         # Initialize embedders
         self.x_embedder = PatchEmbedMR(
-            patch_size=patch_size,
-            in_chans=in_channels,
             embed_dim=hidden_size,
-            bias=True
+            patch_size=patch_size,
+            in_chans=in_channels
         )
         self.input_x_embedder = PatchEmbedMR(
-            patch_size=patch_size,
-            in_chans=in_channels,
             embed_dim=hidden_size,
-            bias=True
+            patch_size=patch_size,
+            in_chans=in_channels
         )
         
         self.time_token = TimestepEmbedder(hidden_size)
@@ -324,16 +331,17 @@ class OmniGen(Model):
             for x in latents:
                 height = tf.shape(x)[1]
                 width = tf.shape(x)[2]
+                channels = tf.shape(x)[3]
                 
-                # Reshape to (batch, height*width, channels)
-                x = tf.reshape(x, (-1, height * width, x.shape[-1]))
-                
-                # Apply embedding
+                # Apply embedding (keeping NHWC format)
                 if is_input_images:
                     x = self.input_x_embedder(x)
                 else:
                     x = self.x_embedder(x)
                     
+                # Now reshape to (batch, sequence_length, channels)
+                x = tf.reshape(x, (-1, height * width, x.shape[-1]))
+                
                 # Add position embeddings
                 pos_embed = self.get_pos_embed(height, width)
                 x = x + pos_embed
@@ -359,16 +367,17 @@ class OmniGen(Model):
             # Handle single latent
             height = tf.shape(latents)[1]
             width = tf.shape(latents)[2]
+            channels = tf.shape(latents)[3]
             
-            # Reshape to (batch, height*width, channels)
-            latents = tf.reshape(latents, (-1, height * width, latents.shape[-1]))
-            
-            # Apply embedding
+            # Apply embedding (keeping NHWC format)
             if is_input_images:
                 latents = self.input_x_embedder(latents)
             else:
                 latents = self.x_embedder(latents)
                 
+            # Now reshape to (batch, sequence_length, channels)
+            latents = tf.reshape(latents, (-1, height * width, latents.shape[-1]))
+            
             # Add position embeddings
             pos_embed = self.get_pos_embed(height, width)
             latents = latents + pos_embed
