@@ -28,15 +28,16 @@ from .utils import (
 )
 
 class OmniGenProcessor:
-    """Processor class for OmniGen model that handles text and image inputs."""
+    """Processor for OmniGen model."""
     
-    def __init__(self, text_tokenizer, max_image_size: int = 1024):
-        self.text_tokenizer = text_tokenizer
-        self.max_image_size = max_image_size
+    def __init__(self, tokenizer=None):
+        """Initialize processor."""
+        self.tokenizer = tokenizer or AutoTokenizer.from_pretrained("microsoft/phi-2")
+        self.max_image_size = 1024
 
         # Image processing pipeline using TensorFlow
         self.image_transform = tf.keras.Sequential([
-            tf.keras.layers.Lambda(lambda img: crop_arr(img, max_image_size)),
+            tf.keras.layers.Lambda(lambda img: crop_arr(img, self.max_image_size)),
             tf.keras.layers.Lambda(lambda img: tf.cast(img, tf.float32) / 255.0),
             tf.keras.layers.Lambda(lambda img: (img - 0.5) * 2.0)  # Normalize to [-1, 1]
         ])
@@ -45,16 +46,45 @@ class OmniGenProcessor:
         self.separate_collator = OmniGenSeparateCollator()
 
     @classmethod
-    def from_pretrained(cls, model_name):
-        if not os.path.exists(model_name):
-            cache_folder = os.getenv('HF_HUB_CACHE')
-            model_name = snapshot_download(
-                repo_id=model_name,
-                cache_dir=cache_folder,
-                allow_patterns="*.json"
-            )
-        text_tokenizer = AutoTokenizer.from_pretrained(model_name)
-        return cls(text_tokenizer)
+    def from_pretrained(cls, pretrained_model_name_or_path):
+        """Load pretrained processor."""
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
+        except:
+            print("Using default Phi-2 tokenizer")
+            tokenizer = AutoTokenizer.from_pretrained("microsoft/phi-2")
+            
+        return cls(tokenizer=tokenizer)
+        
+    def __call__(
+        self,
+        prompt,
+        padding=True,
+        max_length=None,
+        truncation=True,
+        return_tensors=None,
+        **kwargs
+    ):
+        """Process text input."""
+        # Handle single string or list of strings
+        if isinstance(prompt, str):
+            prompt = [prompt]
+            
+        # Tokenize text
+        inputs = self.tokenizer(
+            prompt,
+            padding=padding,
+            max_length=max_length,
+            truncation=truncation,
+            return_tensors=return_tensors,
+            **kwargs
+        )
+        
+        return inputs
+        
+    def decode(self, token_ids, **kwargs):
+        """Decode token ids to text."""
+        return self.tokenizer.decode(token_ids, **kwargs)
 
     def process_image(self, image):
         if isinstance(image, str):
@@ -68,11 +98,11 @@ class OmniGenProcessor:
     def process_multi_modal_prompt(self, text: str, input_images: Optional[List[Union[str, Image.Image, tf.Tensor]]] = None):
         text = self.add_prefix_instruction(text)
         if input_images is None or len(input_images) == 0:
-            model_inputs = self.text_tokenizer(text)
+            model_inputs = self.tokenizer(text)
             return {"input_ids": model_inputs.input_ids, "pixel_values": None, "image_sizes": None}
 
         pattern = r"<\|image_\d+\|>"
-        prompt_chunks = [self.text_tokenizer(chunk).input_ids for chunk in re.split(pattern, text)]
+        prompt_chunks = [self.tokenizer(chunk).input_ids for chunk in re.split(pattern, text)]
 
         # Handle continuation token
         for i in range(1, len(prompt_chunks)):
@@ -120,40 +150,6 @@ class OmniGenProcessor:
         user_prompt += '# Instruction: Implement the logic for processing images in the process_image method\n'
         user_prompt += '# Instruction: Implement the logic for building combined input sequence in the process_multi_modal_prompt method\n'
         return user_prompt + prompt
-
-    def __call__(self, prompt, max_length=77, padding="max_length", truncation=True):
-        """Process text input.
-        
-        Args:
-            prompt (str or List[str]): Text prompt(s) to process
-            max_length (int): Maximum sequence length
-            padding (str): Padding strategy
-            truncation (bool): Whether to truncate sequences
-            
-        Returns:
-            dict: Processed inputs with 'input_ids' and 'attention_mask'
-        """
-        # Handle single prompt
-        if isinstance(prompt, str):
-            prompt = [prompt]
-            
-        # Tokenize
-        inputs = self.text_tokenizer(
-            prompt,
-            max_length=max_length,
-            padding=padding,
-            truncation=truncation,
-            return_tensors="tf"
-        )
-        
-        return {
-            "input_ids": inputs["input_ids"],
-            "attention_mask": inputs["attention_mask"]
-        }
-        
-    def decode(self, token_ids):
-        """Decode token IDs back to text."""
-        return self.text_tokenizer.decode(token_ids)
 
 class OmniGenCollator:
     """Collator class for OmniGen model."""

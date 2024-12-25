@@ -74,11 +74,11 @@ class OmniGenPipeline:
 
     def __call__(
         self,
-        prompt: str,
-        height: int = 512,
-        width: int = 512,
-        num_inference_steps: int = 50,
-        guidance_scale: float = 7.5,
+        prompt,
+        height=512,
+        width=512,
+        num_inference_steps=50,
+        guidance_scale=7.5,
     ):
         """Generate image from text prompt using GPU acceleration."""
         with tf.device(self.device):
@@ -90,30 +90,52 @@ class OmniGenPipeline:
                 truncation=True,
                 return_tensors="tf"
             )
+            input_ids = inputs["input_ids"]
             
             # Initialize latents on GPU
             latents_shape = (1, height // 8, width // 8, 4)
-            latents = tf.random.normal(latents_shape, dtype=tf.float16)  # Use float16 for GPU
+            latents = tf.random.normal(latents_shape)
             
             # Set timesteps
             self.scheduler.set_timesteps(num_inference_steps)
             timesteps = self.scheduler.timesteps
             
-            # Generate image
-            for t in timesteps:
-                # Run model inference on GPU
-                noise_pred = self.model(
-                    latents,
-                    t,
-                    inputs["input_ids"],
-                    inputs["attention_mask"]
-                )
-                
-                # Scheduler step on GPU
-                latents = self.scheduler.step(noise_pred, t, latents)
+            # Prepare extra kwargs for the scheduler step
+            extra_step_kwargs = {}
             
-            # Decode latents on GPU
-            image = self.decode_latents(latents)
+            # Denoising loop
+            for i, t in enumerate(timesteps):
+                # Expand latents for classifier-free guidance
+                latent_model_input = tf.concat([latents] * 2, axis=0)
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                
+                # Predict noise residual
+                with tf.GradientTape() as tape:
+                    noise_pred = self.model(
+                        input_ids=input_ids,
+                        latents=latent_model_input,
+                        timestep=t,
+                        return_dict=False
+                    )[0]
+                    
+                # Perform guidance
+                noise_pred_uncond, noise_pred_text = tf.split(noise_pred, num_or_size_splits=2, axis=0)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                
+                # Compute previous noisy sample x_t -> x_t-1
+                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs)
+                
+            # Scale and decode the image latents
+            latents = latents * 0.18215
+            image = self.model.decode(latents)
+            
+            # Post-process image
+            image = (image / 2 + 0.5) * 255
+            image = tf.clip_by_value(image, 0, 255)
+            image = tf.cast(image, tf.uint8)
+            
+            # Convert to PIL Image
+            image = Image.fromarray(image[0].numpy())
             
             return image
             
