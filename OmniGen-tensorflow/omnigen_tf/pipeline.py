@@ -110,20 +110,23 @@ class OmniGenPipeline:
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
                 
                 # Predict noise residual
-                with tf.GradientTape() as tape:
-                    noise_pred = self.model(
-                        input_ids=input_ids,
-                        latents=latent_model_input,
-                        timestep=t,
-                        return_dict=False
-                    )[0]
+                noise_pred = self.model(
+                    input_ids=input_ids,
+                    latents=latent_model_input,
+                    timestep=t
+                )
+                
+                if isinstance(noise_pred, tuple):
+                    noise_pred = noise_pred[0]
+                elif isinstance(noise_pred, dict):
+                    noise_pred = noise_pred["sample"]
                     
                 # Perform guidance
                 noise_pred_uncond, noise_pred_text = tf.split(noise_pred, num_or_size_splits=2, axis=0)
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
                 
                 # Compute previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs)
+                latents = self.scheduler.step(noise_pred, t, latents)
                 
             # Scale and decode the image latents
             latents = latents * 0.18215
