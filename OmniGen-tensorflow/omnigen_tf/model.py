@@ -512,7 +512,7 @@ class OmniGen(Model):
         x = x + tf.expand_dims(time_embed, axis=1)  # Add time embedding to each position
         
         # Get text embeddings from input_ids
-        text_embeds = self.transformer.embed_tokens(input_ids)
+        text_embeds = self.transformer.wte(input_ids)
         
         # Combine image and text embeddings
         combined_embeds = tf.concat([text_embeds, x], axis=1)
