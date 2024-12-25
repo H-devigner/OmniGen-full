@@ -109,10 +109,27 @@ class PatchEmbedMR(layers.Layer):
     def call(self, x):
         """Forward pass."""
         # Input should be in NHWC format
-        x = self.proj(x)
-        # Reshape to (batch, sequence_length, channels)
-        x = tf.reshape(x, [tf.shape(x)[0], -1, tf.shape(x)[-1]])
+        # Get input dimensions
+        batch_size = tf.shape(x)[0]
+        height = tf.shape(x)[1]
+        width = tf.shape(x)[2]
+        
+        # Calculate output dimensions
+        h = height // self.patch_size
+        w = width // self.patch_size
+        
+        # Apply projection
+        x = self.proj(x)  # Shape: [B, H/P, W/P, C]
+        
+        # Reshape to (batch, num_patches, embed_dim)
+        x = tf.reshape(x, [batch_size, h * w, self.embed_dim])
         return x
+
+    def get_output_length(self, height, width):
+        """Get the number of patches that will be output."""
+        h = height // self.patch_size
+        w = width // self.patch_size
+        return h * w
 
 
 class OmniGen(Model):
@@ -331,24 +348,28 @@ class OmniGen(Model):
             for x in latents:
                 height = tf.shape(x)[1]
                 width = tf.shape(x)[2]
-                channels = tf.shape(x)[3]
+                
+                # Store original shape for position embeddings
+                orig_h, orig_w = height, width
                 
                 # Apply embedding (keeping NHWC format)
                 if is_input_images:
-                    x = self.input_x_embedder(x)
+                    x = self.input_x_embedder(x)  # Returns [B, N, C]
                 else:
-                    x = self.x_embedder(x)
-                    
-                # Now reshape to (batch, sequence_length, channels)
-                x = tf.reshape(x, (-1, height * width, x.shape[-1]))
+                    x = self.x_embedder(x)  # Returns [B, N, C]
+                
+                # Calculate number of patches
+                num_patches = (height // self.patch_size) * (width // self.patch_size)
                 
                 # Add position embeddings
-                pos_embed = self.get_pos_embed(height, width)
+                pos_embed = self.get_pos_embed(orig_h, orig_w)
+                pos_embed = tf.reshape(pos_embed, [1, -1, self.transformer.config.hidden_size])
+                pos_embed = pos_embed[:, :num_patches, :]  # Only use as many position embeddings as patches
                 x = x + pos_embed
                 
                 all_latents.append(x)
                 all_num_tokens.append(tf.shape(x)[1])
-                all_shapes.append((height, width))
+                all_shapes.append((orig_h, orig_w))
                 
             # Pad and concatenate
             max_tokens = tf.reduce_max(all_num_tokens)
@@ -367,23 +388,27 @@ class OmniGen(Model):
             # Handle single latent
             height = tf.shape(latents)[1]
             width = tf.shape(latents)[2]
-            channels = tf.shape(latents)[3]
+            
+            # Store original shape for position embeddings
+            orig_h, orig_w = height, width
             
             # Apply embedding (keeping NHWC format)
             if is_input_images:
-                latents = self.input_x_embedder(latents)
+                latents = self.input_x_embedder(latents)  # Returns [B, N, C]
             else:
-                latents = self.x_embedder(latents)
-                
-            # Now reshape to (batch, sequence_length, channels)
-            latents = tf.reshape(latents, (-1, height * width, latents.shape[-1]))
+                latents = self.x_embedder(latents)  # Returns [B, N, C]
+            
+            # Calculate number of patches
+            num_patches = (height // self.patch_size) * (width // self.patch_size)
             
             # Add position embeddings
-            pos_embed = self.get_pos_embed(height, width)
+            pos_embed = self.get_pos_embed(orig_h, orig_w)
+            pos_embed = tf.reshape(pos_embed, [1, -1, self.transformer.config.hidden_size])
+            pos_embed = pos_embed[:, :num_patches, :]  # Only use as many position embeddings as patches
             latents = latents + pos_embed
             
             num_tokens = tf.shape(latents)[1]
-            return latents, num_tokens, [(height, width)]
+            return latents, num_tokens, [(orig_h, orig_w)]
             
     def get_pos_embed(self, height, width):
         """Get position embeddings for given dimensions."""
@@ -393,35 +418,18 @@ class OmniGen(Model):
         if isinstance(width, tf.Tensor):
             width = tf.cast(width, tf.int32)
             
-        # Check dimensions
-        if height > self.pos_embed_max_size or width > self.pos_embed_max_size:
-            # Instead of raising error, resize to max size
-            scale_factor = tf.minimum(
-                self.pos_embed_max_size / height,
-                self.pos_embed_max_size / width
-            )
-            height = tf.cast(tf.cast(height, tf.float32) * scale_factor, tf.int32)
-            width = tf.cast(tf.cast(width, tf.float32) * scale_factor, tf.int32)
+        # Calculate number of patches
+        height = height // self.patch_size
+        width = width // self.patch_size
             
         # Get base position embeddings
         pos_embed = get_2d_sincos_pos_embed(
             self.transformer.config.hidden_size,
-            int(self.pos_embed_max_size),
-            cls_token=False,
-            base_size=self.pos_embed_max_size
+            height,  # Use actual patch dimensions
+            width,   # Use actual patch dimensions
+            cls_token=False
         )
         pos_embed = tf.convert_to_tensor(pos_embed, dtype=tf.float32)
-        
-        # Interpolate to target size
-        if height != self.pos_embed_max_size or width != self.pos_embed_max_size:
-            pos_embed = tf.reshape(pos_embed, (self.pos_embed_max_size, self.pos_embed_max_size, -1))
-            pos_embed = tf.image.resize(
-                pos_embed[tf.newaxis],
-                (height, width),
-                method='bilinear'
-            )[0]
-            
-        pos_embed = tf.reshape(pos_embed, (height * width, -1))
         return pos_embed
 
     @tf.function(jit_compile=True)
