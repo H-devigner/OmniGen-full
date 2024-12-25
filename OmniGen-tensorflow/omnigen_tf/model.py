@@ -497,7 +497,7 @@ class OmniGen(Model):
         shapes = tf.shape(latents)
         
         # Process inputs
-        x = self.x_embedder(latents)
+        x = self.x_embedder(latents)  # Shape: [batch_size, num_patches, hidden_size]
         
         # Get position embeddings for actual spatial dimensions
         h, w = tf.cast(shapes[1], tf.int32), tf.cast(shapes[2], tf.int32)
@@ -511,14 +511,17 @@ class OmniGen(Model):
         # Combine embeddings with time embedding
         x = x + tf.expand_dims(time_embed, axis=1)  # Add time embedding to each position
         
-        # Get text embeddings from input_ids
-        text_embeds = self.transformer.wte(input_ids)
+        # Get text embeddings from input_ids and expand to match batch size
+        text_embeds = self.transformer.wte(input_ids)  # Shape: [1, seq_len, hidden_size]
+        text_embeds = tf.repeat(text_embeds, batch_size, axis=0)  # Shape: [batch_size, seq_len, hidden_size]
         
         # Combine image and text embeddings
         combined_embeds = tf.concat([text_embeds, x], axis=1)
         
         # Create combined attention mask if needed
         if attention_mask is not None:
+            # Expand attention mask to match batch size
+            attention_mask = tf.repeat(attention_mask, batch_size, axis=0)
             # Create attention mask for image tokens (all 1s)
             image_attention = tf.ones((batch_size, tf.shape(x)[1]), dtype=attention_mask.dtype)
             # Combine text and image attention masks
