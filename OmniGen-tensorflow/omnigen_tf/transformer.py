@@ -9,7 +9,7 @@ from tensorflow import keras
 from tensorflow.keras import layers
 
 from transformers import PretrainedConfig
-from transformers.modeling_tf_utils import TFPreTrainedModel, unpack_inputs
+from transformers.modeling_tf_utils import TFPreTrainedModel
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.utils import logging
 
@@ -252,7 +252,6 @@ class Phi3Transformer(TFPreTrainedModel):
         hidden_states = self.ln_f(hidden_states)
         return hidden_states
         
-    @unpack_inputs
     def call(
         self,
         input_ids: Optional[tf.Tensor] = None,
@@ -475,7 +474,6 @@ class OmniGenTransformer(layers.Layer):
         hidden_states = self.norm(hidden_states)
         return hidden_states
         
-    @unpack_inputs
     def call(
         self,
         hidden_states,
@@ -655,19 +653,13 @@ class OmniGenLayer(layers.Layer):
         training=False,
     ):
         """Forward pass of transformer layer with memory optimization."""
-        # Memory optimization: use mixed precision
-        policy = tf.keras.mixed_precision.global_policy()
-        if policy.name == 'mixed_float16':
-            hidden_states = tf.cast(hidden_states, tf.float16)
-            
-        residual = hidden_states
         
-        # Layer norm
+        residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         
-        # Self attention
+        # Self Attention
         attn_outputs = self.self_attn(
-            hidden_states=hidden_states,
+            hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
@@ -675,44 +667,30 @@ class OmniGenLayer(layers.Layer):
             training=training,
         )
         
-        # Add residual connection
-        hidden_states = attn_outputs[0]
-        hidden_states = residual + hidden_states
+        if isinstance(attn_outputs, tuple):
+            attn_output = attn_outputs[0]
+            attn_weights = attn_outputs[1] if len(attn_outputs) > 1 else None
+            past_key_value = attn_outputs[2] if len(attn_outputs) > 2 else None
+        else:
+            attn_output = attn_outputs
+            attn_weights = None
+            past_key_value = None
+            
+        hidden_states = attn_output + residual
         
         # MLP
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        
-        # Memory optimization: process MLP in chunks if needed
-        if tf.reduce_prod(tf.shape(hidden_states)) > 1024 * 1024:
-            chunk_size = 1024  # Adjust based on available memory
-            chunks = []
-            
-            for i in range(0, tf.shape(hidden_states)[1], chunk_size):
-                chunk = hidden_states[:, i:i+chunk_size, :]
-                chunk = self.mlp(chunk, training=training)
-                chunks.append(chunk)
-                
-            hidden_states = tf.concat(chunks, axis=1)
-        else:
-            hidden_states = self.mlp(hidden_states, training=training)
-        
-        # Add residual connection
-        hidden_states = residual + hidden_states
-        
-        # Convert back to original dtype if needed
-        if policy.name == 'mixed_float16':
-            hidden_states = tf.cast(hidden_states, tf.float32)
+        hidden_states = self.mlp(hidden_states, training=training)
+        hidden_states = hidden_states + residual
         
         outputs = (hidden_states,)
-        
         if output_attentions:
-            outputs += (attn_outputs[1],)
+            outputs += (attn_weights,)
+        if use_cache:
+            outputs += (past_key_value,)
             
-        if past_key_value is not None:
-            outputs += (attn_outputs[2],)
-            
-        return outputs
+        return outputs if len(outputs) > 1 else outputs[0]
 
 
 class OmniGenAttention(layers.Layer):
@@ -755,50 +733,58 @@ class OmniGenAttention(layers.Layer):
         position_ids=None,
         past_key_value=None,
         output_attentions=False,
+        use_cache=False,
         training=False,
     ):
         """Forward pass."""
-        bsz, q_len, _ = tf.shape(hidden_states)
+        batch_size, seq_length = tf.shape(hidden_states)[0], tf.shape(hidden_states)[1]
         
-        # Get query, key, value projections
+        # Project input to query, key, value
         qkv = self.qkv_proj(hidden_states)
-        qkv = tf.reshape(qkv, (bsz, q_len, 3, self.num_attention_heads, self.head_dim))
-        qkv = tf.transpose(qkv, (2, 0, 3, 1, 4))
+        qkv = tf.reshape(qkv, (batch_size, seq_length, 3, self.num_attention_heads, self.head_dim))
+        qkv = tf.transpose(qkv, perm=[2, 0, 3, 1, 4])
         q, k, v = tf.unstack(qkv, axis=0)
         
-        # Handle past key values
+        # Reuse past key and value if provided
         if past_key_value is not None:
-            k = tf.concat([past_key_value[0], k], axis=2)
-            v = tf.concat([past_key_value[1], v], axis=2)
+            past_key, past_value = past_key_value
+            k = tf.concat([past_key, k], axis=2)
+            v = tf.concat([past_value, v], axis=2)
             
-        if past_key_value is not None:
-            present_key_value = (k, v)
+        # Save current key and value if needed
+        if use_cache:
+            present = (k, v)
             
-        # Compute attention
-        attn_weights = tf.matmul(q, k, transpose_b=True)
-        attn_weights = attn_weights * tf.math.rsqrt(tf.cast(self.head_dim, attn_weights.dtype))
+        # Compute attention scores
+        scale = tf.cast(1.0 / tf.math.sqrt(tf.cast(self.head_dim, tf.float32)), hidden_states.dtype)
+        attn_weights = tf.matmul(q, k, transpose_b=True) * scale
         
+        # Add attention mask if provided
         if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
+            attention_mask = tf.expand_dims(attention_mask, axis=[1])  # [batch_size, 1, seq_length]
+            attention_mask = tf.cast(attention_mask, attn_weights.dtype)
+            attn_weights = attn_weights + (1.0 - attention_mask) * -10000.0
             
+        # Normalize attention weights
         attn_weights = tf.nn.softmax(attn_weights, axis=-1)
         attn_weights = self.attention_dropout(attn_weights, training=training)
         
+        # Compute attention output
         attn_output = tf.matmul(attn_weights, v)
-        attn_output = tf.transpose(attn_output, (0, 2, 1, 3))
-        attn_output = tf.reshape(attn_output, (bsz, q_len, self.hidden_size))
+        attn_output = tf.transpose(attn_output, perm=[0, 2, 1, 3])
+        attn_output = tf.reshape(attn_output, (batch_size, seq_length, self.hidden_size))
         
-        # Output projection
+        # Project output
         attn_output = self.o_proj(attn_output)
         attn_output = self.resid_dropout(attn_output, training=training)
         
         outputs = (attn_output,)
         if output_attentions:
             outputs += (attn_weights,)
-        if past_key_value is not None:
-            outputs += (present_key_value,)
+        if use_cache:
+            outputs += (present,)
             
-        return outputs
+        return outputs if len(outputs) > 1 else outputs[0]
 
 
 class OmniGenMLP(layers.Layer):
