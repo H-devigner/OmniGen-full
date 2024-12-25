@@ -353,6 +353,35 @@ class Phi3Transformer(TFPreTrainedModel):
             "hidden_states": all_hidden_states,
             "attentions": all_self_attns,
         }
+        
+    def get_config(self):
+        """Get model configuration."""
+        config = super().get_config()
+        config.update({
+            'config': self.config.to_dict(),
+            'gradient_checkpointing_enabled': self.gradient_checkpointing_enabled,
+            'use_mixed_precision': self.use_mixed_precision,
+            'chunk_size': self.chunk_size,
+        })
+        return config
+        
+    @classmethod
+    def from_config(cls, config):
+        """Create model from configuration."""
+        # Extract transformer config
+        transformer_config = config.pop('config', None)
+        if transformer_config is not None:
+            transformer_config = Phi3Config(**transformer_config)
+            
+        # Create model
+        model = cls(config=transformer_config)
+        
+        # Set optimization flags
+        model.gradient_checkpointing_enabled = config.get('gradient_checkpointing_enabled', False)
+        model.use_mixed_precision = config.get('use_mixed_precision', False)
+        model.chunk_size = config.get('chunk_size', None)
+        
+        return model
 
 
 class OmniGenTransformer(layers.Layer):

@@ -599,6 +599,29 @@ class OmniGen(Model):
         # Combine chunks
         return output_chunks
 
+    def get_config(self):
+        """Get model configuration."""
+        config = super().get_config()
+        config.update({
+            'transformer_config': self.transformer_config.to_dict(),
+            'patch_size': self.patch_size,
+            'in_channels': self.in_channels,
+            'pe_interpolation': self.pe_interpolation,
+            'pos_embed_max_size': self.pos_embed_max_size,
+        })
+        return config
+        
+    @classmethod
+    def from_config(cls, config):
+        """Create model from configuration."""
+        # Extract transformer config
+        transformer_config = config.pop('transformer_config', None)
+        if transformer_config is not None:
+            transformer_config = Phi3Config(**transformer_config)
+            
+        # Create model
+        return cls(transformer_config=transformer_config, **config)
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs) -> "OmniGen":
         """Load pretrained model."""

@@ -59,14 +59,19 @@ class OmniGenPipeline:
         self.model_to_device()
         
     def model_to_device(self):
-        """Move model to specified device."""
-        with tf.device(self.device):
-            # Use mixed precision for better performance
+        """Move model to device and set to eval mode."""
+        # Enable mixed precision if using GPU
+        if self.device == "/GPU:0":
             tf.keras.mixed_precision.set_global_policy('mixed_float16')
             
-            # Ensure model is using the device
-            self.model = tf.keras.models.clone_model(self.model)
+        # Create a new model instance with the same config
+        with tf.device(self.device):
+            config = self.model.get_config()
+            self.model = self.model.__class__.from_config(config)
             
+            # Copy weights from original model
+            self.model.set_weights(self.model.get_weights())
+
     def __call__(
         self,
         prompt: str,
