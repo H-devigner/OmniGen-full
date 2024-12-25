@@ -278,22 +278,130 @@ class DDIMScheduler:
 
 class OmniGenScheduler:
     """Scheduler for OmniGen model."""
-
-    def __init__(self, num_steps: int = 50, time_shifting_factor: int = 1):
-        """Initialize scheduler.
+    
+    def __init__(
+        self,
+        num_train_timesteps=1000,
+        beta_start=0.00085,
+        beta_end=0.012,
+        beta_schedule="scaled_linear",
+        clip_sample=False,
+        set_alpha_to_one=False,
+        steps_offset=0,
+        prediction_type="epsilon",
+        **kwargs
+    ):
+        """Initialize scheduler."""
+        self.num_train_timesteps = num_train_timesteps
+        self.beta_start = beta_start
+        self.beta_end = beta_end
+        self.beta_schedule = beta_schedule
+        self.clip_sample = clip_sample
+        self.set_alpha_to_one = set_alpha_to_one
+        self.steps_offset = steps_offset
+        self.prediction_type = prediction_type
         
-        Args:
-            num_steps: Number of diffusion steps
-            time_shifting_factor: Factor for time shifting
-        """
-        self.num_steps = num_steps
-        self.time_shift = time_shifting_factor
-
-        # Precompute sigma values with better precision
-        with tf.device("/CPU:0"):
-            t = tf.cast(tf.linspace(0.0, 1.0, num_steps + 1), tf.float32)
-            t = t / (t + time_shifting_factor - time_shifting_factor * t)
-            self.sigma = t
+        # Initialize betas and alphas
+        if beta_schedule == "linear":
+            self.betas = tf.linspace(beta_start, beta_end, num_train_timesteps)
+        elif beta_schedule == "scaled_linear":
+            # Scale the betas linearly
+            self.betas = tf.linspace(beta_start ** 0.5, beta_end ** 0.5, num_train_timesteps) ** 2
+        else:
+            raise ValueError(f"Unknown beta schedule: {beta_schedule}")
+            
+        self.alphas = 1.0 - self.betas
+        self.alphas_cumprod = tf.math.cumprod(self.alphas, axis=0)
+        
+        # Store for easy access
+        self.final_alpha_cumprod = self.alphas_cumprod[-1]
+        
+        # For noise prediction
+        self.init_noise_sigma = 1.0
+        
+    def set_timesteps(self, num_inference_steps):
+        """Set timesteps for inference."""
+        self.num_inference_steps = num_inference_steps
+        
+        # Create evenly spaced timesteps
+        timesteps = tf.linspace(
+            self.num_train_timesteps - 1,
+            0,
+            num_inference_steps
+        )
+        
+        # Add offset and cast to int
+        self.timesteps = tf.cast(timesteps + self.steps_offset, tf.int32)
+        self.sigmas = tf.zeros_like(timesteps)  # For compatibility
+        
+    def _get_variance(self, timestep, prev_timestep):
+        """Get variance for given timestep."""
+        alpha_prod_t = self.alphas_cumprod[timestep]
+        alpha_prod_t_prev = self.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.final_alpha_cumprod
+        beta_prod_t = 1 - alpha_prod_t
+        beta_prod_t_prev = 1 - alpha_prod_t_prev
+        
+        variance = (beta_prod_t_prev / beta_prod_t) * (1 - alpha_prod_t / alpha_prod_t_prev)
+        
+        return variance
+        
+    def scale_model_input(self, sample, timestep):
+        """Scale input sample for model."""
+        timestep = tf.cast(timestep, tf.int32)
+        
+        # Get step index
+        step_index = tf.where(self.timesteps == timestep)[0][0]
+        
+        # No scaling needed for DDPM
+        return sample
+        
+    def step(
+        self,
+        model_output,
+        timestep,
+        sample,
+        return_dict=True,
+        **kwargs
+    ):
+        """Predict the sample at the previous timestep."""
+        # Cast timestep to int
+        timestep = tf.cast(timestep, tf.int32)
+        
+        # Get step index
+        step_index = tf.where(self.timesteps == timestep)[0][0]
+        prev_timestep = self.timesteps[step_index + 1] if step_index < len(self.timesteps) - 1 else 0
+        
+        # Get alpha values
+        alpha_prod_t = self.alphas_cumprod[timestep]
+        alpha_prod_t_prev = self.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.final_alpha_cumprod
+        beta_prod_t = 1 - alpha_prod_t
+        
+        # Compute predicted original sample
+        if self.prediction_type == "epsilon":
+            pred_original_sample = (sample - beta_prod_t ** 0.5 * model_output) / alpha_prod_t ** 0.5
+        elif self.prediction_type == "sample":
+            pred_original_sample = model_output
+        else:
+            raise ValueError(f"Unknown prediction type {self.prediction_type}")
+            
+        # Get coefficients for pred original sample and current sample
+        pred_sample_coeff = (alpha_prod_t_prev ** 0.5 * beta_prod_t) / beta_prod_t
+        current_sample_coeff = alpha_prod_t ** 0.5 * (1 - alpha_prod_t_prev) / beta_prod_t
+        
+        # Get predicted previous sample
+        pred_prev_sample = pred_sample_coeff * pred_original_sample + current_sample_coeff * sample
+        
+        # Add noise
+        variance = 0 if step_index == len(self.timesteps) - 1 else self._get_variance(timestep, prev_timestep)
+        std_dev = tf.math.sqrt(variance)
+        if self.clip_sample:
+            pred_prev_sample = tf.clip_by_value(pred_prev_sample, -1, 1)
+            
+        if variance > 0:
+            noise = tf.random.normal(pred_prev_sample.shape) * std_dev
+            pred_prev_sample = pred_prev_sample + noise
+            
+        return pred_prev_sample
 
     @tf.function(jit_compile=True)
     def crop_kv_cache(self, past_key_values, num_tokens_for_img):
@@ -337,18 +445,16 @@ class OmniGenScheduler:
         batch_size = tf.shape(z)[0]
         timesteps = tf.zeros([batch_size], dtype=tf.float32)
 
-        for i in tqdm(range(self.num_steps)):
+        for i in tqdm(range(self.num_inference_steps)):
             # Update timesteps efficiently
-            timesteps = tf.fill([batch_size], self.sigma[i])
+            timesteps = tf.fill([batch_size], self.timesteps[i])
             
             # Run model step
             with tf.GradientTape() as tape:
                 pred, cache = func(z, timesteps, cache=cache, **model_kwargs)
             
             # Update z with better precision
-            sigma_next = self.sigma[i + 1]
-            sigma = self.sigma[i]
-            z = tf.add(z, (sigma_next - sigma) * pred)
+            z = tf.add(z, (self.timesteps[i + 1] - self.timesteps[i]) * pred)
 
             if i == 0 and use_kv_cache:
                 # Update model kwargs for caching with XLA optimization
@@ -412,142 +518,3 @@ def _get_timestep_embedding(timesteps, embedding_dim: int, dtype=None):
     if dtype is not None:
         emb = tf.cast(emb, dtype)
     return emb
-
-
-class OmniGenScheduler:
-    """Scheduler for OmniGen model."""
-    
-    def __init__(
-        self,
-        num_train_timesteps: int = 1000,
-        beta_start: float = 0.00085,
-        beta_end: float = 0.012,
-        beta_schedule: str = "scaled_linear",
-        trained_betas: Optional[np.ndarray] = None,
-        clip_sample: bool = True,
-        prediction_type: str = "epsilon",
-        **kwargs,
-    ):
-        """Initialize scheduler.
-        
-        Args:
-            num_train_timesteps: Number of diffusion steps used to train the model.
-            beta_start: Starting value for beta schedule.
-            beta_end: Ending value for beta schedule.
-            beta_schedule: Beta schedule, either "linear" or "scaled_linear".
-            trained_betas: Optional pre-defined beta schedule.
-            clip_sample: Whether to clip predicted sample between -1 and 1.
-            prediction_type: Prediction type, either "epsilon" or "sample".
-        """
-        self.num_train_timesteps = num_train_timesteps
-        self.beta_start = beta_start
-        self.beta_end = beta_end
-        self.beta_schedule = beta_schedule
-        self.trained_betas = trained_betas
-        self.clip_sample = clip_sample
-        self.prediction_type = prediction_type
-        
-        # Initialize timesteps and betas
-        self.timesteps = None
-        if trained_betas is not None:
-            self.betas = tf.constant(trained_betas, dtype=tf.float32)
-        elif beta_schedule == "linear":
-            self.betas = tf.linspace(beta_start, beta_end, num_train_timesteps)
-        elif beta_schedule == "scaled_linear":
-            # Glide/DDPM schedule
-            betas = tf.linspace(beta_start ** 0.5, beta_end ** 0.5, num_train_timesteps) ** 2
-            self.betas = tf.cast(betas, tf.float32)
-        else:
-            raise ValueError(f"Unknown beta schedule: {beta_schedule}")
-            
-        # Pre-compute values
-        self.alphas = 1.0 - self.betas
-        self.alphas_cumprod = tf.math.cumprod(self.alphas)
-        self.one = tf.constant(1.0, dtype=tf.float32)
-        
-        # For caching during inference
-        self.num_inference_steps = None
-        self.timestep_map = None
-        
-    def set_timesteps(self, num_inference_steps: int):
-        """Set the timesteps used for the diffusion chain.
-        
-        Args:
-            num_inference_steps: Number of diffusion steps to run.
-        """
-        if self.num_inference_steps == num_inference_steps:
-            return
-            
-        self.num_inference_steps = num_inference_steps
-        
-        # Create evenly spaced timesteps
-        timesteps = tf.linspace(0, self.num_train_timesteps - 1, num_inference_steps)
-        self.timesteps = tf.cast(tf.reverse(timesteps, axis=[0]), tf.int32)  # Flip for denoising
-        
-        # Create timestep map for fast lookup
-        self.timestep_map = tf.zeros(self.num_train_timesteps, dtype=tf.int32)
-        indices = tf.cast(self.timesteps, tf.int32)
-        updates = tf.range(len(self.timesteps))
-        self.timestep_map = tf.tensor_scatter_nd_update(
-            self.timestep_map,
-            indices[:, None],
-            updates
-        )
-        
-    def _get_variance(self, timestep: int) -> tf.Tensor:
-        """Get variance for given timestep."""
-        prev_t = timestep - 1 if timestep > 0 else 0
-        
-        alpha_prod_t = self.alphas_cumprod[timestep]
-        alpha_prod_t_prev = self.alphas_cumprod[prev_t] if prev_t >= 0 else self.one
-        
-        current_beta_t = 1 - alpha_prod_t / alpha_prod_t_prev
-        
-        # For t > 0, compute predicted variance βt (see formula (6) and (7) from https://arxiv.org/pdf/2006.11239.pdf)
-        # and sample from it to get previous sample
-        # x_{t-1} ~ N(pred_prev_sample, variance) == add variance to pred_sample
-        variance = (1 - alpha_prod_t_prev) / (1 - alpha_prod_t) * current_beta_t
-        
-        return variance
-        
-    def step(
-        self,
-        model_output: tf.Tensor,
-        timestep: int,
-        sample: tf.Tensor,
-        return_dict: bool = True,
-    ) -> Union[tf.Tensor, Tuple[tf.Tensor, tf.Tensor]]:
-        """Predict the sample from the previous timestep by reversing the SDE.
-        
-        Args:
-            model_output: Direct output from learned diffusion model.
-            timestep: Current discrete timestep in the diffusion chain.
-            sample: Current instance of sample being created by diffusion process.
-            return_dict: Whether to return output as dict or tuple.
-            
-        Returns:
-            pred_prev_sample: Predicted previous sample
-        """
-        # Get alphas for current and previous timestep
-        alpha_prod_t = self.alphas_cumprod[timestep]
-        alpha_prod_t_prev = self.alphas_cumprod[timestep - 1] if timestep > 0 else self.one
-        beta_prod_t = 1 - alpha_prod_t
-        beta_prod_t_prev = 1 - alpha_prod_t_prev
-        
-        # For t > 0, compute predicted original sample from predicted noise also called
-        # "predicted x_0" of formula (15) from https://arxiv.org/pdf/2006.11239.pdf
-        if self.prediction_type == "epsilon":
-            pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
-        elif self.prediction_type == "sample":
-            pred_original_sample = model_output
-        else:
-            raise ValueError(f"prediction_type given as {self.prediction_type} must be one of `epsilon`, or `sample`")
-            
-        # Get previous sample based on (x_0, x_t)
-        pred_prev_sample = (alpha_prod_t_prev ** (0.5) * pred_original_sample +
-                          beta_prod_t_prev ** (0.5) * model_output)
-        
-        if self.clip_sample:
-            pred_prev_sample = tf.clip_by_value(pred_prev_sample, -1, 1)
-            
-        return pred_prev_sample
