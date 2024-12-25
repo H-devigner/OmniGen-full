@@ -421,71 +421,71 @@ class OmniGen(Model):
         pos_embed = tf.convert_to_tensor(pos_embed, dtype=tf.float32)
         return pos_embed
 
-    @tf.function(jit_compile=True)
-    def call(self, x, timestep, input_ids=None, input_img_latents=None,
-            input_image_sizes=None, attention_mask=None, position_ids=None,
-            padding_latent=None, past_key_values=None, return_past_key_values=True,
-            offload_model=False, training=False):
-        """Forward pass of the model."""
-        input_is_list = isinstance(x, list)
-        x, num_tokens, shapes = self.patch_multiple_resolutions(x, padding_latent)
+    def __call__(self, latents, timestep, input_ids=None, attention_mask=None):
+        """Forward pass.
         
-        # Get time token
-        time_token = self.time_token(timestep)
-        time_token = tf.expand_dims(time_token, 1)
+        Args:
+            latents: Input latents
+            timestep: Current timestep
+            input_ids: Text token IDs
+            attention_mask: Attention mask for text tokens
+            
+        Returns:
+            Predicted noise
+        """
+        # Clear memory
+        tf.keras.backend.clear_session()
         
-        if input_img_latents is not None:
-            input_latents, _, _ = self.patch_multiple_resolutions(
-                input_img_latents, is_input_images=True
-            )
-            
-        if input_ids is not None:
-            condition_embeds = self.transformer.embed_tokens(input_ids)
-            input_img_inx = 0
-            
-            for b_inx in input_image_sizes.keys():
-                for start_inx, end_inx in input_image_sizes[b_inx]:
-                    condition_embeds = tf.tensor_scatter_nd_update(
-                        condition_embeds,
-                        [[b_inx, i] for i in range(start_inx, end_inx)],
-                        input_latents[input_img_inx]
-                    )
-                    input_img_inx += 1
-                    
-            if input_img_latents is not None:
-                tf.debugging.assert_equal(
-                    input_img_inx,
-                    len(input_latents),
-                    "Number of input images doesn't match"
-                )
-            
-            input_emb = tf.concat([condition_embeds, time_token, x], axis=1)
+        # Get batch size
+        batch_size = tf.shape(latents)[0]
+        
+        # Get input shape
+        if isinstance(latents, list):
+            shapes = [(x.shape[1], x.shape[2]) for x in latents]
+            num_tokens = [h * w // (self.patch_size ** 2) for h, w in shapes]
+            max_num_tokens = max(num_tokens)
+            input_is_list = True
         else:
-            input_emb = tf.concat([time_token, x], axis=1)
+            h, w = latents.shape[1:3]
+            num_tokens = h * w // (self.patch_size ** 2)
+            shapes = (h, w)
+            input_is_list = False
             
+        # Process inputs
+        if input_is_list:
+            # Handle list of latents
+            x = [self.x_embedder(lat) for lat in latents]
+            max_len = max([xi.shape[1] for xi in x])
+            x = [tf.pad(xi, [[0,0], [0, max_len - xi.shape[1]], [0,0]]) for xi in x]
+            x = tf.concat(x, axis=0)
+        else:
+            x = self.x_embedder(latents)
+            
+        # Get position embeddings
+        pos_embed = self.get_pos_embed(shapes[0], shapes[1])
+        
+        # Add time embedding
+        t = self.time_token(timestep)
+        
         # Run through transformer
         output = self.transformer(
-            inputs_embeds=input_emb,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            training=training
+            x,
+            pos_embed,
+            t,
+            input_ids,
+            attention_mask,
+            training=False
         )
         
-        if return_past_key_values:
-            output, past_key_values = output.last_hidden_state, output.past_key_values
-        else:
-            output = output.last_hidden_state
-            
+        # Process output
         if input_is_list:
             image_embedding = output[:, -tf.reduce_max(num_tokens):]
             time_emb = self.time_token(timestep)
             x = self.final_layer(image_embedding, time_emb)
             
             latents = []
-            for i in range(tf.shape(x)[0]):
-                latent = x[i:i+1, :num_tokens[i]]
-                latent = self.unpatchify(latent, shapes[i][0], shapes[i][1])
+            for i, (h, w) in enumerate(shapes):
+                latent = self.unpatchify(x[i:i+1], h, w)
                 latents.append(latent)
         else:
             image_embedding = output[:, -num_tokens:]
@@ -493,8 +493,9 @@ class OmniGen(Model):
             x = self.final_layer(image_embedding, time_emb)
             latents = self.unpatchify(x, shapes[0], shapes[1])
             
-        if return_past_key_values:
-            return latents, past_key_values
+        # Clear memory again
+        tf.keras.backend.clear_session()
+            
         return latents
 
     @classmethod

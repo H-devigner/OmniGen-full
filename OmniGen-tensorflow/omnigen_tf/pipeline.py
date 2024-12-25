@@ -98,7 +98,14 @@ class OmniGenPipeline:
         else:
             print(f"Warning: Unknown model type, cannot move to {device}")
             
-    def __call__(self, prompt, height=512, width=512, num_inference_steps=50, guidance_scale=7.5):
+    def __call__(
+        self,
+        prompt: str,
+        height: int = 512,
+        width: int = 512,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.5,
+    ):
         """Generate image from text prompt.
         
         Args:
@@ -106,26 +113,31 @@ class OmniGenPipeline:
             height: Output image height
             width: Output image width
             num_inference_steps: Number of denoising steps
-            guidance_scale: Classifier-free guidance scale
+            guidance_scale: Scale for classifier-free guidance
             
         Returns:
-            PIL.Image: Generated image
+            Generated image
         """
-        # Process prompt
-        inputs = self.processor(prompt)
+        # Clear any existing GPU memory
+        tf.keras.backend.clear_session()
         
-        # Get input shape
-        batch_size = inputs["input_ids"].shape[0]
+        # Process inputs
+        inputs = self.processor(
+            prompt,
+            padding="max_length",
+            max_length=77,
+            return_tensors="tf"
+        )
         
         # Initialize latents
-        latents_shape = (batch_size, 4, height // 8, width // 8)
-        latents = tf.random.normal(latents_shape)
+        latents_shape = (1, height // 8, width // 8, 4)
+        latents = tf.random.normal(latents_shape, dtype=tf.float32)
         
         # Set timesteps
         self.scheduler.set_timesteps(num_inference_steps)
         timesteps = self.scheduler.timesteps
         
-        # Denoising loop
+        # Generate image
         for t in timesteps:
             # Get model prediction
             with tf.device(self.device):
@@ -139,13 +151,26 @@ class OmniGenPipeline:
             # Scheduler step
             latents = self.scheduler.step(noise_pred, t, latents)
             
-        # Decode latents to image
-        with tf.device(self.device):
-            image = self.model.decode_latents(latents)
-            
-        # Convert to PIL
-        image = tf.cast((image + 1.0) * 127.5, tf.uint8)
-        image = tf.transpose(image, [0, 2, 3, 1])
-        image = Image.fromarray(image[0].numpy())
+            # Free up memory
+            tf.keras.backend.clear_session()
         
+        # Decode latents
+        image = self.decode_latents(latents)
+        
+        return image
+        
+    def decode_latents(self, latents):
+        """Decode latents to image."""
+        # Scale and decode the image latents with vae
+        latents = 1 / 0.18215 * latents
+        
+        # Convert to PIL image
+        image = tf.transpose(latents, [0, 3, 1, 2])  # NCHW
+        image = ((image + 1) / 2) * 255
+        image = tf.clip_by_value(image, 0, 255)
+        image = tf.cast(image, tf.uint8)
+        
+        # Convert to PIL
+        image = image[0].numpy()
+        image = Image.fromarray(np.transpose(image, [1, 2, 0]))
         return image
