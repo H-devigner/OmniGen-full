@@ -332,73 +332,72 @@ class OmniGenTransformer(layers.Layer):
         
     def call(
         self,
-        hidden_states: tf.Tensor,
-        attention_mask: Optional[tf.Tensor] = None,
-        position_ids: Optional[tf.Tensor] = None,
-        past_key_values: Optional[Tuple[Tuple[tf.Tensor]]] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        training: bool = False,
-    ) -> Union[tf.Tensor, Tuple[tf.Tensor, ...], Dict[str, tf.Tensor]]:
-        """Forward pass."""
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        
-        # Initialize outputs
-        all_hidden_states = () if output_hidden_states else None
-        all_self_attentions = () if output_attentions else None
-        next_decoder_cache = () if use_cache else None
-        
-        # Process through layers
-        for i, layer in enumerate(self.layers):
-            if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states,)
-                
-            layer_outputs = layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_values[i] if past_key_values is not None else None,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                training=training,
-            )
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        output_attentions=False,
+        training=False,
+    ):
+        """Forward pass of transformer with memory optimization."""
+        # Memory optimization: use mixed precision
+        policy = tf.keras.mixed_precision.global_policy()
+        if policy.name == 'mixed_float16':
+            hidden_states = tf.cast(hidden_states, tf.float16)
             
-            hidden_states = layer_outputs[0]
-            
-            if use_cache:
-                next_decoder_cache += (layer_outputs[-1],)
-                
-            if output_attentions:
-                all_self_attentions = all_self_attentions + (layer_outputs[1],)
-                
-        # Final layer norm
+        residual = hidden_states
+        
+        # Layer norm
         hidden_states = self.norm(hidden_states)
         
-        # Add last hidden state
-        if output_hidden_states:
-            all_hidden_states = all_hidden_states + (hidden_states,)
+        # Self attention
+        attn_outputs = self.layers[0].self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            training=training,
+        )
+        
+        # Add residual connection
+        hidden_states = attn_outputs[0]
+        hidden_states = residual + hidden_states
+        
+        # MLP
+        residual = hidden_states
+        hidden_states = self.layers[0].post_attention_layernorm(hidden_states)
+        
+        # Memory optimization: process MLP in chunks if needed
+        if tf.reduce_prod(tf.shape(hidden_states)) > 1024 * 1024:
+            chunk_size = 1024  # Adjust based on available memory
+            chunks = []
             
-        if not return_dict:
-            return tuple(v for v in [
-                hidden_states,
-                next_decoder_cache,
-                all_hidden_states,
-                all_self_attentions,
-            ] if v is not None)
+            for i in range(0, tf.shape(hidden_states)[1], chunk_size):
+                chunk = hidden_states[:, i:i+chunk_size, :]
+                chunk = self.layers[0].mlp(chunk, training=training)
+                chunks.append(chunk)
+                
+            hidden_states = tf.concat(chunks, axis=1)
+        else:
+            hidden_states = self.layers[0].mlp(hidden_states, training=training)
+        
+        # Add residual connection
+        hidden_states = residual + hidden_states
+        
+        # Convert back to original dtype if needed
+        if policy.name == 'mixed_float16':
+            hidden_states = tf.cast(hidden_states, tf.float32)
+        
+        outputs = (hidden_states,)
+        
+        if output_attentions:
+            outputs += (attn_outputs[1],)
             
-        return {
-            "last_hidden_state": hidden_states,
-            "past_key_values": next_decoder_cache,
-            "hidden_states": all_hidden_states,
-            "attentions": all_self_attentions,
-        }
+        if past_key_value is not None:
+            outputs += (attn_outputs[2],)
+            
+        return outputs
 
 
 class OmniGenLayer(layers.Layer):
@@ -421,41 +420,71 @@ class OmniGenLayer(layers.Layer):
         
     def call(
         self,
-        hidden_states: tf.Tensor,
-        attention_mask: Optional[tf.Tensor] = None,
-        position_ids: Optional[tf.Tensor] = None,
-        past_key_value: Optional[Tuple[tf.Tensor]] = None,
-        output_attentions: Optional[bool] = False,
-        use_cache: Optional[bool] = False,
-        training: bool = False,
-    ) -> Tuple[tf.Tensor, ...]:
-        """Forward pass."""
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        output_attentions=False,
+        use_cache=False,
+        training=False,
+    ):
+        """Forward pass of transformer layer with memory optimization."""
+        # Memory optimization: use mixed precision
+        policy = tf.keras.mixed_precision.global_policy()
+        if policy.name == 'mixed_float16':
+            hidden_states = tf.cast(hidden_states, tf.float16)
+            
         residual = hidden_states
         
-        # Self attention
+        # Layer norm
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        
+        # Self attention
+        attn_outputs = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
-            use_cache=use_cache,
             training=training,
         )
+        
+        # Add residual connection
+        hidden_states = attn_outputs[0]
         hidden_states = residual + hidden_states
         
         # MLP
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        
+        # Memory optimization: process MLP in chunks if needed
+        if tf.reduce_prod(tf.shape(hidden_states)) > 1024 * 1024:
+            chunk_size = 1024  # Adjust based on available memory
+            chunks = []
+            
+            for i in range(0, tf.shape(hidden_states)[1], chunk_size):
+                chunk = hidden_states[:, i:i+chunk_size, :]
+                chunk = self.mlp(chunk, training=training)
+                chunks.append(chunk)
+                
+            hidden_states = tf.concat(chunks, axis=1)
+        else:
+            hidden_states = self.mlp(hidden_states, training=training)
+        
+        # Add residual connection
         hidden_states = residual + hidden_states
         
+        # Convert back to original dtype if needed
+        if policy.name == 'mixed_float16':
+            hidden_states = tf.cast(hidden_states, tf.float32)
+        
         outputs = (hidden_states,)
+        
         if output_attentions:
-            outputs += (self_attn_weights,)
-        if use_cache:
-            outputs += (present_key_value,)
+            outputs += (attn_outputs[1],)
+            
+        if past_key_value is not None:
+            outputs += (attn_outputs[2],)
             
         return outputs
 
@@ -495,14 +524,13 @@ class OmniGenAttention(layers.Layer):
         
     def call(
         self,
-        hidden_states: tf.Tensor,
-        attention_mask: Optional[tf.Tensor] = None,
-        position_ids: Optional[tf.Tensor] = None,
-        past_key_value: Optional[Tuple[tf.Tensor]] = None,
-        output_attentions: Optional[bool] = False,
-        use_cache: Optional[bool] = False,
-        training: bool = False,
-    ) -> Tuple[tf.Tensor, Optional[tf.Tensor], Optional[Tuple[tf.Tensor]]]:
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        output_attentions=False,
+        training=False,
+    ):
         """Forward pass."""
         bsz, q_len, _ = tf.shape(hidden_states)
         
@@ -517,7 +545,7 @@ class OmniGenAttention(layers.Layer):
             k = tf.concat([past_key_value[0], k], axis=2)
             v = tf.concat([past_key_value[1], v], axis=2)
             
-        if use_cache:
+        if past_key_value is not None:
             present_key_value = (k, v)
             
         # Compute attention
@@ -541,7 +569,7 @@ class OmniGenAttention(layers.Layer):
         outputs = (attn_output,)
         if output_attentions:
             outputs += (attn_weights,)
-        if use_cache:
+        if past_key_value is not None:
             outputs += (present_key_value,)
             
         return outputs
@@ -563,7 +591,7 @@ class OmniGenMLP(layers.Layer):
         self.down_proj = layers.Dense(self.hidden_size, use_bias=False, name="down_proj")
         self.act_fn = tf.keras.activations.swish
         
-    def call(self, x: tf.Tensor) -> tf.Tensor:
+    def call(self, x, training=False):
         """Forward pass."""
         # Split activation
         gate_up = self.gate_up_proj(x)
