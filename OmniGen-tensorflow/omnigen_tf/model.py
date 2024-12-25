@@ -117,15 +117,15 @@ class PatchEmbed(layers.Layer):
 class TimeToken(tf.keras.layers.Layer):
     """Time token embedding layer."""
     
-    def __init__(self, hidden_size=2048, **kwargs):
+    def __init__(self, embed_dim=2048, **kwargs):
         """Initialize layer."""
         super().__init__(**kwargs)
-        self.hidden_size = hidden_size
+        self.embed_dim = embed_dim
         
         # Create MLP for time embedding
         self.mlp = tf.keras.Sequential([
-            tf.keras.layers.Dense(hidden_size, activation='gelu'),
-            tf.keras.layers.Dense(hidden_size)
+            tf.keras.layers.Dense(embed_dim, activation='gelu'),
+            tf.keras.layers.Dense(embed_dim)
         ])
         
     def call(self, t):
@@ -145,7 +145,7 @@ class TimeToken(tf.keras.layers.Layer):
         """Get layer configuration."""
         config = super().get_config()
         config.update({
-            'hidden_size': self.hidden_size
+            'embed_dim': self.embed_dim
         })
         return config
 
