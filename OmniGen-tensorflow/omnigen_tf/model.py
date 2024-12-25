@@ -511,11 +511,25 @@ class OmniGen(Model):
         # Combine embeddings with time embedding
         x = x + tf.expand_dims(time_embed, axis=1)  # Add time embedding to each position
         
+        # Get text embeddings from input_ids
+        text_embeds = self.transformer.embed_tokens(input_ids)
+        
+        # Combine image and text embeddings
+        combined_embeds = tf.concat([text_embeds, x], axis=1)
+        
+        # Create combined attention mask if needed
+        if attention_mask is not None:
+            # Create attention mask for image tokens (all 1s)
+            image_attention = tf.ones((batch_size, tf.shape(x)[1]), dtype=attention_mask.dtype)
+            # Combine text and image attention masks
+            combined_attention = tf.concat([attention_mask, image_attention], axis=1)
+        else:
+            combined_attention = None
+        
         # Run through transformer
         output = self.transformer(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            inputs_embeds=x,
+            inputs_embeds=combined_embeds,
+            attention_mask=combined_attention,
             training=training
         )
         
@@ -523,7 +537,7 @@ class OmniGen(Model):
             output = output[0]
             
         return output
-        
+
     def call(
         self,
         latents,
