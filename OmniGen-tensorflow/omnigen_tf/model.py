@@ -138,23 +138,25 @@ class OmniGen(Model):
     def __init__(
         self,
         transformer_config: Phi3Config,
-        patch_size=2,
+        patch_size=16,
         in_channels=4,
         pe_interpolation: float = 1.0,
         pos_embed_max_size: int = 192,
     ):
         super().__init__()
         
-        # Model configuration
+        # Save configuration
+        self.transformer = Phi3Transformer(transformer_config)
+        self.transformer_config = transformer_config
+        self.patch_size = patch_size
         self.in_channels = in_channels
         self.out_channels = in_channels
-        self.patch_size = patch_size
-        self.pos_embed_max_size = pos_embed_max_size
         self.pe_interpolation = pe_interpolation
+        self.pos_embed_max_size = pos_embed_max_size
         
         hidden_size = transformer_config.hidden_size
         
-        # Initialize embedders
+        # Create embedders
         self.x_embedder = PatchEmbedMR(
             embed_dim=hidden_size,
             patch_size=patch_size,
@@ -166,14 +168,14 @@ class OmniGen(Model):
             in_chans=in_channels
         )
         
+        # Create time embedder
         self.time_token = TimestepEmbedder(hidden_size)
-        self.t_embedder = TimestepEmbedder(hidden_size)
         
         # Create positional embeddings
         pos_embed = get_2d_sincos_pos_embed(
             hidden_size, 
             pos_embed_max_size,
-            interpolation_scale=self.pe_interpolation,
+            interpolation_scale=pe_interpolation,
             base_size=64
         )
         self.pos_embed = tf.Variable(
@@ -182,20 +184,12 @@ class OmniGen(Model):
             name="pos_embed"
         )
         
+        # Create final layer
         self.final_layer = FinalLayer(
             hidden_size=hidden_size,
             patch_size=patch_size,
             out_channels=self.out_channels
         )
-        
-        self.transformer = Phi3Transformer(
-            config=transformer_config
-        )
-        # Disable caching to match PyTorch
-        self.transformer.config.use_cache = False
-        
-        # Create weights mapping
-        self._create_weights_mapping()
         
     def _create_weights_mapping(self):
         """Create mapping between PyTorch and TensorFlow weight names."""
@@ -236,10 +230,6 @@ class OmniGen(Model):
             "time_token/mlp_0/bias": "time_token.mlp.0.bias",
             "time_token/mlp_2/kernel": "time_token.mlp.2.weight",
             "time_token/mlp_2/bias": "time_token.mlp.2.bias",
-            "t_embedder/mlp_0/kernel": "t_embedder.mlp.0.weight",
-            "t_embedder/mlp_0/bias": "t_embedder.mlp.0.bias",
-            "t_embedder/mlp_2/kernel": "t_embedder.mlp.2.weight",
-            "t_embedder/mlp_2/bias": "t_embedder.mlp.2.bias",
         })
         
         # Patch embedder mappings
@@ -290,7 +280,7 @@ class OmniGen(Model):
 
         # Initialize timestep embedding MLP with normal distribution
         std = 0.02
-        for embedder in [self.t_embedder, self.time_token]:
+        for embedder in [self.time_token]:
             for layer in embedder.mlp.layers:
                 if isinstance(layer, layers.Dense):
                     layer.kernel.assign(tf.random.normal(
@@ -489,7 +479,7 @@ class OmniGen(Model):
             
         if input_is_list:
             image_embedding = output[:, -tf.reduce_max(num_tokens):]
-            time_emb = self.t_embedder(timestep)
+            time_emb = self.time_token(timestep)
             x = self.final_layer(image_embedding, time_emb)
             
             latents = []
@@ -499,7 +489,7 @@ class OmniGen(Model):
                 latents.append(latent)
         else:
             image_embedding = output[:, -num_tokens:]
-            time_emb = self.t_embedder(timestep)
+            time_emb = self.time_token(timestep)
             x = self.final_layer(image_embedding, time_emb)
             latents = self.unpatchify(x, shapes[0], shapes[1])
             
@@ -564,7 +554,7 @@ class OmniGen(Model):
             
         return model
 
-def get_2d_sincos_pos_embed(embed_dim, grid_size_h, grid_size_w=None, cls_token=False):
+def get_2d_sincos_pos_embed(embed_dim, grid_size_h, grid_size_w=None, cls_token=False, interpolation_scale=1.0, base_size=1):
     """2D sine-cosine position embedding.
     
     Args:
@@ -572,12 +562,18 @@ def get_2d_sincos_pos_embed(embed_dim, grid_size_h, grid_size_w=None, cls_token=
         grid_size_h: number of patches in height.
         grid_size_w: number of patches in width. If None, use grid_size_h.
         cls_token: whether to add a cls token.
+        interpolation_scale: scale factor for interpolation
+        base_size: base grid size for interpolation
         
     Returns:
         pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (with cls token)
     """
     if grid_size_w is None:
         grid_size_w = grid_size_h
+        
+    # Apply interpolation scaling
+    grid_size_h = int(grid_size_h * (base_size / interpolation_scale))
+    grid_size_w = int(grid_size_w * (base_size / interpolation_scale))
         
     grid_h = np.arange(grid_size_h, dtype=np.float32)
     grid_w = np.arange(grid_size_w, dtype=np.float32)
