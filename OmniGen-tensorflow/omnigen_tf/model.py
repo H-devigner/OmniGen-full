@@ -313,83 +313,107 @@ class OmniGen(Model):
         imgs = tf.reshape(x, [batch_size, c, h, w])
         return imgs
 
-    def cropped_pos_embed(self, height, width):
-        """Crops positional embeddings for SD3 compatibility."""
-        if self.pos_embed_max_size is None:
-            raise ValueError("`pos_embed_max_size` must be set for cropping.")
-
-        height = height // self.patch_size
-        width = width // self.patch_size
-        
-        if height > self.pos_embed_max_size:
-            raise ValueError(
-                f"Height ({height}) cannot be greater than `pos_embed_max_size`: {self.pos_embed_max_size}."
-            )
-        if width > self.pos_embed_max_size:
-            raise ValueError(
-                f"Width ({width}) cannot be greater than `pos_embed_max_size`: {self.pos_embed_max_size}."
-            )
-
-        top = (self.pos_embed_max_size - height) // 2
-        left = (self.pos_embed_max_size - width) // 2
-        
-        # Reshape and crop
-        spatial_pos_embed = tf.reshape(
-            self.pos_embed,
-            [1, self.pos_embed_max_size, self.pos_embed_max_size, -1]
-        )
-        spatial_pos_embed = spatial_pos_embed[:, top:top + height, left:left + width, :]
-        spatial_pos_embed = tf.reshape(
-            spatial_pos_embed,
-            [1, -1, tf.shape(spatial_pos_embed)[-1]]
-        )
-        return spatial_pos_embed
-
     def patch_multiple_resolutions(self, latents, padding_latent=None, is_input_images=False):
-        """Handle multiple resolution inputs."""
+        """Process input latents with multiple resolutions."""
         if isinstance(latents, list):
-            return_list = False
-            if padding_latent is None:
-                padding_latent = [None] * len(latents)
-                return_list = True
-                
-            patched_latents, num_tokens, shapes = [], [], []
-            for latent, padding in zip(latents, padding_latent):
-                height, width = tf.shape(latent)[-2], tf.shape(latent)[-1]
-                
-                if is_input_images:
-                    latent = self.input_x_embedder(latent)
-                else:
-                    latent = self.x_embedder(latent)
-                    
-                pos_embed = self.cropped_pos_embed(height, width)
-                latent = latent + pos_embed
-                
-                if padding is not None:
-                    latent = tf.concat([latent, padding], axis=-2)
-                    
-                patched_latents.append(latent)
-                num_tokens.append(tf.shape(pos_embed)[1])
-                shapes.append([height, width])
-                
-            if not return_list:
-                latents = tf.concat(patched_latents, axis=0)
-            else:
-                latents = patched_latents
-        else:
-            height, width = tf.shape(latents)[-2], tf.shape(latents)[-1]
+            # Handle list of latents
+            all_latents = []
+            all_num_tokens = []
+            all_shapes = []
             
+            for x in latents:
+                height = tf.shape(x)[1]
+                width = tf.shape(x)[2]
+                
+                # Reshape to (batch, height*width, channels)
+                x = tf.reshape(x, (-1, height * width, x.shape[-1]))
+                
+                # Apply embedding
+                if is_input_images:
+                    x = self.input_x_embedder(x)
+                else:
+                    x = self.x_embedder(x)
+                    
+                # Add position embeddings
+                pos_embed = self.get_pos_embed(height, width)
+                x = x + pos_embed
+                
+                all_latents.append(x)
+                all_num_tokens.append(tf.shape(x)[1])
+                all_shapes.append((height, width))
+                
+            # Pad and concatenate
+            max_tokens = tf.reduce_max(all_num_tokens)
+            padded_latents = []
+            
+            for x, num_tokens in zip(all_latents, all_num_tokens):
+                if num_tokens < max_tokens:
+                    padding = tf.zeros((tf.shape(x)[0], max_tokens - num_tokens, tf.shape(x)[-1]))
+                    x = tf.concat([x, padding], axis=1)
+                padded_latents.append(x)
+                
+            latents = tf.concat(padded_latents, axis=0)
+            return latents, all_num_tokens, all_shapes
+            
+        else:
+            # Handle single latent
+            height = tf.shape(latents)[1]
+            width = tf.shape(latents)[2]
+            
+            # Reshape to (batch, height*width, channels)
+            latents = tf.reshape(latents, (-1, height * width, latents.shape[-1]))
+            
+            # Apply embedding
             if is_input_images:
                 latents = self.input_x_embedder(latents)
             else:
                 latents = self.x_embedder(latents)
                 
-            pos_embed = self.cropped_pos_embed(height, width)
+            # Add position embeddings
+            pos_embed = self.get_pos_embed(height, width)
             latents = latents + pos_embed
-            num_tokens = tf.shape(latents)[1]
-            shapes = [height, width]
             
-        return latents, num_tokens, shapes
+            num_tokens = tf.shape(latents)[1]
+            return latents, num_tokens, [(height, width)]
+            
+    def get_pos_embed(self, height, width):
+        """Get position embeddings for given dimensions."""
+        # Convert to concrete values if tensors
+        if isinstance(height, tf.Tensor):
+            height = tf.cast(height, tf.int32)
+        if isinstance(width, tf.Tensor):
+            width = tf.cast(width, tf.int32)
+            
+        # Check dimensions
+        if height > self.pos_embed_max_size or width > self.pos_embed_max_size:
+            # Instead of raising error, resize to max size
+            scale_factor = tf.minimum(
+                self.pos_embed_max_size / height,
+                self.pos_embed_max_size / width
+            )
+            height = tf.cast(tf.cast(height, tf.float32) * scale_factor, tf.int32)
+            width = tf.cast(tf.cast(width, tf.float32) * scale_factor, tf.int32)
+            
+        # Get base position embeddings
+        pos_embed = get_2d_sincos_pos_embed(
+            self.transformer.config.hidden_size,
+            int(self.pos_embed_max_size),
+            cls_token=False,
+            base_size=self.pos_embed_max_size
+        )
+        pos_embed = tf.convert_to_tensor(pos_embed, dtype=tf.float32)
+        
+        # Interpolate to target size
+        if height != self.pos_embed_max_size or width != self.pos_embed_max_size:
+            pos_embed = tf.reshape(pos_embed, (self.pos_embed_max_size, self.pos_embed_max_size, -1))
+            pos_embed = tf.image.resize(
+                pos_embed[tf.newaxis],
+                (height, width),
+                method='bilinear'
+            )[0]
+            
+        pos_embed = tf.reshape(pos_embed, (height * width, -1))
+        return pos_embed
 
     @tf.function(jit_compile=True)
     def call(self, x, timestep, input_ids=None, input_img_latents=None,
