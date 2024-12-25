@@ -536,9 +536,7 @@ class OmniGen(Model):
             position_ids=None,
             past_key_value=None,
             output_attentions=False,
-            output_hidden_states=False,
             use_cache=False,
-            return_dict=False,
             training=training
         )
         
