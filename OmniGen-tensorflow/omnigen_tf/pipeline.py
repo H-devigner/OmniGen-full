@@ -91,6 +91,7 @@ class OmniGenPipeline:
                 return_tensors="tf"
             )
             input_ids = inputs["input_ids"]
+            attention_mask = inputs.get("attention_mask", None)
             
             # Initialize latents on GPU
             latents_shape = (1, height // 8, width // 8, 4)
@@ -111,9 +112,10 @@ class OmniGenPipeline:
                 
                 # Predict noise residual
                 noise_pred = self.model(
-                    input_ids=input_ids,
                     latents=latent_model_input,
-                    timestep=t
+                    timestep=t,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask
                 )
                 
                 if isinstance(noise_pred, tuple):

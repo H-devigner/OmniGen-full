@@ -163,10 +163,16 @@ class OmniGen(Model):
         in_channels=4,
         pe_interpolation='bicubic',
         pos_embed_max_size=1024,
+        chunk_size=128,
+        enable_checkpointing=False,
         **kwargs
     ):
         """Initialize model."""
         super().__init__(**kwargs)
+        
+        # Set default chunk size if not provided
+        self.chunk_size = chunk_size
+        self.enable_checkpointing = enable_checkpointing
         
         # Initialize transformer with config
         if not isinstance(transformer_config, Phi3Config):
@@ -201,31 +207,23 @@ class OmniGen(Model):
         # Memory optimization flags
         self.memory_efficient = False
         self.gradient_checkpointing = False
-        self.chunk_size = None
         
         # Create weights mapping
         self._create_weights_mapping()
         
-    def enable_memory_efficient_inference(self):
-        """Enable memory efficient inference mode."""
+    def enable_memory_efficient_inference(self, chunk_size=None):
+        """Enable memory efficient inference."""
+        if chunk_size is not None:
+            self.chunk_size = chunk_size
         self.memory_efficient = True
         self.gradient_checkpointing = True
         self.transformer.enable_gradient_checkpointing()
-        self.chunk_size = 64  # Default chunk size, can be adjusted
-        self.transformer.set_chunk_size(self.chunk_size)
         
     def disable_memory_efficient_inference(self):
         """Disable memory efficient inference mode."""
         self.memory_efficient = False
         self.gradient_checkpointing = False
         self.transformer.disable_gradient_checkpointing()
-        self.chunk_size = None
-        self.transformer.set_chunk_size(None)
-        
-    def set_chunk_size(self, chunk_size: int):
-        """Set chunk size for processing large inputs."""
-        self.chunk_size = chunk_size
-        self.transformer.set_chunk_size(chunk_size)
         
     def _create_weights_mapping(self):
         """Create mapping between PyTorch and TensorFlow weight names."""
@@ -458,66 +456,27 @@ class OmniGen(Model):
         pos_embed = tf.convert_to_tensor(pos_embed, dtype=tf.float32)
         return pos_embed
 
-    def call(
-        self,
-        latents,
-        timestep,
-        input_ids=None,
-        attention_mask=None,
-        training=False,
-    ):
-        """Forward pass with memory optimizations."""
+    def _chunked_forward(self, latents, timestep, input_ids, attention_mask=None, training=False):
+        """Forward pass with chunking for memory efficiency."""
+        # Process in chunks
+        chunk_size = self.chunk_size
+        chunks = tf.shape(latents)[1] // chunk_size + (1 if tf.shape(latents)[1] % chunk_size != 0 else 0)
         
-        # Set up memory efficient inference if enabled
-        if self.memory_efficient and not training:
-            # Use mixed precision
-            if tf.keras.mixed_precision.global_policy().name != 'mixed_float16':
-                tf.keras.mixed_precision.set_global_policy('mixed_float16')
-                
-            # Clear memory before inference
-            tf.keras.backend.clear_session()
+        outputs = []
+        for i in range(chunks):
+            start_idx = i * chunk_size
+            end_idx = min(start_idx + chunk_size, tf.shape(latents)[1])
+            chunk = latents[:, start_idx:end_idx]
             
-            # Run garbage collection
-            gc.collect()
+            # Process chunk
+            chunk_output = self._forward(chunk, timestep, input_ids, attention_mask, training)
+            outputs.append(chunk_output)
             
-            # Configure GPU memory growth
-            gpus = tf.config.list_physical_devices('GPU')
-            if gpus:
-                try:
-                    for gpu in gpus:
-                        tf.config.experimental.set_memory_growth(gpu, True)
-                except RuntimeError as e:
-                    print(f"GPU memory growth error: {e}")
-                    
-        # Process in chunks if needed
-        if self.chunk_size is not None and isinstance(latents, list):
-            all_latents = []
-            for x in latents:
-                if x.shape[1] > self.chunk_size:
-                    x = self._chunked_forward(x, timestep, input_ids, attention_mask, training)
-                else:
-                    x = self._normal_forward(x, timestep, input_ids, attention_mask, training)
-                all_latents.append(x)
-            return all_latents
-        else:
-            if isinstance(latents, list):
-                latents = tf.concat(latents, axis=0)
-            if latents.shape[1] > self.chunk_size:
-                return self._chunked_forward(latents, timestep, input_ids, attention_mask, training)
-            else:
-                return self._normal_forward(latents, timestep, input_ids, attention_mask, training)
+        # Combine chunks
+        return tf.concat(outputs, axis=1)
         
-    def _normal_forward(
-        self,
-        latents,
-        timestep,
-        input_ids=None,
-        attention_mask=None,
-        training=False,
-    ):
-        """Normal forward pass."""
-        
-        # Get batch size
+    def _forward(self, latents, timestep, input_ids, attention_mask=None, training=False):
+        """Forward pass without chunking."""
         batch_size = tf.shape(latents)[0]
         
         # Get input shape
@@ -537,14 +496,16 @@ class OmniGen(Model):
         
         # Run through transformer
         output = self.transformer(
-            x,
-            pos_embed,
-            t,
-            input_ids,
-            attention_mask,
-            training=training,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            inputs_embeds=x,
+            time_embedding=t,
+            training=training
         )
         
+        if isinstance(output, tuple):
+            output = output[0]
+            
         # Process output
         image_embedding = output[:, -num_tokens:]
         time_emb = self.time_token(timestep)
@@ -559,7 +520,7 @@ class OmniGen(Model):
             
         return latents
         
-    def _chunked_forward(
+    def call(
         self,
         latents,
         timestep,
@@ -567,37 +528,21 @@ class OmniGen(Model):
         attention_mask=None,
         training=False,
     ):
-        """Process input in chunks to save memory."""
-        
-        # Split inputs into chunks
-        input_chunks = tf.split(
-            latents,
-            num_or_size_splits=math.ceil(latents.shape[1]/self.chunk_size),
-            axis=1
-        )
-        
-        # Process each chunk
-        output_chunks = []
-        for chunk in input_chunks:
-            # Get corresponding attention mask and position ids for chunk
-            if attention_mask is not None:
-                chunk_mask = attention_mask[:, :chunk.shape[1]]
-            else:
-                chunk_mask = None
-                
-            # Process chunk
-            chunk_output = self._normal_forward(chunk, timestep, input_ids, chunk_mask, training)
+        """Model forward pass."""
+        # Handle list inputs
+        if isinstance(latents, list):
+            latents = tf.concat(latents, axis=0)
             
-            # Store chunk output
-            output_chunks.append(chunk_output)
+        # Use chunked forward if needed
+        if tf.shape(latents)[1] > self.chunk_size:
+            return self._chunked_forward(latents, timestep, input_ids, attention_mask, training)
+        else:
+            return self._forward(latents, timestep, input_ids, attention_mask, training)
             
-            # Clear memory after each chunk
-            if self.memory_efficient:
-                tf.keras.backend.clear_session()
-                gc.collect()
-                
-        # Combine chunks
-        return output_chunks
+    def decode(self, latents):
+        """Decode latents to image."""
+        # Add decoding logic here
+        return latents  # Placeholder for now
 
     def get_config(self):
         """Get model configuration."""
@@ -608,6 +553,8 @@ class OmniGen(Model):
             'in_channels': self.in_channels,
             'pe_interpolation': self.pe_interpolation,
             'pos_embed_max_size': self.pos_embed_max_size,
+            'chunk_size': self.chunk_size,
+            'enable_checkpointing': self.enable_checkpointing,
         })
         return config
         
