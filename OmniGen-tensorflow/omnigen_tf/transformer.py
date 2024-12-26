@@ -819,8 +819,8 @@ class OmniGenAttention(layers.Layer):
 
 
 class OmniGenMLP(layers.Layer):
-    """MLP layer for OmniGen."""
-    
+    """MLP layer with memory optimization."""
+
     def __init__(
         self,
         hidden_size,
@@ -835,34 +835,43 @@ class OmniGenMLP(layers.Layer):
         self.gate_up_proj = layers.Dense(2 * intermediate_size, use_bias=True)
         self.down_proj = layers.Dense(hidden_size, use_bias=True)
         
+    def _process_chunk(self, chunk, training=False):
+        """Process a single chunk of data."""
+        # Split activation
+        gate_up = self.gate_up_proj(chunk)
+        gate, up = tf.split(gate_up, 2, axis=-1)
+        
+        # Apply activation and multiply
+        gate = tf.keras.activations.swish(gate)
+        hidden_states = gate * up
+        
+        # Down projection
+        return self.down_proj(hidden_states)
+        
     def call(self, x, training=False):
-        """Forward pass with chunked processing for memory efficiency."""
+        """Forward pass with aggressive memory optimization."""
         batch_size, seq_length = tf.shape(x)[0], tf.shape(x)[1]
         
-        # Process in chunks to save memory
-        chunk_size = 4  # Adjust based on available memory
-        num_chunks = (seq_length + chunk_size - 1) // chunk_size
-        
+        # Use smaller chunks and process in sequence
+        chunk_size = 1  # Process one token at a time
         outputs = []
-        for i in range(num_chunks):
-            start_idx = i * chunk_size
-            end_idx = min((i + 1) * chunk_size, seq_length)
-            
-            # Process chunk
-            chunk = x[:, start_idx:end_idx, :]
-            
-            # Split activation
-            gate_up = self.gate_up_proj(chunk)
-            gate, up = tf.split(gate_up, 2, axis=-1)
-            
-            # Apply activation
-            gate = tf.keras.activations.swish(gate)
-            hidden_states = gate * up
-            
-            # Down projection
-            hidden_states = self.down_proj(hidden_states)
-            
-            outputs.append(hidden_states)
         
-        # Concatenate chunks
+        # Process each token separately to minimize memory usage
+        for i in range(seq_length):
+            # Extract single token
+            chunk = x[:, i:i+1, :]
+            
+            # Process chunk with gradient checkpointing if training
+            if training:
+                chunk_output = tf.recompute_grad(self._process_chunk)(chunk, training)
+            else:
+                chunk_output = self._process_chunk(chunk, training)
+                
+            outputs.append(chunk_output)
+            
+            # Clear unnecessary tensors
+            if tf.config.list_physical_devices('GPU'):
+                tf.keras.backend.clear_session()
+        
+        # Concatenate all outputs
         return tf.concat(outputs, axis=1)
