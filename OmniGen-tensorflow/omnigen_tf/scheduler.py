@@ -240,15 +240,21 @@ class DDIMScheduler:
         Returns:
             Denoised sample
         """
+        # Ensure consistent precision (use float32 for computations)
+        model_output = tf.cast(model_output, tf.float32)
+        sample = tf.cast(sample, tf.float32)
+        timestep = tf.cast(timestep, tf.int32)
+        
         # Get alpha values for current and previous timestep
         t = timestep
         prev_t = t - 1 if t > 0 else t
         
-        alpha_prod_t = self.alphas_cumprod[t]
-        alpha_prod_t_prev = self.alphas_cumprod[prev_t] if prev_t >= 0 else tf.ones_like(alpha_prod_t)
-        
+        alpha_prod_t = tf.cast(self.alphas_cumprod[t], tf.float32)
+        alpha_prod_t_prev = tf.cast(
+            self.alphas_cumprod[prev_t] if prev_t >= 0 else 1.0, 
+            tf.float32
+        )
         beta_prod_t = 1 - alpha_prod_t
-        beta_prod_t_prev = 1 - alpha_prod_t_prev
         
         # Compute coefficients
         sqrt_alpha_prod = tf.sqrt(alpha_prod_t)
@@ -273,6 +279,9 @@ class DDIMScheduler:
         if self.clip_sample:
             prev_sample = tf.clip_by_value(prev_sample, -1, 1)
             
+        # Cast back to original dtype of sample
+        prev_sample = tf.cast(prev_sample, sample.dtype)
+        
         return prev_sample
 
 
@@ -363,45 +372,69 @@ class OmniGenScheduler:
         return_dict=True,
         **kwargs
     ):
-        """Predict the sample at the previous timestep."""
-        # Cast timestep to int
+        """
+        Predict the previous noisy sample x_t -> x_t-1.
+        
+        Args:
+            model_output (Tensor): Predicted noise or sample from the model
+            timestep (Tensor): Current timestep
+            sample (Tensor): Current noisy sample
+            return_dict (bool): Whether to return a dictionary or tuple
+        
+        Returns:
+            Tensor or Dict: Denoised sample
+        """
+        # Ensure consistent precision (use float32 for computations)
+        model_output = tf.cast(model_output, tf.float32)
+        sample = tf.cast(sample, tf.float32)
         timestep = tf.cast(timestep, tf.int32)
         
-        # Get step index
-        step_index = tf.where(self.timesteps == timestep)[0][0]
-        prev_timestep = self.timesteps[step_index + 1] if step_index < len(self.timesteps) - 1 else 0
-        
-        # Get alpha values
-        alpha_prod_t = self.alphas_cumprod[timestep]
-        alpha_prod_t_prev = self.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.final_alpha_cumprod
+        # Compute noise schedule parameters
+        alpha_prod_t = tf.cast(self.alphas_cumprod[timestep], tf.float32)
+        alpha_prod_t_prev = tf.cast(
+            self.alphas_cumprod[timestep - 1] if timestep > 0 else 1.0, 
+            tf.float32
+        )
         beta_prod_t = 1 - alpha_prod_t
         
         # Compute predicted original sample
         if self.prediction_type == "epsilon":
-            pred_original_sample = (sample - beta_prod_t ** 0.5 * model_output) / alpha_prod_t ** 0.5
+            # Noise prediction
+            pred_original_sample = (
+                sample - (beta_prod_t ** 0.5) * model_output
+            ) / (alpha_prod_t ** 0.5)
         elif self.prediction_type == "sample":
+            # Direct sample prediction
             pred_original_sample = model_output
         else:
-            raise ValueError(f"Unknown prediction type {self.prediction_type}")
-            
-        # Get coefficients for pred original sample and current sample
-        pred_sample_coeff = (alpha_prod_t_prev ** 0.5 * beta_prod_t) / beta_prod_t
-        current_sample_coeff = alpha_prod_t ** 0.5 * (1 - alpha_prod_t_prev) / beta_prod_t
+            raise ValueError(f"Unsupported prediction type: {self.prediction_type}")
         
-        # Get predicted previous sample
-        pred_prev_sample = pred_sample_coeff * pred_original_sample + current_sample_coeff * sample
+        # Compute variance
+        variance = (
+            (1 - alpha_prod_t_prev) / (1 - alpha_prod_t) * 
+            (1 - alpha_prod_t / alpha_prod_t_prev)
+        ) ** 0.5
         
-        # Add noise
-        variance = 0 if step_index == len(self.timesteps) - 1 else self._get_variance(timestep, prev_timestep)
-        std_dev = tf.math.sqrt(variance)
-        if self.clip_sample:
-            pred_prev_sample = tf.clip_by_value(pred_prev_sample, -1, 1)
-            
-        if variance > 0:
-            noise = tf.random.normal(pred_prev_sample.shape) * std_dev
-            pred_prev_sample = pred_prev_sample + noise
-            
-        return pred_prev_sample
+        # Compute standard deviation
+        std_dev = variance * model_output
+        
+        # Compute next sample
+        next_sample = (
+            pred_original_sample * (alpha_prod_t_prev ** 0.5) + 
+            std_dev
+        )
+        
+        # Cast back to original dtype of sample
+        next_sample = tf.cast(next_sample, sample.dtype)
+        pred_original_sample = tf.cast(pred_original_sample, sample.dtype)
+        
+        # Return results
+        if return_dict:
+            return {
+                "prev_sample": next_sample,
+                "pred_original_sample": pred_original_sample,
+            }
+        return next_sample
 
     @tf.function(jit_compile=True)
     def crop_kv_cache(self, past_key_values, num_tokens_for_img):
