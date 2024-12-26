@@ -421,23 +421,67 @@ class OmniGenTransformer(layers.Layer):
         
         self.config = config
         self.num_hidden_layers = config.num_hidden_layers
+        self.chunk_size = 32  # Default chunk size for processing
         
         # Initialize components with mixed precision
         self.h = [OmniGenLayer(config, name=f"h.{i}") for i in range(self.num_hidden_layers)]
         self.norm = layers.LayerNormalization(epsilon=1e-5, dtype=tf.float16, name="norm")
         
-    @tf.function(jit_compile=True)
-    def _process_layer(self, layer_module, hidden_states, attention_mask, position_ids, past_key_value, output_attentions, use_cache, training):
-        """Process a single transformer layer with XLA optimization."""
-        return layer_module(
-            hidden_states,
+    def _process_chunk(self, chunk, layer_module, attention_mask, position_ids, past_key_value, output_attentions, use_cache, training):
+        """Process a single chunk through a transformer layer."""
+        # Process chunk with layer
+        layer_outputs = layer_module(
+            chunk,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
-            training=training,
+            training=training
         )
+        return layer_outputs
+        
+    def _process_in_chunks(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, output_attentions=False, use_cache=False, training=False):
+        """Process hidden states in chunks to save memory."""
+        # Get dimensions
+        batch_size = tf.shape(hidden_states)[0]
+        seq_length = tf.shape(hidden_states)[1]
+        
+        # Calculate number of chunks
+        num_chunks = tf.cast(tf.math.ceil(seq_length / self.chunk_size), tf.int32)
+        
+        # Process each chunk
+        chunk_outputs = []
+        for i in range(num_chunks):
+            # Get chunk indices
+            start_idx = i * self.chunk_size
+            end_idx = tf.minimum(start_idx + self.chunk_size, seq_length)
+            
+            # Extract chunk
+            chunk = hidden_states[:, start_idx:end_idx, :]
+            
+            # Process chunk through layers
+            for layer_module in self.h:
+                chunk = self._process_chunk(
+                    chunk,
+                    layer_module,
+                    attention_mask[:, start_idx:end_idx] if attention_mask is not None else None,
+                    position_ids[:, start_idx:end_idx] if position_ids is not None else None,
+                    past_key_value,
+                    output_attentions,
+                    use_cache,
+                    training
+                )[0]  # Get hidden states from layer outputs
+            
+            chunk_outputs.append(chunk)
+        
+        # Concatenate chunks
+        hidden_states = tf.concat(chunk_outputs, axis=1)
+        
+        # Final layer norm
+        hidden_states = self.norm(hidden_states)
+        
+        return hidden_states
         
     def call(
         self,
@@ -456,8 +500,21 @@ class OmniGenTransformer(layers.Layer):
         # Cast inputs to float16
         hidden_states = tf.cast(hidden_states, tf.float16)
         if attention_mask is not None:
-            attention_mask = tf.cast(attention_mask, tf.float16)
+            attention_mask = tf.cast(attention_mask, tf.int32)
             
+        # Process in chunks if sequence length is large
+        if tf.shape(hidden_states)[1] > self.chunk_size:
+            return self._process_in_chunks(
+                hidden_states,
+                attention_mask,
+                position_ids,
+                past_key_value,
+                output_attentions,
+                use_cache,
+                training
+            )
+        
+        # Regular processing for small sequences
         all_hidden_states = () if output_attentions else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
@@ -466,10 +523,15 @@ class OmniGenTransformer(layers.Layer):
         for i, layer_module in enumerate(self.h):
             past_key_value_layer = past_key_value[i] if past_key_value is not None else None
             
-            # Process layer with XLA optimization
-            layer_outputs = self._process_layer(
-                layer_module, hidden_states, attention_mask, position_ids,
-                past_key_value_layer, output_attentions, use_cache, training
+            # Process layer
+            layer_outputs = layer_module(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value_layer,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                training=training
             )
                 
             hidden_states = layer_outputs[0]

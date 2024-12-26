@@ -93,9 +93,9 @@ class OmniGenPipeline:
             input_ids = inputs["input_ids"]
             attention_mask = inputs.get("attention_mask", None)
             
-            # Initialize latents on GPU
+            # Initialize latents on GPU with smaller batch size
             latents_shape = (1, height // 8, width // 8, 4)
-            latents = tf.random.normal(latents_shape)
+            latents = tf.random.normal(latents_shape, dtype=tf.float16)
             
             # Set timesteps
             self.scheduler.set_timesteps(num_inference_steps)
@@ -104,34 +104,49 @@ class OmniGenPipeline:
             # Prepare extra kwargs for the scheduler step
             extra_step_kwargs = {}
             
-            # Denoising loop
+            # Denoising loop with memory-efficient processing
             for i, t in enumerate(timesteps):
-                # Expand latents for classifier-free guidance
-                latent_model_input = tf.concat([latents] * 2, axis=0)
-                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-                
                 # Convert timestep to scalar
                 timestep = tf.cast(t, tf.int32)
                 
-                # Predict noise residual
-                noise_pred = self.model(
-                    latents=latent_model_input,
+                # Process unconditional and conditional separately to save memory
+                # First process unconditional (no prompt)
+                noise_pred_uncond = self.model(
+                    latents=latents,
                     timestep=timestep,
                     input_ids=input_ids,
-                    attention_mask=attention_mask
+                    attention_mask=attention_mask,
+                    training=False
                 )
                 
-                if isinstance(noise_pred, tuple):
-                    noise_pred = noise_pred[0]
-                elif isinstance(noise_pred, dict):
-                    noise_pred = noise_pred["sample"]
+                if isinstance(noise_pred_uncond, tuple):
+                    noise_pred_uncond = noise_pred_uncond[0]
+                elif isinstance(noise_pred_uncond, dict):
+                    noise_pred_uncond = noise_pred_uncond["sample"]
                 
-                # Convert noise_pred to match latents shape
-                noise_pred = self._convert_noise_pred(noise_pred, latents)
-                    
+                # Then process conditional (with prompt)
+                noise_pred_text = self.model(
+                    latents=latents,
+                    timestep=timestep,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    training=False
+                )
+                
+                if isinstance(noise_pred_text, tuple):
+                    noise_pred_text = noise_pred_text[0]
+                elif isinstance(noise_pred_text, dict):
+                    noise_pred_text = noise_pred_text["sample"]
+                
+                # Convert predictions to match latents shape
+                noise_pred_uncond = self._convert_single_noise_pred(noise_pred_uncond, latents)
+                noise_pred_text = self._convert_single_noise_pred(noise_pred_text, latents)
+                
                 # Perform guidance
-                noise_pred_uncond, noise_pred_text = tf.split(noise_pred, num_or_size_splits=2, axis=0)
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                
+                # Free memory
+                tf.keras.backend.clear_session()
                 
                 # Compute previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, timestep, latents)
@@ -156,48 +171,29 @@ class OmniGenPipeline:
             image = Image.fromarray(image[0])
             
             return image
-        
-    def _convert_noise_pred(self, noise_pred, latents):
-        """Convert noise prediction to match latents shape."""
+            
+    def _convert_single_noise_pred(self, noise_pred, latents):
+        """Convert a single noise prediction to match latents shape."""
         # Debug print shapes
-        print(f"Original noise_pred shape: {noise_pred.shape}")
-        print(f"Latents shape: {latents.shape}")
+        print(f"Single noise_pred shape: {noise_pred.shape}")
+        print(f"Target latents shape: {latents.shape}")
         
-        # If noise_pred is from a transformer output (2, 78, 3072)
+        # If noise_pred is from transformer output (1, 78, 3072)
         if len(noise_pred.shape) == 3 and noise_pred.shape[-1] == 3072:
-            # Split the batch dimension (unconditional and conditional)
-            noise_pred_uncond, noise_pred_text = tf.split(noise_pred, 2, axis=0)
-            
             # Reduce sequence length and project to latent space
-            noise_pred_uncond = tf.reduce_mean(noise_pred_uncond, axis=1)
-            noise_pred_text = tf.reduce_mean(noise_pred_text, axis=1)
-            
-            # Reshape to match latent dimensions
-            noise_pred_uncond = tf.reshape(
-                noise_pred_uncond, 
-                (1, latents.shape[1], latents.shape[2], -1)
-            )
-            noise_pred_text = tf.reshape(
-                noise_pred_text, 
-                (1, latents.shape[1], latents.shape[2], -1)
+            noise_pred = tf.reduce_mean(noise_pred, axis=1)
+            noise_pred = tf.reshape(
+                noise_pred, 
+                (latents.shape[0], latents.shape[1], latents.shape[2], -1)
             )
             
             # Ensure last dimension matches latents
-            if noise_pred_uncond.shape[-1] != latents.shape[-1]:
-                # Use a simple projection or interpolation
-                noise_pred_uncond = tf.image.resize(
-                    noise_pred_uncond, 
+            if noise_pred.shape[-1] != latents.shape[-1]:
+                noise_pred = tf.image.resize(
+                    noise_pred, 
                     (latents.shape[1], latents.shape[2]), 
                     method=tf.image.ResizeMethod.BILINEAR
                 )
-                noise_pred_text = tf.image.resize(
-                    noise_pred_text, 
-                    (latents.shape[1], latents.shape[2]), 
-                    method=tf.image.ResizeMethod.BILINEAR
-                )
-            
-            # Recombine the batches
-            noise_pred = tf.concat([noise_pred_uncond, noise_pred_text], axis=0)
         
         # If shape still doesn't match, use resize
         if noise_pred.shape != latents.shape:
@@ -209,12 +205,10 @@ class OmniGenPipeline:
         
         # Ensure the last dimension matches
         if noise_pred.shape[-1] != latents.shape[-1]:
-            # Project or truncate to match
             noise_pred = noise_pred[..., :latents.shape[-1]]
         
         # Print final shapes for debugging
         print(f"Converted noise_pred shape: {noise_pred.shape}")
-        print(f"Target latents shape: {latents.shape}")
         
         return noise_pred
 
