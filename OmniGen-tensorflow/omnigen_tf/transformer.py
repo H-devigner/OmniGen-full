@@ -415,71 +415,29 @@ class Phi3Transformer(TFPreTrainedModel):
 class OmniGenTransformer(layers.Layer):
     """Transformer model for OmniGen."""
     
-    def __init__(self, config, **kwargs):
+    def __init__(self, config: Phi3Config, **kwargs):
         """Initialize transformer."""
         super().__init__(**kwargs)
         
         self.config = config
-        self.hidden_size = config.hidden_size
         self.num_hidden_layers = config.num_hidden_layers
-        self.num_attention_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_attention_heads
         
-        # Enable memory optimization flags
-        self.gradient_checkpointing_enabled = False
-        self.use_mixed_precision = True
-        self.chunk_size = None  # For chunked processing
+        # Initialize components with mixed precision
+        self.h = [OmniGenLayer(config, name=f"h.{i}") for i in range(self.num_hidden_layers)]
+        self.norm = layers.LayerNormalization(epsilon=1e-5, dtype=tf.float16, name="norm")
         
-        # Initialize layers
-        self.layers = [OmniGenLayer(config, name=f"layer_{i}") for i in range(self.num_hidden_layers)]
-        self.norm = layers.LayerNormalization(epsilon=1e-5, name="norm")
-        
-    def enable_gradient_checkpointing(self):
-        """Enable gradient checkpointing for memory efficiency."""
-        self.gradient_checkpointing_enabled = True
-        
-    def disable_gradient_checkpointing(self):
-        """Disable gradient checkpointing."""
-        self.gradient_checkpointing_enabled = False
-        
-    def set_chunk_size(self, chunk_size: Optional[int]):
-        """Set chunk size for processing large inputs."""
-        self.chunk_size = chunk_size
-        
-    def process_in_chunks(self, hidden_states):
-        """Process hidden states in chunks to save memory."""
-        if not self.chunk_size or hidden_states.shape[1] <= self.chunk_size:
-            return hidden_states
-            
-        chunks = tf.split(
+    @tf.function(jit_compile=True)
+    def _process_layer(self, layer_module, hidden_states, attention_mask, position_ids, past_key_value, output_attentions, use_cache, training):
+        """Process a single transformer layer with XLA optimization."""
+        return layer_module(
             hidden_states,
-            num_or_size_splits=[self.chunk_size] * (hidden_states.shape[1] // self.chunk_size) + [hidden_states.shape[1] % self.chunk_size],
-            axis=1
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            training=training,
         )
-        
-        # Remove empty chunks
-        chunks = [chunk for chunk in chunks if chunk.shape[1] > 0]
-        
-        # Process each chunk
-        processed_chunks = []
-        for chunk in chunks:
-            processed_chunk = self._process_chunk(chunk)
-            processed_chunks.append(processed_chunk)
-            
-        # Concatenate chunks
-        return tf.concat(processed_chunks, axis=1)
-        
-    def _process_chunk(self, hidden_states):
-        """Process a single chunk through the transformer layers."""
-        # Apply transformer layers
-        for layer in self.layers:
-            if self.gradient_checkpointing_enabled:
-                hidden_states = tf.stop_gradient(hidden_states)
-            hidden_states = layer(hidden_states)
-            
-        # Apply final normalization
-        hidden_states = self.norm(hidden_states)
-        return hidden_states
         
     def call(
         self,
@@ -491,164 +449,48 @@ class OmniGenTransformer(layers.Layer):
         use_cache=False,
         training=False,
     ):
-        """Forward pass of transformer with memory optimization."""
-        
-        # Enable mixed precision if flag is set
-        if self.use_mixed_precision:
-            policy = tf.keras.mixed_precision.Policy('mixed_float16')
-            hidden_states = tf.cast(hidden_states, policy.compute_dtype)
-            if attention_mask is not None:
-                attention_mask = tf.cast(attention_mask, policy.compute_dtype)
-        
-        # Process in chunks if chunk size is set
-        if self.chunk_size is not None:
-            def chunk_forward(chunk):
-                outputs = self._forward_pass(
-                    chunk, attention_mask, position_ids,
-                    past_key_value, output_attentions,
-                    use_cache, training
-                )
-                return outputs[0] if isinstance(outputs, tuple) else outputs
-                
-            hidden_states = self.process_in_chunks(
-                chunk_forward, hidden_states, self.chunk_size
-            )
+        """Forward pass with memory optimization."""
+        if hidden_states is None:
             return hidden_states
             
-        return self._forward_pass(
-            hidden_states, attention_mask, position_ids,
-            past_key_value, output_attentions,
-            use_cache, training
-        )
-        
-    def _forward_pass(
-        self,
-        hidden_states,
-        attention_mask,
-        position_ids,
-        past_key_value,
-        output_attentions,
-        use_cache,
-        training,
-    ):
-        """Core forward pass implementation."""
-        
+        # Cast inputs to float16
+        hidden_states = tf.cast(hidden_states, tf.float16)
+        if attention_mask is not None:
+            attention_mask = tf.cast(attention_mask, tf.float16)
+            
         all_hidden_states = () if output_attentions else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
         
-        # Use gradient checkpointing if enabled
-        layer_fn = self._checkpointed_layer if self.gradient_checkpointing_enabled else self._regular_layer
-        
-        for idx, decoder_layer in enumerate(self.layers):
-            if output_attentions:
-                all_hidden_states = all_hidden_states + (hidden_states,)
-                
-            past_key_value_layer = past_key_value[idx] if past_key_value is not None else None
+        # Process through layers
+        for i, layer_module in enumerate(self.h):
+            past_key_value_layer = past_key_value[i] if past_key_value is not None else None
             
-            hidden_states, self_attn, present_key_value = layer_fn(
-                decoder_layer,
-                hidden_states,
-                attention_mask,
-                position_ids,
-                past_key_value_layer,
-                output_attentions,
-                use_cache,
-                training,
+            # Process layer with XLA optimization
+            layer_outputs = self._process_layer(
+                layer_module, hidden_states, attention_mask, position_ids,
+                past_key_value_layer, output_attentions, use_cache, training
             )
+                
+            hidden_states = layer_outputs[0]
             
             if use_cache:
-                next_decoder_cache = next_decoder_cache + (present_key_value,)
+                next_decoder_cache += (layer_outputs[-1],)
                 
             if output_attentions:
-                all_self_attns = all_self_attns + (self_attn,)
+                all_self_attns += (layer_outputs[1],)
                 
+        # Final layer norm
         hidden_states = self.norm(hidden_states)
         
-        # Convert back to float32 for output
-        if self.use_mixed_precision:
-            hidden_states = tf.cast(hidden_states, tf.float32)
-            
+        # Prepare outputs
+        outputs = (hidden_states,)
         if output_attentions:
-            all_hidden_states = all_hidden_states + (hidden_states,)
+            outputs += (all_self_attns,)
+        if use_cache:
+            outputs += (next_decoder_cache,)
             
-        if not use_cache:
-            return hidden_states
-            
-        return hidden_states, next_decoder_cache
-        
-    def _checkpointed_layer(
-        self,
-        layer,
-        hidden_states,
-        attention_mask,
-        position_ids,
-        past_key_value,
-        output_attentions,
-        use_cache,
-        training,
-    ):
-        """Run layer with gradient checkpointing."""
-        
-        def create_custom_forward():
-            def custom_forward(*inputs):
-                return layer(inputs[0], 
-                           attention_mask=inputs[1],
-                           position_ids=inputs[2],
-                           output_attentions=output_attentions,
-                           use_cache=use_cache,
-                           training=training)
-            return custom_forward
-            
-        layer_outputs = tf.recompute_grad(create_custom_forward())(
-            hidden_states,
-            attention_mask,
-            position_ids,
-        )
-        
-        if isinstance(layer_outputs, tuple):
-            hidden_states = layer_outputs[0]
-            self_attn = layer_outputs[1] if len(layer_outputs) > 1 else None
-            present_key_value = layer_outputs[2] if len(layer_outputs) > 2 else None
-        else:
-            hidden_states = layer_outputs
-            self_attn = None
-            present_key_value = None
-            
-        return hidden_states, self_attn, present_key_value
-        
-    def _regular_layer(
-        self,
-        layer,
-        hidden_states,
-        attention_mask,
-        position_ids,
-        past_key_value,
-        output_attentions,
-        use_cache,
-        training,
-    ):
-        """Run layer normally."""
-        layer_outputs = layer(
-            hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            training=training,
-        )
-        
-        if isinstance(layer_outputs, tuple):
-            hidden_states = layer_outputs[0]
-            self_attn = layer_outputs[1] if len(layer_outputs) > 1 else None
-            present_key_value = layer_outputs[2] if len(layer_outputs) > 2 else None
-        else:
-            hidden_states = layer_outputs
-            self_attn = None
-            present_key_value = None
-            
-        return hidden_states, self_attn, present_key_value
+        return outputs[0] if len(outputs) == 1 else outputs
 
 
 class OmniGenLayer(layers.Layer):
@@ -831,13 +673,26 @@ class OmniGenMLP(layers.Layer):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         
-        # Initialize components
-        self.gate_up_proj = layers.Dense(2 * intermediate_size, use_bias=True)
-        self.down_proj = layers.Dense(hidden_size, use_bias=True)
+        # Initialize components with mixed precision
+        self.gate_up_proj = layers.Dense(
+            2 * intermediate_size,
+            use_bias=True,
+            dtype=tf.float16,
+            kernel_initializer=tf.keras.initializers.TruncatedNormal(stddev=0.02)
+        )
+        self.down_proj = layers.Dense(
+            hidden_size,
+            use_bias=True,
+            dtype=tf.float16,
+            kernel_initializer=tf.keras.initializers.TruncatedNormal(stddev=0.02)
+        )
         
-    @tf.function(reduce_retracing=True)
+    @tf.function(jit_compile=True)
     def _process_chunk(self, chunk, training=False):
-        """Process a single chunk of data."""
+        """Process a single chunk of data with XLA optimization."""
+        # Cast to float16 for computation
+        chunk = tf.cast(chunk, tf.float16)
+        
         # Project to higher dimension
         gate_up = self.gate_up_proj(chunk)
         
@@ -856,20 +711,17 @@ class OmniGenMLP(layers.Layer):
         batch_size, seq_length, hidden_size = tf.shape(x)[0], tf.shape(x)[1], tf.shape(x)[2]
         
         # Process in smaller chunks to save memory
-        chunk_size = 8  # Smaller chunk size
+        chunk_size = 4  # Even smaller chunks
         outputs = []
         
+        # Process chunks with mixed precision
         for i in range(0, seq_length, chunk_size):
             # Get chunk indices
             end_idx = tf.minimum(i + chunk_size, seq_length)
             chunk = x[:, i:end_idx, :]
             
             # Process chunk
-            if training:
-                chunk_output = tf.recompute_grad(self._process_chunk)(chunk, training)
-            else:
-                chunk_output = self._process_chunk(chunk, training)
-            
+            chunk_output = self._process_chunk(chunk, training)
             outputs.append(chunk_output)
         
         # Combine all chunks
