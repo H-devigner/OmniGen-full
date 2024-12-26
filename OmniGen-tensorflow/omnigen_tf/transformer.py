@@ -667,7 +667,7 @@ class OmniGenLayer(layers.Layer):
         self.input_layernorm = layers.LayerNormalization(epsilon=1e-5, name="input_layernorm")
         self.self_attn = OmniGenAttention(config, name="self_attn")
         self.post_attention_layernorm = layers.LayerNormalization(epsilon=1e-5, name="post_attention_layernorm")
-        self.mlp = OmniGenMLP(config, name="mlp")
+        self.mlp = OmniGenMLP(config.hidden_size, config.intermediate_size, name="mlp")
         
     def call(
         self,
@@ -821,24 +821,48 @@ class OmniGenAttention(layers.Layer):
 class OmniGenMLP(layers.Layer):
     """MLP layer for OmniGen."""
     
-    def __init__(self, config: Phi3Config, **kwargs):
-        """Initialize MLP layer."""
+    def __init__(
+        self,
+        hidden_size,
+        intermediate_size,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
-        
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
         
         # Initialize components
-        self.gate_up_proj = layers.Dense(2 * self.intermediate_size, use_bias=False, name="gate_up_proj")
-        self.down_proj = layers.Dense(self.hidden_size, use_bias=False, name="down_proj")
-        self.act_fn = tf.keras.activations.swish
+        self.gate_up_proj = layers.Dense(2 * intermediate_size, use_bias=True)
+        self.down_proj = layers.Dense(hidden_size, use_bias=True)
         
     def call(self, x, training=False):
-        """Forward pass."""
-        # Split activation
-        gate_up = self.gate_up_proj(x)
-        gate, up = tf.split(gate_up, 2, axis=-1)
+        """Forward pass with chunked processing for memory efficiency."""
+        batch_size, seq_length = tf.shape(x)[0], tf.shape(x)[1]
         
-        # Apply activation
-        return self.down_proj(self.act_fn(gate) * up)
+        # Process in chunks to save memory
+        chunk_size = 4  # Adjust based on available memory
+        num_chunks = (seq_length + chunk_size - 1) // chunk_size
+        
+        outputs = []
+        for i in range(num_chunks):
+            start_idx = i * chunk_size
+            end_idx = min((i + 1) * chunk_size, seq_length)
+            
+            # Process chunk
+            chunk = x[:, start_idx:end_idx, :]
+            
+            # Split activation
+            gate_up = self.gate_up_proj(chunk)
+            gate, up = tf.split(gate_up, 2, axis=-1)
+            
+            # Apply activation
+            gate = tf.keras.activations.swish(gate)
+            hidden_states = gate * up
+            
+            # Down projection
+            hidden_states = self.down_proj(hidden_states)
+            
+            outputs.append(hidden_states)
+        
+        # Concatenate chunks
+        return tf.concat(outputs, axis=1)
