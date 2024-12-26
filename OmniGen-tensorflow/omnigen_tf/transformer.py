@@ -831,47 +831,51 @@ class OmniGenMLP(layers.Layer):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         
-        # Initialize components
+        # Initialize components with smaller chunks
+        self.chunk_size = 16  # Process 16 tokens at a time
         self.gate_up_proj = layers.Dense(2 * intermediate_size, use_bias=True)
         self.down_proj = layers.Dense(hidden_size, use_bias=True)
         
+    @tf.function(reduce_retracing=True)
     def _process_chunk(self, chunk, training=False):
         """Process a single chunk of data."""
-        # Split activation
+        # Project to higher dimension
         gate_up = self.gate_up_proj(chunk)
+        
+        # Split activation
         gate, up = tf.split(gate_up, 2, axis=-1)
         
         # Apply activation and multiply
         gate = tf.keras.activations.swish(gate)
         hidden_states = gate * up
         
-        # Down projection
+        # Project back to original dimension
         return self.down_proj(hidden_states)
         
     def call(self, x, training=False):
-        """Forward pass with aggressive memory optimization."""
+        """Forward pass with memory optimization."""
         batch_size, seq_length = tf.shape(x)[0], tf.shape(x)[1]
         
-        # Use smaller chunks and process in sequence
-        chunk_size = 1  # Process one token at a time
-        outputs = []
+        # Calculate number of chunks
+        num_chunks = (seq_length + self.chunk_size - 1) // self.chunk_size
+        outputs = tf.TensorArray(x.dtype, size=num_chunks, dynamic_size=False)
         
-        # Process each token separately to minimize memory usage
-        for i in range(seq_length):
-            # Extract single token
-            chunk = x[:, i:i+1, :]
+        # Process in chunks
+        for i in range(num_chunks):
+            start_idx = i * self.chunk_size
+            end_idx = tf.minimum(start_idx + self.chunk_size, seq_length)
             
-            # Process chunk with gradient checkpointing if training
+            # Extract chunk
+            chunk = tf.slice(x, [0, start_idx, 0], [-1, end_idx - start_idx, -1])
+            
+            # Process chunk
             if training:
                 chunk_output = tf.recompute_grad(self._process_chunk)(chunk, training)
             else:
                 chunk_output = self._process_chunk(chunk, training)
                 
-            outputs.append(chunk_output)
+            # Store result
+            outputs = outputs.write(i, chunk_output)
             
-            # Clear unnecessary tensors
-            if tf.config.list_physical_devices('GPU'):
-                tf.keras.backend.clear_session()
-        
-        # Concatenate all outputs
-        return tf.concat(outputs, axis=1)
+        # Combine chunks
+        return tf.concat(outputs.stack(), axis=1)
