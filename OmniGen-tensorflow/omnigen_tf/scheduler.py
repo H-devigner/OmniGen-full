@@ -430,18 +430,48 @@ class OmniGenScheduler:
             
             # Ensure model_output is compatible with sample
             if model_output.shape != sample.shape:
-                # Attempt to resize or reduce dimensions
-                if len(model_output.shape) == 3:
-                    # Assume transformer output, reduce to match sample
-                    model_output = tf.reduce_mean(model_output, axis=1)
-                    model_output = tf.reshape(model_output, sample.shape)
-                else:
-                    # Fallback to resizing
+                # Split into unconditional and conditional if batch dimension is different
+                if model_output.shape[0] == 2 and len(model_output.shape) == 3:
+                    model_output_uncond, model_output_text = tf.split(model_output, 2, axis=0)
+                    model_output_uncond = tf.reduce_mean(model_output_uncond, axis=1)
+                    model_output_text = tf.reduce_mean(model_output_text, axis=1)
+                    
+                    model_output_uncond = tf.reshape(
+                        model_output_uncond, 
+                        (1, sample.shape[1], sample.shape[2], -1)
+                    )
+                    model_output_text = tf.reshape(
+                        model_output_text, 
+                        (1, sample.shape[1], sample.shape[2], -1)
+                    )
+                    
+                    # Resize if needed
+                    if model_output_uncond.shape[-1] != sample.shape[-1]:
+                        model_output_uncond = tf.image.resize(
+                            model_output_uncond, 
+                            (sample.shape[1], sample.shape[2]), 
+                            method=tf.image.ResizeMethod.BILINEAR
+                        )
+                        model_output_text = tf.image.resize(
+                            model_output_text, 
+                            (sample.shape[1], sample.shape[2]), 
+                            method=tf.image.ResizeMethod.BILINEAR
+                        )
+                    
+                    # Recombine
+                    model_output = tf.concat([model_output_uncond, model_output_text], axis=0)
+                
+                # Fallback resize if still not matching
+                if model_output.shape != sample.shape:
                     model_output = tf.image.resize(
                         model_output, 
-                        sample.shape[1:3], 
+                        (sample.shape[1], sample.shape[2]), 
                         method=tf.image.ResizeMethod.BILINEAR
                     )
+                
+                # Ensure last dimension matches
+                if model_output.shape[-1] != sample.shape[-1]:
+                    model_output = model_output[..., :sample.shape[-1]]
             
             pred_original_sample = (
                 sample - sqrt_beta_prod_t * model_output

@@ -160,24 +160,58 @@ class OmniGenPipeline:
         print(f"Original noise_pred shape: {noise_pred.shape}")
         print(f"Latents shape: {latents.shape}")
         
-        # If noise_pred is from a transformer output (1, 78, 3072)
+        # If noise_pred is from a transformer output (2, 78, 3072)
         if len(noise_pred.shape) == 3 and noise_pred.shape[-1] == 3072:
-            # Attempt to reduce dimensionality
-            # This is a heuristic and might need adjustment based on your specific model
-            noise_pred = tf.reduce_mean(noise_pred, axis=1)  # Reduce sequence length
-            noise_pred = tf.reshape(noise_pred, (-1, 1, 1, noise_pred.shape[-1] // 16))
+            # Split the batch dimension (unconditional and conditional)
+            noise_pred_uncond, noise_pred_text = tf.split(noise_pred, 2, axis=0)
             
-            # Ensure the last dimension matches latents
-            if noise_pred.shape[-1] != latents.shape[-1]:
-                # If still not matching, use a projection layer or interpolation
-                noise_pred = tf.image.resize(
-                    noise_pred, 
+            # Reduce sequence length and project to latent space
+            noise_pred_uncond = tf.reduce_mean(noise_pred_uncond, axis=1)
+            noise_pred_text = tf.reduce_mean(noise_pred_text, axis=1)
+            
+            # Reshape to match latent dimensions
+            noise_pred_uncond = tf.reshape(
+                noise_pred_uncond, 
+                (1, latents.shape[1], latents.shape[2], -1)
+            )
+            noise_pred_text = tf.reshape(
+                noise_pred_text, 
+                (1, latents.shape[1], latents.shape[2], -1)
+            )
+            
+            # Ensure last dimension matches latents
+            if noise_pred_uncond.shape[-1] != latents.shape[-1]:
+                # Use a simple projection or interpolation
+                noise_pred_uncond = tf.image.resize(
+                    noise_pred_uncond, 
                     (latents.shape[1], latents.shape[2]), 
                     method=tf.image.ResizeMethod.BILINEAR
                 )
+                noise_pred_text = tf.image.resize(
+                    noise_pred_text, 
+                    (latents.shape[1], latents.shape[2]), 
+                    method=tf.image.ResizeMethod.BILINEAR
+                )
+            
+            # Recombine the batches
+            noise_pred = tf.concat([noise_pred_uncond, noise_pred_text], axis=0)
         
-        # Ensure shape matches latents
-        noise_pred = tf.ensure_shape(noise_pred, latents.shape)
+        # If shape still doesn't match, use resize
+        if noise_pred.shape != latents.shape:
+            noise_pred = tf.image.resize(
+                noise_pred, 
+                (latents.shape[1], latents.shape[2]), 
+                method=tf.image.ResizeMethod.BILINEAR
+            )
+        
+        # Ensure the last dimension matches
+        if noise_pred.shape[-1] != latents.shape[-1]:
+            # Project or truncate to match
+            noise_pred = noise_pred[..., :latents.shape[-1]]
+        
+        # Print final shapes for debugging
+        print(f"Converted noise_pred shape: {noise_pred.shape}")
+        print(f"Target latents shape: {latents.shape}")
         
         return noise_pred
 
