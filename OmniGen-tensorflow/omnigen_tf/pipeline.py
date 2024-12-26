@@ -168,36 +168,46 @@ class OmniGenPipeline:
         print(f"Single noise_pred shape: {noise_pred.shape}")
         print(f"Target latents shape: {latents.shape}")
         
-        # If noise_pred is from transformer output (1, 78, 3072)
-        if len(noise_pred.shape) == 3 and noise_pred.shape[-1] == 3072:
-            # Reduce sequence length and project to latent space
-            noise_pred = tf.reduce_mean(noise_pred, axis=1)
-            noise_pred = tf.reshape(
-                noise_pred, 
-                (latents.shape[0], latents.shape[1], latents.shape[2], -1)
-            )
+        # If noise_pred is from transformer output (B, seq_len, hidden_dim)
+        if len(noise_pred.shape) == 3:
+            # Reduce sequence length dimension
+            noise_pred = tf.reduce_mean(noise_pred, axis=1)  # Now (B, hidden_dim)
             
-            # Ensure last dimension matches latents
-            if noise_pred.shape[-1] != latents.shape[-1]:
+            # Calculate target dimensions
+            batch_size = latents.shape[0]
+            height = latents.shape[1]
+            width = latents.shape[2]
+            channels = latents.shape[3]
+            
+            # Project to correct number of dimensions
+            if noise_pred.shape[-1] != height * width * channels:
+                # First reshape to a square image with channels
+                side_length = tf.cast(tf.sqrt(tf.cast(noise_pred.shape[-1] // 4, tf.float32)), tf.int32)
+                noise_pred = tf.reshape(noise_pred, (batch_size, side_length, side_length, channels))
+                
+                # Then resize to target dimensions
                 noise_pred = tf.image.resize(
-                    noise_pred, 
-                    (latents.shape[1], latents.shape[2]), 
-                    method=tf.image.ResizeMethod.BILINEAR
+                    noise_pred,
+                    (height, width),
+                    method=tf.image.ResizeMethod.BICUBIC
                 )
+            else:
+                # If dimensions match, reshape directly
+                noise_pred = tf.reshape(noise_pred, (batch_size, height, width, channels))
         
         # If shape still doesn't match, use resize
-        if noise_pred.shape != latents.shape:
+        if noise_pred.shape[1:3] != latents.shape[1:3]:
             noise_pred = tf.image.resize(
-                noise_pred, 
-                (latents.shape[1], latents.shape[2]), 
-                method=tf.image.ResizeMethod.BILINEAR
+                noise_pred,
+                (latents.shape[1], latents.shape[2]),
+                method=tf.image.ResizeMethod.BICUBIC
             )
         
         # Ensure the last dimension matches
         if noise_pred.shape[-1] != latents.shape[-1]:
             noise_pred = noise_pred[..., :latents.shape[-1]]
         
-        # Print final shapes for debugging
+        # Print final shape for debugging
         print(f"Converted noise_pred shape: {noise_pred.shape}")
         
         return noise_pred
