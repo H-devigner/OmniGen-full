@@ -5,14 +5,11 @@ which is a diffusion model with a Transformer backbone. The implementation
 closely follows the PyTorch version while utilizing TensorFlow-specific optimizations.
 """
 
-import math
+import os
 import tensorflow as tf
-from tensorflow.keras import layers
-from tensorflow.keras.mixed_precision import global_policy
-
-from .transformer import Phi3Config, Phi3Transformer
-from .layers import TimestepEmbedder, FinalLayer, PatchEmbedMR
+from tensorflow.keras import layers, Model
 import numpy as np
+import math
 from typing import Dict, Optional, List, Union
 from safetensors.torch import load_file
 from huggingface_hub import snapshot_download
@@ -21,11 +18,108 @@ import json
 from dataclasses import fields
 import gc
 
+from omnigen_tf.transformer import Phi3Config, Phi3Transformer
+
 
 @tf.function(jit_compile=True)
 def modulate(x, shift, scale):
     """Apply adaptive layer normalization modulation."""
     return x * (1 + tf.expand_dims(scale, 1)) + tf.expand_dims(shift, 1)
+
+
+class TimestepEmbedder(Model):
+    """Embeds scalar timesteps into vector representations."""
+    
+    def __init__(self, hidden_size, frequency_embedding_size=256, **kwargs):
+        super().__init__(**kwargs)
+        self.mlp = tf.keras.Sequential([
+            layers.Dense(hidden_size, use_bias=True),
+            layers.Activation('silu'),
+            layers.Dense(hidden_size, use_bias=True)
+        ])
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    @tf.function(jit_compile=True)
+    def timestep_embedding(t, dim, max_period=10000):
+        """
+        Create sinusoidal timestep embeddings.
+        :param t: a 1-D Tensor of N indices, one per batch element.
+                          These may be fractional.
+        :param dim: the dimension of the output.
+        :param max_period: controls the minimum frequency of the embeddings.
+        :return: an (N, D) Tensor of positional embeddings.
+        """
+        half = dim // 2
+        freqs = tf.exp(
+            -math.log(max_period) * tf.range(half, dtype=t.dtype) / half
+        )
+        args = tf.cast(t[:, None], dtype=freqs.dtype) * freqs[None]
+        embedding = tf.concat([tf.cos(args), tf.sin(args)], axis=-1)
+        if dim % 2:
+            embedding = tf.concat([embedding, tf.zeros_like(embedding[:, :1])], axis=-1)
+        return embedding
+
+    def call(self, t, dtype=tf.float32):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_freq = tf.cast(t_freq, dtype)
+        t_emb = self.mlp(t_freq)
+        return t_emb
+
+
+class PatchEmbed(layers.Layer):
+    """2D Image to Patch Embedding."""
+    
+    def __init__(self, embed_dim=768, patch_size=16, in_channels=3, **kwargs):
+        """Initialize patch embedding layer."""
+        super().__init__(**kwargs)
+        self.embed_dim = embed_dim
+        self.patch_size = patch_size
+        self.in_channels = in_channels
+        
+        # Initialize projection layer
+        self.proj = layers.Conv2D(
+            filters=embed_dim,
+            kernel_size=patch_size,
+            strides=patch_size,
+            padding='valid',
+            name='proj'
+        )
+        
+    def call(self, x):
+        """Forward pass."""
+        # Rearrange input to NCHW format
+        if x.shape[-1] == self.in_channels:  # NHWC format
+            x = tf.transpose(x, [0, 3, 1, 2])
+            
+        B, C, H, W = x.shape
+        
+        # Ensure input dimensions are compatible with patch size
+        if H % self.patch_size != 0 or W % self.patch_size != 0:
+            raise ValueError(
+                f"Input image dimensions ({H}, {W}) must be divisible by "
+                f"patch size ({self.patch_size})"
+            )
+            
+        # Convert back to NHWC for Conv2D
+        x = tf.transpose(x, [0, 2, 3, 1])
+        
+        # Apply patch embedding
+        x = self.proj(x)
+        
+        # Reshape to (B, N, C)
+        x = tf.reshape(x, [B, -1, self.embed_dim])
+        
+        return x
+        
+    def get_num_patches(self, h, w):
+        """Get number of patches for given input dimensions."""
+        if h % self.patch_size != 0 or w % self.patch_size != 0:
+            raise ValueError(
+                f"Input image dimensions ({h}, {w}) must be divisible by "
+                f"patch size ({self.patch_size})"
+            )
+        return (h // self.patch_size) * (w // self.patch_size)
 
 
 class TimeToken(tf.keras.layers.Layer):
@@ -64,6 +158,29 @@ class TimeToken(tf.keras.layers.Layer):
         return config
 
 
+class FinalLayer(layers.Layer):
+    """Final layer for image generation."""
+    
+    def __init__(self, patch_size, in_channels, embed_dim, **kwargs):
+        super().__init__(**kwargs)
+        self.patch_size = patch_size
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        
+        # Initialize projection layer
+        self.proj = layers.Dense(patch_size * patch_size * in_channels, name="proj")
+        
+    def call(self, x, time_emb):
+        """Forward pass."""
+        # Add time embedding
+        x = x + time_emb[:, None, :]
+        
+        # Project to patch space
+        x = self.proj(x)
+        
+        return x
+
+
 class OmniGen(Model):
     """OmniGen model implementation."""
     
@@ -76,494 +193,111 @@ class OmniGen(Model):
         pos_embed_max_size=192,
         **kwargs
     ):
-        """Initialize OmniGen model."""
+        """Initialize model."""
         super().__init__(**kwargs)
         
-        self.transformer_config = transformer_config
-        self.in_channels = in_channels
-        self.out_channels = in_channels
-        self.patch_size = patch_size
-        self.pos_embed_max_size = pos_embed_max_size
-        self.pe_interpolation = pe_interpolation
+        if not isinstance(transformer_config, Phi3Config):
+            transformer_config = Phi3Config(**transformer_config)
         
         hidden_size = transformer_config.hidden_size
         
-        # Initialize components with mixed precision
-        self.x_embedder = PatchEmbedMR(patch_size, in_channels, hidden_size, bias=True)
-        self.input_x_embedder = PatchEmbedMR(patch_size, in_channels, hidden_size, bias=True)
-        
-        self.time_token = TimestepEmbedder(hidden_size)
-        self.t_embedder = TimestepEmbedder(hidden_size)
-        
-        # Initialize position embeddings
-        pos_embed = self._get_2d_sincos_pos_embed(
-            hidden_size,
-            pos_embed_max_size,
-            interpolation_scale=pe_interpolation,
-            base_size=64
+        # Initialize embedders
+        self.x_embedder = PatchEmbed(
+            embed_dim=hidden_size,
+            patch_size=patch_size,
+            in_channels=in_channels,
+            name="x_embedder"
         )
-        self.pos_embed = tf.Variable(
-            initial_value=pos_embed,
-            trainable=False,
-            name="pos_embed"
+        self.input_x_embedder = PatchEmbed(
+            embed_dim=hidden_size,
+            patch_size=patch_size,
+            in_channels=in_channels,
+            name="input_x_embedder"
         )
         
-        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+        # Initialize time embedders
+        self.time_token = TimestepEmbedder(hidden_size, name="time_token")
+        self.t_embedder = TimestepEmbedder(hidden_size, name="t_embedder")
         
         # Initialize transformer
-        self.transformer = Phi3Transformer(config=transformer_config)
-        self.transformer.config.use_cache = False
+        self.transformer = Phi3Transformer(transformer_config, name="transformer")
         
-        # Initialize weights
-        self.initialize_weights()
+        # Store configs
+        self.patch_size = patch_size
+        self.in_channels = in_channels
+        self.pos_embed_max_size = pos_embed_max_size
+        self.pe_interpolation = pe_interpolation
+        self.hidden_size = hidden_size
         
-    def enable_memory_efficient_inference(self, chunk_size=None):
-        """Enable memory efficient inference."""
-        if chunk_size is not None:
-            self.chunk_size = chunk_size
-        self.memory_efficient = True
-        self.gradient_checkpointing = True
-        self.transformer.enable_gradient_checkpointing()
-        
-    def disable_memory_efficient_inference(self):
-        """Disable memory efficient inference mode."""
-        self.memory_efficient = False
-        self.gradient_checkpointing = False
-        self.transformer.disable_gradient_checkpointing()
-        
-    def _create_weights_mapping(self):
-        """Create mapping between PyTorch and TensorFlow weight names."""
-        self.weights_map = {}
-        
-        # Transformer mappings
-        self.weights_map.update({
-            "transformer/wte/embeddings": "transformer.wte.weight",
-            "transformer/norm/gamma": "transformer.norm.weight",
-            "transformer/norm/beta": "transformer.norm.bias",
-        })
-        
-        # Layer mappings
-        for i in range(self.transformer_config.num_hidden_layers):
-            layer_map = {
-                f"transformer/layer_{i}/input_layernorm/gamma": f"transformer.layers.{i}.input_layernorm.weight",
-                f"transformer/layer_{i}/input_layernorm/beta": f"transformer.layers.{i}.input_layernorm.bias",
-                f"transformer/layer_{i}/self_attn/qkv_proj/kernel": f"transformer.layers.{i}.self_attn.qkv_proj.weight",
-                f"transformer/layer_{i}/self_attn/qkv_proj/bias": f"transformer.layers.{i}.self_attn.qkv_proj.bias",
-                f"transformer/layer_{i}/self_attn/o_proj/kernel": f"transformer.layers.{i}.self_attn.o_proj.weight",
-                f"transformer/layer_{i}/self_attn/o_proj/bias": f"transformer.layers.{i}.self_attn.o_proj.bias",
-                f"transformer/layer_{i}/post_attention_layernorm/gamma": f"transformer.layers.{i}.post_attention_layernorm.weight",
-                f"transformer/layer_{i}/post_attention_layernorm/beta": f"transformer.layers.{i}.post_attention_layernorm.bias",
-                f"transformer/layer_{i}/mlp/gate_up_proj/kernel": f"transformer.layers.{i}.mlp.gate_up_proj.weight",
-                f"transformer/layer_{i}/mlp/gate_up_proj/bias": f"transformer.layers.{i}.mlp.gate_up_proj.bias",
-                f"transformer/layer_{i}/mlp/down_proj/kernel": f"transformer.layers.{i}.mlp.down_proj.weight",
-                f"transformer/layer_{i}/mlp/down_proj/bias": f"transformer.layers.{i}.mlp.down_proj.bias",
-            }
-            self.weights_map.update(layer_map)
-            
-        # Other components mappings
-        self.weights_map.update({
-            "x_embedder/proj/kernel": "x_embedder.proj.weight",
-            "x_embedder/proj/bias": "x_embedder.proj.bias",
-            "time_token/mlp_0/kernel": "time_token.mlp.0.weight",
-            "time_token/mlp_0/bias": "time_token.mlp.0.bias",
-            "time_token/mlp_2/kernel": "time_token.mlp.2.weight",
-            "time_token/mlp_2/bias": "time_token.mlp.2.bias",
-            "final_layer/proj/kernel": "final_layer.proj.weight",
-            "final_layer/proj/bias": "final_layer.proj.bias",
-        })
-
-    def load_weights_from_safetensors(self, weights_file):
-        """Load weights from safetensors file."""
-        print("Loading safetensors weights...")
-        from safetensors.torch import load_file
-        
-        # Load state dict
-        state_dict = load_file(weights_file)
-        
-        # Convert weights to TensorFlow format
-        tf_weights = {}
-        for pt_name, param in state_dict.items():
-            # Get corresponding TF name
-            tf_name = self.weights_map.get(pt_name)
-            if tf_name is not None:
-                # Convert tensor to numpy array
-                param_np = param.numpy()
-                tf_weights[tf_name] = param_np
-                
-        # Load weights into model
-        for w in self.trainable_weights:
-            if w.name in tf_weights:
-                w.assign(tf_weights[w.name])
-                
-        print("Weights loaded successfully!")
-
-    def initialize_weights(self):
-        """Initialize model weights to match PyTorch implementation."""
-        # Initialize transformer layers
-        def _basic_init(module):
-            if isinstance(module, layers.Dense):
-                # Xavier uniform initialization
-                limit = tf.sqrt(6. / float(module.input_dim + module.units))
-                module.kernel.assign(tf.random.uniform(
-                    module.kernel.shape, -limit, limit
-                ))
-                if module.use_bias:
-                    module.bias.assign(tf.zeros_like(module.bias))
-                    
-        for layer in self.layers:
-            if hasattr(layer, 'kernel'):
-                _basic_init(layer)
-        
-        # Initialize patch_embed like Dense (instead of Conv2D)
-        for embedder in [self.x_embedder]:
-            w = embedder.proj.kernel
-            # Reshape to 2D for Xavier initialization
-            w_flat = tf.reshape(w, [w.shape[0], -1])
-            limit = tf.sqrt(6. / float(w_flat.shape[0] + w_flat.shape[1]))
-            w_init = tf.random.uniform(w_flat.shape, -limit, limit)
-            # Reshape back to 4D
-            embedder.proj.kernel.assign(tf.reshape(w_init, w.shape))
-            embedder.proj.bias.assign(tf.zeros_like(embedder.proj.bias))
-
-        # Initialize timestep embedding MLP with normal distribution
-        std = 0.02
-        for embedder in [self.time_token]:
-            for layer in embedder.mlp.layers:
-                if isinstance(layer, layers.Dense):
-                    layer.kernel.assign(tf.random.normal(
-                        layer.kernel.shape, mean=0.0, stddev=std
-                    ))
-
-        # Zero-out output layers
-        self.final_layer.proj.kernel.assign(
-            tf.zeros_like(self.final_layer.proj.kernel)
-        )
-        self.final_layer.proj.bias.assign(
-            tf.zeros_like(self.final_layer.proj.bias)
-        )
-
     def call(
         self,
-        x,
+        latents,
         timestep,
-        input_ids,
+        input_ids=None,
         attention_mask=None,
-        position_ids=None,
-        training=False
+        training=False,
     ):
-        """Forward pass."""
-        # Get batch size and sequence length
-        batch_size = tf.shape(x)[0]
+        """Model forward pass."""
+        # Cast inputs to float32
+        latents = tf.cast(latents, tf.float32)
+        timestep = tf.cast(timestep, tf.int32)
         
-        # Embed timestep
-        t_emb = self.time_token(timestep)  # [B, D]
+        # Get batch size and dimensions
+        batch_size = tf.shape(latents)[0]
+        h = tf.shape(latents)[1]
+        w = tf.shape(latents)[2]
         
-        # Patch embed the input
-        x = self.x_embedder(x)  # [B, H*W, D]
+        # Embed latents
+        x = self.x_embedder(latents)  # [B, H*W, C]
         
-        # Get positional embeddings
-        pos_embed = self.get_pos_embed(x.shape[1])  # [1, H*W, D]
-        x = x + pos_embed
+        # Create position IDs
+        position_ids = tf.range(tf.shape(x)[1], dtype=tf.int32)[None]
+        position_ids = tf.tile(position_ids, [batch_size, 1])
         
-        # Prepare transformer inputs
-        hidden_states = x
+        # Get timestep embeddings
+        t_emb = self.t_embedder(timestep[None])  # [1, C]
+        time_tokens = self.time_token(timestep[None])  # [1, C]
         
-        # Add time token at the beginning
-        time_tokens = tf.expand_dims(t_emb, axis=1)  # [B, 1, D]
-        hidden_states = tf.concat([time_tokens, hidden_states], axis=1)
+        # Add time tokens to beginning of sequence
+        time_tokens = tf.tile(time_tokens, [batch_size, 1])  # [B, C]
+        time_tokens = time_tokens[:, None, :]  # [B, 1, C]
+        x = tf.concat([time_tokens, x], axis=1)  # [B, 1+H*W, C]
         
-        # Create attention mask including time token
-        if attention_mask is not None:
-            # Add attention mask for time token
-            time_token_mask = tf.ones((batch_size, 1), dtype=attention_mask.dtype)
-            attention_mask = tf.concat([time_token_mask, attention_mask], axis=1)
+        # Update position IDs for time token
+        position_ids = tf.pad(position_ids, [[0, 0], [1, 0]])
         
-        # Update position IDs to account for time token
-        if position_ids is not None:
-            time_token_pos = tf.zeros((batch_size, 1), dtype=position_ids.dtype)
-            position_ids = tf.concat([time_token_pos, position_ids], axis=1)
-        
-        # Pass through transformer
-        transformer_outputs = self.transformer(
-            input_ids=input_ids,
+        # Process through transformer
+        x = self.transformer(
+            x,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            inputs_embeds=hidden_states,
             training=training
         )
-        
-        hidden_states = transformer_outputs[0]
         
         # Remove time token
-        hidden_states = hidden_states[:, 1:]
+        x = x[:, 1:]  # [B, H*W, C]
         
-        # Final layer
-        output = self.final_layer(hidden_states, t_emb)
+        # Reshape to image dimensions
+        x = self.unpatchify(x, h, w)  # [B, H, W, C]
         
-        # Reshape to image
-        height = width = int(tf.sqrt(tf.cast(hidden_states.shape[1], tf.float32)))
-        output = tf.reshape(output, [batch_size, height, width, self.in_channels])
+        return x
         
-        return output
+    def unpatchify(self, x, h, w):
+        """
+        x: (N, T, patch_size**2 * C)
+        imgs: (N, H, W, C)
+        """
+        p = self.patch_size
+        c = self.in_channels
         
-    def get_pos_embed(self, sequence_length):
-        """Get position embeddings."""
-        if not hasattr(self, "pos_embed"):
-            # Initialize position embeddings
-            pos_embed = self._get_2d_sincos_pos_embed(
-                self.transformer_config.hidden_size,
-                int(tf.sqrt(tf.cast(sequence_length, tf.float32)))
-            )
-            self.pos_embed = tf.Variable(
-                initial_value=pos_embed,
-                trainable=False,
-                name="pos_embed"
-            )
-        return self.pos_embed[:, :sequence_length]
+        # Calculate dimensions
+        h_unpatched = h * p
+        w_unpatched = w * p
         
-    def _get_2d_sincos_pos_embed(self, embed_dim, grid_size):
-        """Generate 2D sinusoidal position embeddings."""
-        grid_h = tf.range(grid_size, dtype=tf.float32)
-        grid_w = tf.range(grid_size, dtype=tf.float32)
-        grid = tf.stack(tf.meshgrid(grid_w, grid_h, indexing='xy'), axis=0)
-        grid = tf.reshape(grid, [2, 1, grid_size, grid_size])
+        # Reshape to image dimensions
+        x = tf.reshape(x, [-1, h, w, self.hidden_size])  # [B, H, W, C]
         
-        emb_h = self._get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])
-        emb_w = self._get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])
-        
-        pos_embed = tf.concat([emb_h, emb_w], axis=-1)
-        return tf.expand_dims(pos_embed, 0)
-        
-    def _get_1d_sincos_pos_embed_from_grid(self, embed_dim, pos):
-        """Generate 1D sinusoidal position embeddings."""
-        omega = tf.exp(
-            -math.log(10000) * tf.range(embed_dim // 2, dtype=tf.float32) / embed_dim
-        )
-        
-        pos = tf.cast(tf.reshape(pos, [-1]), tf.float32)
-        out = tf.einsum('m,d->md', pos, omega)
-        
-        emb_sin = tf.sin(out)
-        emb_cos = tf.cos(out)
-        
-        pos_embed = tf.concat([emb_sin, emb_cos], axis=-1)
-        return pos_embed
-
-    def patch_multiple_resolutions(self, latents, padding_latent=None, is_input_images=False):
-        """Process input latents with multiple resolutions."""
-        if isinstance(latents, list):
-            # Handle list of latents
-            all_latents = []
-            all_num_tokens = []
-            all_shapes = []
-            
-            for x in latents:
-                height = tf.shape(x)[1]
-                width = tf.shape(x)[2]
-                
-                # Store original shape for position embeddings
-                orig_h, orig_w = height, width
-                
-                # Apply embedding (keeping NHWC format)
-                if is_input_images:
-                    x = self.x_embedder(x)  # Returns [B, N, C]
-                else:
-                    x = self.x_embedder(x)  # Returns [B, N, C]
-                
-                # Calculate number of patches
-                num_patches = (height // self.patch_size) * (width // self.patch_size)
-                
-                # Add position embeddings
-                pos_embed = self.get_pos_embed(orig_h, orig_w)
-                pos_embed = tf.reshape(pos_embed, [1, -1, self.transformer_config.hidden_size])
-                pos_embed = pos_embed[:, :num_patches, :]  # Only use as many position embeddings as patches
-                x = x + pos_embed
-                
-                all_latents.append(x)
-                all_num_tokens.append(tf.shape(x)[1])
-                all_shapes.append((orig_h, orig_w))
-                
-            # Pad and concatenate
-            max_tokens = tf.reduce_max(all_num_tokens)
-            padded_latents = []
-            
-            for x, num_tokens in zip(all_latents, all_num_tokens):
-                if num_tokens < max_tokens:
-                    padding = tf.zeros((tf.shape(x)[0], max_tokens - num_tokens, tf.shape(x)[-1]))
-                    x = tf.concat([x, padding], axis=1)
-                padded_latents.append(x)
-                
-            latents = tf.concat(padded_latents, axis=0)
-            return latents, all_num_tokens, all_shapes
-            
-        else:
-            # Handle single latent
-            height = tf.shape(latents)[1]
-            width = tf.shape(latents)[2]
-            
-            # Store original shape for position embeddings
-            orig_h, orig_w = height, width
-            
-            # Apply embedding (keeping NHWC format)
-            if is_input_images:
-                latents = self.x_embedder(latents)  # Returns [B, N, C]
-            else:
-                latents = self.x_embedder(latents)  # Returns [B, N, C]
-            
-            # Calculate number of patches
-            num_patches = (height // self.patch_size) * (width // self.patch_size)
-            
-            # Add position embeddings
-            pos_embed = self.get_pos_embed(orig_h, orig_w)
-            pos_embed = tf.reshape(pos_embed, [1, -1, self.transformer_config.hidden_size])
-            pos_embed = pos_embed[:, :num_patches, :]  # Only use as many position embeddings as patches
-            latents = latents + pos_embed
-            
-            num_tokens = tf.shape(latents)[1]
-            return latents, num_tokens, [(orig_h, orig_w)]
-            
-    def _chunked_forward(self, latents, timestep, input_ids, attention_mask=None, training=False):
-        """Forward pass with chunking for memory efficiency."""
-        # Process in chunks
-        chunk_size = self.chunk_size
-        chunks = tf.shape(latents)[1] // chunk_size + (1 if tf.shape(latents)[1] % chunk_size != 0 else 0)
-        
-        outputs = []
-        for i in range(chunks):
-            start_idx = i * chunk_size
-            end_idx = min(start_idx + chunk_size, tf.shape(latents)[1])
-            chunk = latents[:, start_idx:end_idx]
-            
-            # Process chunk
-            chunk_output = self._forward(chunk, timestep, input_ids, attention_mask, training)
-            outputs.append(chunk_output)
-            
-        # Combine chunks
-        return tf.concat(outputs, axis=1)
-        
-    def _forward(self, latents, timestep, input_ids, attention_mask=None, training=False):
-        """Forward pass without chunking."""
-        batch_size = tf.shape(latents)[0]
-        
-        # Get input shape
-        shapes = tf.shape(latents)
-        
-        # Process inputs
-        x = self.x_embedder(latents)  # Shape: [batch_size, num_patches, hidden_size]
-        
-        # Get position embeddings for actual spatial dimensions
-        h, w = tf.cast(shapes[1], tf.int32), tf.cast(shapes[2], tf.int32)
-        pos_embed = self.get_pos_embed(h, w)
-        
-        # Add time embedding
-        # Expand timestep to match batch size
-        t = tf.fill([batch_size], timestep)
-        time_embed = self.time_token(t)
-        
-        # Combine embeddings with time embedding
-        x = x + tf.expand_dims(time_embed, axis=1)  # Add time embedding to each position
-        
-        # Get text embeddings from input_ids and expand to match batch size
-        text_embeds = self.transformer.wte(input_ids)  # Shape: [1, seq_len, hidden_size]
-        text_embeds = tf.repeat(text_embeds, batch_size, axis=0)  # Shape: [batch_size, seq_len, hidden_size]
-        
-        # Combine image and text embeddings
-        hidden_states = tf.concat([text_embeds, x], axis=1)
-        
-        # Create combined attention mask if needed
-        if attention_mask is not None:
-            # Expand attention mask to match batch size
-            attention_mask = tf.repeat(attention_mask, batch_size, axis=0)
-            # Create attention mask for image tokens (all 1s)
-            image_attention = tf.ones((batch_size, tf.shape(x)[1]), dtype=attention_mask.dtype)
-            # Combine text and image attention masks
-            combined_attention = tf.concat([attention_mask, image_attention], axis=1)
-        else:
-            combined_attention = None
-        
-        # Run through transformer
-        output = self.transformer.transformer(
-            hidden_states,
-            attention_mask=combined_attention,
-            position_ids=None,
-            past_key_value=None,
-            output_attentions=False,
-            use_cache=False,
-            training=training
-        )
-        
-        if isinstance(output, tuple):
-            output = output[0]
-            
-        return output
-
-    def decode(self, latents):
-        """Decode latents to image."""
-        # Add decoding logic here
-        return latents  # Placeholder for now
-
-    def get_config(self):
-        """Get model configuration."""
-        config = super().get_config()
-        config.update({
-            'transformer_config': self.transformer_config.to_dict(),
-            'patch_size': self.patch_size,
-            'in_channels': self.in_channels,
-            'pe_interpolation': self.pe_interpolation,
-            'pos_embed_max_size': self.pos_embed_max_size,
-        })
-        return config
-        
-    @classmethod
-    def from_config(cls, config):
-        """Create model from configuration."""
-        # Extract transformer config
-        transformer_config = config.pop('transformer_config', None)
-        if transformer_config is not None:
-            transformer_config = Phi3Config(**transformer_config)
-            
-        # Create model
-        return cls(transformer_config=transformer_config, **config)
-
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs) -> "OmniGen":
-        """Load pretrained model."""
-        # Get model path
-        model_path = pretrained_model_name_or_path
-        if not os.path.exists(model_path):
-            cache_folder = os.getenv('HF_HUB_CACHE')
-            model_path = snapshot_download(
-                repo_id=pretrained_model_name_or_path,
-                cache_dir=cache_folder,
-                ignore_patterns=['flax_model.msgpack', 'rust_model.ot', 'tf_model.h5']
-            )
-            
-        # Load config
-        config_path = os.path.join(model_path, "config.json")
-        if os.path.exists(config_path):
-            with open(config_path, 'r') as f:
-                config_dict = json.load(f)
-        else:
-            config_dict = {}
-            
-        # Update config with any provided kwargs
-        transformer_config = kwargs.pop('transformer_config', {})
-        config_dict.update(transformer_config)
-        
-        # Create config
-        config = Phi3Config(**config_dict)
-        
-        # Create model
-        model = cls(transformer_config=config, **kwargs)
-        
-        # Load weights
-        weights_file = os.path.join(model_path, "model.safetensors")
-        if os.path.exists(weights_file):
-            model.load_weights_from_safetensors(weights_file)
-        else:
-            print(f"No weights found at {weights_file}")
-            
-        return model
+        return x
 
 def get_2d_sincos_pos_embed(
     embed_dim,
