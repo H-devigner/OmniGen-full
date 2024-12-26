@@ -334,29 +334,35 @@ class OmniGen(Model):
         # Load weights
         weights_file = os.path.join(model_path, "model.safetensors")
         if os.path.exists(weights_file):
-            # Load safetensors weights
-            state_dict = load_file(weights_file)
+            print("Loading weights from safetensors...")
             
-            # Map weights to TensorFlow format
-            for name, weight in state_dict.items():
-                try:
-                    # Find corresponding layer in TF model
-                    if name.startswith('transformer.'):
-                        tf_name = name.replace('transformer.', 'transformer/')
-                    else:
-                        tf_name = name.replace('.', '/')
+            # Load weights on CPU first
+            with tf.device('/CPU:0'):
+                state_dict = load_file(weights_file)
+                
+                # Map weights to TensorFlow format
+                for name, weight in state_dict.items():
+                    try:
+                        # Convert weight to numpy array on CPU
+                        weight_np = weight.numpy()
                         
-                    # Get layer by name
-                    layer = model.get_layer(tf_name)
-                    if layer is not None:
-                        # Assign weights
-                        if 'weight' in name:
-                            layer.kernel.assign(weight)
-                        elif 'bias' in name:
-                            layer.bias.assign(weight)
-                except Exception as e:
-                    print(f"Warning: Could not load weight {name}: {str(e)}")
-                    
+                        # Find corresponding layer in TF model
+                        if name.startswith('transformer.'):
+                            tf_name = name.replace('transformer.', 'transformer/')
+                        else:
+                            tf_name = name.replace('.', '/')
+                            
+                        # Get layer by name
+                        layer = model.get_layer(tf_name)
+                        if layer is not None:
+                            # Assign weights
+                            if 'weight' in name:
+                                layer.kernel.assign(weight_np)
+                            elif 'bias' in name:
+                                layer.bias.assign(weight_np)
+                    except Exception as e:
+                        print(f"Warning: Could not load weight {name}: {str(e)}")
+                        
             print("Weights loaded successfully!")
         else:
             print(f"No weights found at {weights_file}")

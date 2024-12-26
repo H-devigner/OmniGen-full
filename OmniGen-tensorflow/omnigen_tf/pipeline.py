@@ -12,7 +12,7 @@ from omnigen_tf.model import OmniGen
 from omnigen_tf.scheduler import OmniGenScheduler
 from omnigen_tf.processor import OmniGenProcessor
 
-# Configure GPU memory growth before any other TensorFlow operations
+# Configure GPU memory growth
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
     try:
@@ -35,12 +35,6 @@ class OmniGenPipeline:
             # Use GPU if available
             if tf.config.list_physical_devices('GPU'):
                 device = '/GPU:0'
-                # Enable memory growth to avoid OOM
-                for gpu in tf.config.list_physical_devices('GPU'):
-                    try:
-                        tf.config.experimental.set_memory_growth(gpu, True)
-                    except:
-                        pass
                 # Set mixed precision policy
                 tf.keras.mixed_precision.set_global_policy('mixed_float16')
             else:
@@ -53,6 +47,15 @@ class OmniGenPipeline:
     @classmethod
     def from_pretrained(cls, model_name):
         """Load pretrained model."""
+        # Configure GPU memory growth
+        gpus = tf.config.list_physical_devices('GPU')
+        if gpus:
+            try:
+                for gpu in gpus:
+                    tf.config.experimental.set_memory_growth(gpu, True)
+            except RuntimeError as e:
+                print(f"GPU memory growth setting failed: {e}")
+        
         if not os.path.exists(model_name):
             print(f"Model not found at {model_name}, downloading from HuggingFace...")
             cache_folder = os.getenv('HF_HUB_CACHE')
@@ -62,10 +65,11 @@ class OmniGenPipeline:
                 ignore_patterns=['flax_model.msgpack', 'rust_model.ot', 'tf_model.h5']
             )
             
-        # Initialize components
-        model = OmniGen.from_pretrained(model_name)  # Config will be loaded from model_name/config.json
-        processor = OmniGenProcessor.from_pretrained(model_name)
-        scheduler = OmniGenScheduler()
+        # Initialize components on CPU first
+        with tf.device('/CPU:0'):
+            model = OmniGen.from_pretrained(model_name)
+            processor = OmniGenProcessor.from_pretrained(model_name)
+            scheduler = OmniGenScheduler()
         
         return cls(model, scheduler, processor)
 
