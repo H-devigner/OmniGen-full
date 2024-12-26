@@ -690,9 +690,6 @@ class OmniGenMLP(layers.Layer):
     @tf.function(jit_compile=True)
     def _process_chunk(self, chunk, training=False):
         """Process a single chunk of data with XLA optimization."""
-        # Cast to float16 for computation
-        chunk = tf.cast(chunk, tf.float16)
-        
         # Project to higher dimension
         gate_up = self.gate_up_proj(chunk)
         
@@ -708,21 +705,18 @@ class OmniGenMLP(layers.Layer):
         
     def call(self, x, training=False):
         """Forward pass with memory optimization."""
-        batch_size, seq_length, hidden_size = tf.shape(x)[0], tf.shape(x)[1], tf.shape(x)[2]
+        # Cast input to float16
+        x = tf.cast(x, tf.float16)
         
-        # Process in smaller chunks to save memory
-        chunk_size = 4  # Even smaller chunks
-        outputs = []
+        # Project to higher dimension
+        gate_up = self.gate_up_proj(x)
         
-        # Process chunks with mixed precision
-        for i in range(0, seq_length, chunk_size):
-            # Get chunk indices
-            end_idx = tf.minimum(i + chunk_size, seq_length)
-            chunk = x[:, i:end_idx, :]
-            
-            # Process chunk
-            chunk_output = self._process_chunk(chunk, training)
-            outputs.append(chunk_output)
+        # Split activation
+        gate, up = tf.split(gate_up, 2, axis=-1)
         
-        # Combine all chunks
-        return tf.concat(outputs, axis=1)
+        # Apply activation and multiply
+        gate = tf.keras.activations.swish(gate)
+        hidden_states = gate * up
+        
+        # Project back to original dimension
+        return self.down_proj(hidden_states)
