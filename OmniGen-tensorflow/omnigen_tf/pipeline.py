@@ -72,8 +72,11 @@ class OmniGenPipeline:
             input_ids = tf.cast(inputs["input_ids"], tf.int32)
             attention_mask = tf.cast(inputs.get("attention_mask", None), tf.int32)
             
+            # Calculate position IDs
+            seq_length = tf.shape(input_ids)[1]
+            position_ids = tf.range(seq_length, dtype=tf.int32)[tf.newaxis, :]
+            
             # Initialize latents on GPU with smaller batch size
-            # Note: latent size is 8x smaller than final image size
             latent_height = height // 8
             latent_width = width // 8
             latents_shape = (1, latent_height, latent_width, 4)
@@ -83,45 +86,33 @@ class OmniGenPipeline:
             self.scheduler.set_timesteps(num_inference_steps)
             timesteps = tf.cast(self.scheduler.timesteps, tf.int32)
             
+            # Prepare for classifier-free guidance
+            unconditional_input_ids = tf.zeros_like(input_ids)
+            unconditional_attention_mask = tf.zeros_like(attention_mask)
+            
             # Denoising loop with memory-efficient processing
             for i, t in enumerate(timesteps):
                 # Convert timestep to scalar
                 timestep = tf.cast(t, tf.int32)
+                timestep_tensor = tf.fill([1], timestep)
                 
-                # Process unconditional and conditional separately to save memory
-                # First process unconditional (no prompt)
-                noise_pred_uncond = self.model(
-                    latents=latents,
-                    timestep=timestep,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
+                # Prepare latent input
+                latent_model_input = tf.concat([latents] * 2, axis=0)
+                
+                # Process unconditional and conditional in one pass
+                noise_pred = self.model(
+                    latent_model_input,
+                    timestep=timestep_tensor,
+                    input_ids=tf.concat([unconditional_input_ids, input_ids], axis=0),
+                    attention_mask=tf.concat([unconditional_attention_mask, attention_mask], axis=0),
+                    position_ids=tf.concat([position_ids, position_ids], axis=0),
                     training=False
                 )
                 
-                if isinstance(noise_pred_uncond, tuple):
-                    noise_pred_uncond = noise_pred_uncond[0]
-                elif isinstance(noise_pred_uncond, dict):
-                    noise_pred_uncond = noise_pred_uncond["sample"]
+                # Split predictions
+                noise_pred_uncond, noise_pred_text = tf.split(noise_pred, num_or_size_splits=2, axis=0)
                 
-                # Then process conditional (with prompt)
-                noise_pred_text = self.model(
-                    latents=latents,
-                    timestep=timestep,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    training=False
-                )
-                
-                if isinstance(noise_pred_text, tuple):
-                    noise_pred_text = noise_pred_text[0]
-                elif isinstance(noise_pred_text, dict):
-                    noise_pred_text = noise_pred_text["sample"]
-                
-                # Convert predictions to match latents shape (all in float16)
-                noise_pred_uncond = tf.cast(self._convert_single_noise_pred(noise_pred_uncond, latents), tf.float16)
-                noise_pred_text = tf.cast(self._convert_single_noise_pred(noise_pred_text, latents), tf.float16)
-                
-                # Perform guidance (keep on GPU)
+                # Perform guidance
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
                 
                 # Compute previous noisy sample x_t -> x_t-1

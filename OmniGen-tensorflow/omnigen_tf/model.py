@@ -5,11 +5,14 @@ which is a diffusion model with a Transformer backbone. The implementation
 closely follows the PyTorch version while utilizing TensorFlow-specific optimizations.
 """
 
-import os
-import tensorflow as tf
-from tensorflow.keras import layers, Model
-import numpy as np
 import math
+import tensorflow as tf
+from tensorflow.keras import layers
+from tensorflow.keras.mixed_precision import global_policy
+
+from .transformer import Phi3Config, Phi3Transformer
+from .layers import TimestepEmbedder, FinalLayer, PatchEmbedMR
+import numpy as np
 from typing import Dict, Optional, List, Union
 from safetensors.torch import load_file
 from huggingface_hub import snapshot_download
@@ -18,100 +21,11 @@ import json
 from dataclasses import fields
 import gc
 
-from omnigen_tf.transformer import Phi3Config, Phi3Transformer
-
 
 @tf.function(jit_compile=True)
 def modulate(x, shift, scale):
     """Apply adaptive layer normalization modulation."""
     return x * (1 + tf.expand_dims(scale, 1)) + tf.expand_dims(shift, 1)
-
-
-class TimestepEmbedder(Model):
-    """Embeds scalar timesteps into vector representations."""
-    
-    def __init__(self, hidden_size, frequency_embedding_size=256):
-        super().__init__()
-        self.mlp = tf.keras.Sequential([
-            layers.Dense(hidden_size, use_bias=True, name="mlp_0"),
-            layers.Activation('silu'),
-            layers.Dense(hidden_size, use_bias=True, name="mlp_2")
-        ])
-        self.frequency_embedding_size = frequency_embedding_size
-
-    @staticmethod
-    @tf.function(jit_compile=True)
-    def timestep_embedding(t, dim, max_period=10000):
-        """Create sinusoidal timestep embeddings."""
-        half = dim // 2
-        freqs = tf.exp(
-            -math.log(max_period) * tf.range(half, dtype=t.dtype) / half
-        )
-        args = tf.cast(t[:, None], dtype=freqs.dtype) * freqs[None]
-        embedding = tf.concat([tf.cos(args), tf.sin(args)], axis=-1)
-        if dim % 2:
-            embedding = tf.concat([embedding, tf.zeros_like(embedding[:, :1])], axis=-1)
-        return embedding
-
-    def call(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        t_emb = self.mlp(t_freq)
-        return t_emb
-
-
-class PatchEmbed(layers.Layer):
-    """2D Image to Patch Embedding."""
-    
-    def __init__(self, embed_dim=768, patch_size=16, in_channels=3, **kwargs):
-        """Initialize patch embedding layer."""
-        super().__init__(**kwargs)
-        self.embed_dim = embed_dim
-        self.patch_size = patch_size
-        self.in_channels = in_channels
-        
-        # Initialize projection layer
-        self.proj = layers.Conv2D(
-            filters=embed_dim,
-            kernel_size=patch_size,
-            strides=patch_size,
-            padding='valid',
-            name='proj'
-        )
-        
-    def call(self, x):
-        """Forward pass."""
-        # Rearrange input to NCHW format
-        if x.shape[-1] == self.in_channels:  # NHWC format
-            x = tf.transpose(x, [0, 3, 1, 2])
-            
-        B, C, H, W = x.shape
-        
-        # Ensure input dimensions are compatible with patch size
-        if H % self.patch_size != 0 or W % self.patch_size != 0:
-            raise ValueError(
-                f"Input image dimensions ({H}, {W}) must be divisible by "
-                f"patch size ({self.patch_size})"
-            )
-            
-        # Convert back to NHWC for Conv2D
-        x = tf.transpose(x, [0, 2, 3, 1])
-        
-        # Apply patch embedding
-        x = self.proj(x)
-        
-        # Reshape to (B, N, C)
-        x = tf.reshape(x, [B, -1, self.embed_dim])
-        
-        return x
-        
-    def get_num_patches(self, h, w):
-        """Get number of patches for given input dimensions."""
-        if h % self.patch_size != 0 or w % self.patch_size != 0:
-            raise ValueError(
-                f"Input image dimensions ({h}, {w}) must be divisible by "
-                f"patch size ({self.patch_size})"
-            )
-        return (h // self.patch_size) * (w // self.patch_size)
 
 
 class TimeToken(tf.keras.layers.Layer):
@@ -150,86 +64,58 @@ class TimeToken(tf.keras.layers.Layer):
         return config
 
 
-class FinalLayer(layers.Layer):
-    """Final layer for image generation."""
-    
-    def __init__(self, patch_size, in_channels, embed_dim, **kwargs):
-        super().__init__(**kwargs)
-        self.patch_size = patch_size
-        self.in_channels = in_channels
-        self.embed_dim = embed_dim
-        
-        # Initialize projection layer
-        self.proj = layers.Dense(patch_size * patch_size * in_channels, name="proj")
-        
-    def call(self, x, time_emb):
-        """Forward pass."""
-        # Add time embedding
-        x = x + time_emb[:, None, :]
-        
-        # Project to patch space
-        x = self.proj(x)
-        
-        return x
-
-
 class OmniGen(Model):
     """OmniGen model implementation."""
     
     def __init__(
         self,
         transformer_config,
-        patch_size=16,
+        patch_size=2,
         in_channels=4,
-        pe_interpolation='bicubic',
-        pos_embed_max_size=1024,
-        chunk_size=128,
-        enable_checkpointing=False,
+        pe_interpolation=1.0,
+        pos_embed_max_size=192,
         **kwargs
     ):
-        """Initialize model."""
+        """Initialize OmniGen model."""
         super().__init__(**kwargs)
         
-        # Set default chunk size if not provided
-        self.chunk_size = chunk_size
-        self.enable_checkpointing = enable_checkpointing
-        
-        # Initialize transformer with config
-        if not isinstance(transformer_config, Phi3Config):
-            transformer_config = Phi3Config(**transformer_config)
-            
-        self.transformer = Phi3Transformer(transformer_config)
         self.transformer_config = transformer_config
-        
-        # Save configuration
-        self.patch_size = patch_size
         self.in_channels = in_channels
-        self.pe_interpolation = pe_interpolation
+        self.out_channels = in_channels
+        self.patch_size = patch_size
         self.pos_embed_max_size = pos_embed_max_size
+        self.pe_interpolation = pe_interpolation
         
-        # Initialize components
-        self.x_embedder = PatchEmbed(
-            patch_size=patch_size,
-            in_channels=in_channels,
-            embed_dim=transformer_config.hidden_size
+        hidden_size = transformer_config.hidden_size
+        
+        # Initialize components with mixed precision
+        self.x_embedder = PatchEmbedMR(patch_size, in_channels, hidden_size, bias=True)
+        self.input_x_embedder = PatchEmbedMR(patch_size, in_channels, hidden_size, bias=True)
+        
+        self.time_token = TimestepEmbedder(hidden_size)
+        self.t_embedder = TimestepEmbedder(hidden_size)
+        
+        # Initialize position embeddings
+        pos_embed = self._get_2d_sincos_pos_embed(
+            hidden_size,
+            pos_embed_max_size,
+            interpolation_scale=pe_interpolation,
+            base_size=64
+        )
+        self.pos_embed = tf.Variable(
+            initial_value=pos_embed,
+            trainable=False,
+            name="pos_embed"
         )
         
-        self.time_token = TimeToken(
-            embed_dim=transformer_config.hidden_size
-        )
+        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         
-        self.final_layer = FinalLayer(
-            patch_size=patch_size,
-            in_channels=in_channels,
-            embed_dim=transformer_config.hidden_size
-        )
+        # Initialize transformer
+        self.transformer = Phi3Transformer(config=transformer_config)
+        self.transformer.config.use_cache = False
         
-        # Memory optimization flags
-        self.memory_efficient = False
-        self.gradient_checkpointing = False
-        
-        # Create weights mapping
-        self._create_weights_mapping()
+        # Initialize weights
+        self.initialize_weights()
         
     def enable_memory_efficient_inference(self, chunk_size=None):
         """Enable memory efficient inference."""
@@ -356,31 +242,112 @@ class OmniGen(Model):
             tf.zeros_like(self.final_layer.proj.bias)
         )
 
-    @tf.function(jit_compile=True)
-    def unpatchify(self, x, h, w):
-        """
-        x: (N, T, patch_size**2 * C)
-        imgs: (N, C, H, W)
-        """
-        c = self.in_channels
+    def call(
+        self,
+        x,
+        timestep,
+        input_ids,
+        attention_mask=None,
+        position_ids=None,
+        training=False
+    ):
+        """Forward pass."""
+        # Get batch size and sequence length
         batch_size = tf.shape(x)[0]
         
-        # Reshape to match PyTorch's dimensions
-        x = tf.reshape(x, [
-            batch_size,
-            h // self.patch_size,
-            w // self.patch_size,
-            self.patch_size,
-            self.patch_size,
-            c
-        ])
+        # Embed timestep
+        t_emb = self.time_token(timestep)  # [B, D]
         
-        # Equivalent to PyTorch's einsum('nhwpqc->nchpwq')
-        x = tf.transpose(x, [0, 5, 1, 3, 2, 4])
+        # Patch embed the input
+        x = self.x_embedder(x)  # [B, H*W, D]
         
-        # Final reshape to get output shape
-        imgs = tf.reshape(x, [batch_size, c, h, w])
-        return imgs
+        # Get positional embeddings
+        pos_embed = self.get_pos_embed(x.shape[1])  # [1, H*W, D]
+        x = x + pos_embed
+        
+        # Prepare transformer inputs
+        hidden_states = x
+        
+        # Add time token at the beginning
+        time_tokens = tf.expand_dims(t_emb, axis=1)  # [B, 1, D]
+        hidden_states = tf.concat([time_tokens, hidden_states], axis=1)
+        
+        # Create attention mask including time token
+        if attention_mask is not None:
+            # Add attention mask for time token
+            time_token_mask = tf.ones((batch_size, 1), dtype=attention_mask.dtype)
+            attention_mask = tf.concat([time_token_mask, attention_mask], axis=1)
+        
+        # Update position IDs to account for time token
+        if position_ids is not None:
+            time_token_pos = tf.zeros((batch_size, 1), dtype=position_ids.dtype)
+            position_ids = tf.concat([time_token_pos, position_ids], axis=1)
+        
+        # Pass through transformer
+        transformer_outputs = self.transformer(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=hidden_states,
+            training=training
+        )
+        
+        hidden_states = transformer_outputs[0]
+        
+        # Remove time token
+        hidden_states = hidden_states[:, 1:]
+        
+        # Final layer
+        output = self.final_layer(hidden_states, t_emb)
+        
+        # Reshape to image
+        height = width = int(tf.sqrt(tf.cast(hidden_states.shape[1], tf.float32)))
+        output = tf.reshape(output, [batch_size, height, width, self.in_channels])
+        
+        return output
+        
+    def get_pos_embed(self, sequence_length):
+        """Get position embeddings."""
+        if not hasattr(self, "pos_embed"):
+            # Initialize position embeddings
+            pos_embed = self._get_2d_sincos_pos_embed(
+                self.transformer_config.hidden_size,
+                int(tf.sqrt(tf.cast(sequence_length, tf.float32)))
+            )
+            self.pos_embed = tf.Variable(
+                initial_value=pos_embed,
+                trainable=False,
+                name="pos_embed"
+            )
+        return self.pos_embed[:, :sequence_length]
+        
+    def _get_2d_sincos_pos_embed(self, embed_dim, grid_size):
+        """Generate 2D sinusoidal position embeddings."""
+        grid_h = tf.range(grid_size, dtype=tf.float32)
+        grid_w = tf.range(grid_size, dtype=tf.float32)
+        grid = tf.stack(tf.meshgrid(grid_w, grid_h, indexing='xy'), axis=0)
+        grid = tf.reshape(grid, [2, 1, grid_size, grid_size])
+        
+        emb_h = self._get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])
+        emb_w = self._get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])
+        
+        pos_embed = tf.concat([emb_h, emb_w], axis=-1)
+        return tf.expand_dims(pos_embed, 0)
+        
+    def _get_1d_sincos_pos_embed_from_grid(self, embed_dim, pos):
+        """Generate 1D sinusoidal position embeddings."""
+        omega = tf.exp(
+            -math.log(10000) * tf.range(embed_dim // 2, dtype=tf.float32) / embed_dim
+        )
+        
+        pos = tf.cast(tf.reshape(pos, [-1]), tf.float32)
+        out = tf.einsum('m,d->md', pos, omega)
+        
+        emb_sin = tf.sin(out)
+        emb_cos = tf.cos(out)
+        
+        pos_embed = tf.concat([emb_sin, emb_cos], axis=-1)
+        return pos_embed
 
     def patch_multiple_resolutions(self, latents, padding_latent=None, is_input_images=False):
         """Process input latents with multiple resolutions."""
@@ -408,7 +375,7 @@ class OmniGen(Model):
                 
                 # Add position embeddings
                 pos_embed = self.get_pos_embed(orig_h, orig_w)
-                pos_embed = tf.reshape(pos_embed, [1, -1, self.transformer.config.hidden_size])
+                pos_embed = tf.reshape(pos_embed, [1, -1, self.transformer_config.hidden_size])
                 pos_embed = pos_embed[:, :num_patches, :]  # Only use as many position embeddings as patches
                 x = x + pos_embed
                 
@@ -448,28 +415,13 @@ class OmniGen(Model):
             
             # Add position embeddings
             pos_embed = self.get_pos_embed(orig_h, orig_w)
-            pos_embed = tf.reshape(pos_embed, [1, -1, self.transformer.config.hidden_size])
+            pos_embed = tf.reshape(pos_embed, [1, -1, self.transformer_config.hidden_size])
             pos_embed = pos_embed[:, :num_patches, :]  # Only use as many position embeddings as patches
             latents = latents + pos_embed
             
             num_tokens = tf.shape(latents)[1]
             return latents, num_tokens, [(orig_h, orig_w)]
             
-    def get_pos_embed(self, height, width):
-        """Get position embeddings."""
-        # Convert to patches
-        height = height // self.patch_size
-        width = width // self.patch_size
-        
-        # Get base position embeddings
-        pos_embed = get_2d_sincos_pos_embed(
-            self.transformer.config.hidden_size,
-            height,
-            width
-        )
-        pos_embed = tf.convert_to_tensor(pos_embed, dtype=tf.float32)
-        return pos_embed
-
     def _chunked_forward(self, latents, timestep, input_ids, attention_mask=None, training=False):
         """Forward pass with chunking for memory efficiency."""
         # Process in chunks
@@ -545,25 +497,6 @@ class OmniGen(Model):
             
         return output
 
-    def call(
-        self,
-        latents,
-        timestep,
-        input_ids=None,
-        attention_mask=None,
-        training=False,
-    ):
-        """Model forward pass."""
-        # Handle list inputs
-        if isinstance(latents, list):
-            latents = tf.concat(latents, axis=0)
-            
-        # Use chunked forward if needed
-        if tf.shape(latents)[1] > self.chunk_size:
-            return self._chunked_forward(latents, timestep, input_ids, attention_mask, training)
-        else:
-            return self._forward(latents, timestep, input_ids, attention_mask, training)
-            
     def decode(self, latents):
         """Decode latents to image."""
         # Add decoding logic here
@@ -578,8 +511,6 @@ class OmniGen(Model):
             'in_channels': self.in_channels,
             'pe_interpolation': self.pe_interpolation,
             'pos_embed_max_size': self.pos_embed_max_size,
-            'chunk_size': self.chunk_size,
-            'enable_checkpointing': self.enable_checkpointing,
         })
         return config
         
