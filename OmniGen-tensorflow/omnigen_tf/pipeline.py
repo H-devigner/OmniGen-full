@@ -145,12 +145,15 @@ class OmniGenPipeline:
             image = self.model.decode(latents)
             
             # Post-process image
-            image = (image / 2 + 0.5) * 255
-            image = tf.clip_by_value(image, 0, 255)
-            image = tf.cast(image, tf.uint8)
+            image = (image / 2 + 0.5)  # Normalize to [0, 1]
+            image = tf.clip_by_value(image, 0, 1)  # Ensure values are in [0, 1]
+            
+            # Convert to numpy and scale to [0, 255]
+            image = image.numpy()
+            image = (image * 255).astype(np.uint8)
             
             # Convert to PIL Image
-            image = Image.fromarray(image[0].numpy())
+            image = Image.fromarray(image[0])
             
             return image
         
@@ -219,17 +222,21 @@ class OmniGenPipeline:
         """Decode latents to image using GPU."""
         with tf.device(self.device):
             # Scale latents
-            latents = 1 / 0.18215 * latents
+            latents = latents * 0.18215
             
-            # Process on GPU
-            image = tf.transpose(latents, [0, 3, 1, 2])
-            image = ((image + 1) / 2) * 255
-            image = tf.clip_by_value(image, 0, 255)
-            image = tf.cast(image, tf.uint8)
+            # Decode
+            image = self.model.decode(latents)
             
-            # Move to CPU for PIL conversion
-            image = image[0].numpy()
-            image = Image.fromarray(np.transpose(image, [1, 2, 0]))
+            # Post-process image
+            image = (image / 2 + 0.5)  # Normalize to [0, 1]
+            image = tf.clip_by_value(image, 0, 1)  # Ensure values are in [0, 1]
+            
+            # Convert to numpy and scale to [0, 255]
+            image = image.numpy()
+            image = (image * 255).astype(np.uint8)
+            
+            # Convert to PIL Image
+            image = Image.fromarray(image[0])
             
             return image
             
