@@ -400,6 +400,12 @@ class OmniGenScheduler:
         # Ensure timestep is a scalar
         timestep = tf.squeeze(timestep)
         
+        # Reshape model_output to match sample shape
+        if len(model_output.shape) != len(sample.shape):
+            # Assuming model_output is from a transformer output
+            # Reshape to match the latent space
+            model_output = tf.reshape(model_output, sample.shape)
+        
         # Compute noise schedule parameters
         try:
             alpha_prod_t = tf.cast(self.alphas_cumprod[timestep], tf.float32)
@@ -426,11 +432,6 @@ class OmniGenScheduler:
             # Ensure compatible shapes for subtraction and division
             sqrt_beta_prod_t = tf.sqrt(beta_prod_t)
             sqrt_alpha_prod_t = tf.sqrt(alpha_prod_t)
-            
-            # Ensure model_output matches sample shape
-            if model_output.shape != sample.shape:
-                print(f"Shape mismatch: model_output {model_output.shape}, sample {sample.shape}")
-                model_output = tf.broadcast_to(model_output, sample.shape)
             
             pred_original_sample = (
                 sample - sqrt_beta_prod_t * model_output
