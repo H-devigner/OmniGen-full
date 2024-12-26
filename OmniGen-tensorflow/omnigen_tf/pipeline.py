@@ -125,6 +125,9 @@ class OmniGenPipeline:
                     noise_pred = noise_pred[0]
                 elif isinstance(noise_pred, dict):
                     noise_pred = noise_pred["sample"]
+                
+                # Convert noise_pred to match latents shape
+                noise_pred = self._convert_noise_pred(noise_pred, latents)
                     
                 # Perform guidance
                 noise_pred_uncond, noise_pred_text = tf.split(noise_pred, num_or_size_splits=2, axis=0)
@@ -133,6 +136,10 @@ class OmniGenPipeline:
                 # Compute previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, timestep, latents)
                 
+                # If step returns a dict, extract the sample
+                if isinstance(latents, dict):
+                    latents = latents["prev_sample"]
+            
             # Scale and decode the image latents
             latents = latents * 0.18215
             image = self.model.decode(latents)
@@ -146,7 +153,34 @@ class OmniGenPipeline:
             image = Image.fromarray(image[0].numpy())
             
             return image
+        
+    def _convert_noise_pred(self, noise_pred, latents):
+        """Convert noise prediction to match latents shape."""
+        # Debug print shapes
+        print(f"Original noise_pred shape: {noise_pred.shape}")
+        print(f"Latents shape: {latents.shape}")
+        
+        # If noise_pred is from a transformer output (1, 78, 3072)
+        if len(noise_pred.shape) == 3 and noise_pred.shape[-1] == 3072:
+            # Attempt to reduce dimensionality
+            # This is a heuristic and might need adjustment based on your specific model
+            noise_pred = tf.reduce_mean(noise_pred, axis=1)  # Reduce sequence length
+            noise_pred = tf.reshape(noise_pred, (-1, 1, 1, noise_pred.shape[-1] // 16))
             
+            # Ensure the last dimension matches latents
+            if noise_pred.shape[-1] != latents.shape[-1]:
+                # If still not matching, use a projection layer or interpolation
+                noise_pred = tf.image.resize(
+                    noise_pred, 
+                    (latents.shape[1], latents.shape[2]), 
+                    method=tf.image.ResizeMethod.BILINEAR
+                )
+        
+        # Ensure shape matches latents
+        noise_pred = tf.ensure_shape(noise_pred, latents.shape)
+        
+        return noise_pred
+
     def decode_latents(self, latents):
         """Decode latents to image using GPU."""
         with tf.device(self.device):

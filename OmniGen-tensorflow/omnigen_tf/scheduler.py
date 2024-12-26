@@ -400,12 +400,6 @@ class OmniGenScheduler:
         # Ensure timestep is a scalar
         timestep = tf.squeeze(timestep)
         
-        # Reshape model_output to match sample shape
-        if len(model_output.shape) != len(sample.shape):
-            # Assuming model_output is from a transformer output
-            # Reshape to match the latent space
-            model_output = tf.reshape(model_output, sample.shape)
-        
         # Compute noise schedule parameters
         try:
             alpha_prod_t = tf.cast(self.alphas_cumprod[timestep], tf.float32)
@@ -419,12 +413,13 @@ class OmniGenScheduler:
             print(f"Alphas_cumprod shape: {self.alphas_cumprod.shape}")
             raise
         
-        # Ensure scalar values are compatible with sample shape
-        alpha_prod_t = tf.ones_like(sample) * alpha_prod_t
-        alpha_prod_t_prev = tf.ones_like(sample) * alpha_prod_t_prev
-        
         # Compute beta product
         beta_prod_t = 1 - alpha_prod_t
+        
+        # Ensure scalar values are broadcast compatible
+        alpha_prod_t = tf.broadcast_to(alpha_prod_t, sample.shape)
+        alpha_prod_t_prev = tf.broadcast_to(alpha_prod_t_prev, sample.shape)
+        beta_prod_t = tf.broadcast_to(beta_prod_t, sample.shape)
         
         # Compute predicted original sample
         if self.prediction_type == "epsilon":
@@ -432,6 +427,21 @@ class OmniGenScheduler:
             # Ensure compatible shapes for subtraction and division
             sqrt_beta_prod_t = tf.sqrt(beta_prod_t)
             sqrt_alpha_prod_t = tf.sqrt(alpha_prod_t)
+            
+            # Ensure model_output is compatible with sample
+            if model_output.shape != sample.shape:
+                # Attempt to resize or reduce dimensions
+                if len(model_output.shape) == 3:
+                    # Assume transformer output, reduce to match sample
+                    model_output = tf.reduce_mean(model_output, axis=1)
+                    model_output = tf.reshape(model_output, sample.shape)
+                else:
+                    # Fallback to resizing
+                    model_output = tf.image.resize(
+                        model_output, 
+                        sample.shape[1:3], 
+                        method=tf.image.ResizeMethod.BILINEAR
+                    )
             
             pred_original_sample = (
                 sample - sqrt_beta_prod_t * model_output
