@@ -338,13 +338,20 @@ class Phi3Transformer(TFPreTrainedModel):
                 training=training,
             )
 
-            hidden_states = layer_outputs[0]
-            
+            if isinstance(layer_outputs, tuple):
+                hidden_states = layer_outputs[0]
+                self_attn = layer_outputs[1] if len(layer_outputs) > 1 else None
+                present_key_value = layer_outputs[2] if len(layer_outputs) > 2 else None
+            else:
+                hidden_states = layer_outputs
+                self_attn = None
+                present_key_value = None
+                
             if use_cache:
-                next_decoder_cache = layer_outputs[-1]
+                next_decoder_cache = next_decoder_cache + (present_key_value,) if next_decoder_cache is not None else (present_key_value,)
 
             if output_attentions:
-                all_self_attns = all_self_attns + (layer_outputs[1],)
+                all_self_attns = all_self_attns + (self_attn,)
 
             # Clear intermediate tensors
             if tf.config.list_physical_devices('GPU'):
@@ -539,7 +546,7 @@ class OmniGenTransformer(layers.Layer):
                 
             past_key_value_layer = past_key_value[idx] if past_key_value is not None else None
             
-            hidden_states, layer_self_attn, present_key_value = layer_fn(
+            hidden_states, self_attn, present_key_value = layer_fn(
                 decoder_layer,
                 hidden_states,
                 attention_mask,
@@ -554,7 +561,7 @@ class OmniGenTransformer(layers.Layer):
                 next_decoder_cache = next_decoder_cache + (present_key_value,)
                 
             if output_attentions:
-                all_self_attns = all_self_attns + (layer_self_attn,)
+                all_self_attns = all_self_attns + (self_attn,)
                 
         hidden_states = self.norm(hidden_states)
         
@@ -599,7 +606,16 @@ class OmniGenTransformer(layers.Layer):
             position_ids,
         )
         
-        return layer_outputs
+        if isinstance(layer_outputs, tuple):
+            hidden_states = layer_outputs[0]
+            self_attn = layer_outputs[1] if len(layer_outputs) > 1 else None
+            present_key_value = layer_outputs[2] if len(layer_outputs) > 2 else None
+        else:
+            hidden_states = layer_outputs
+            self_attn = None
+            present_key_value = None
+            
+        return hidden_states, self_attn, present_key_value
         
     def _regular_layer(
         self,
@@ -613,7 +629,7 @@ class OmniGenTransformer(layers.Layer):
         training,
     ):
         """Run layer normally."""
-        return layer(
+        layer_outputs = layer(
             hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -622,6 +638,17 @@ class OmniGenTransformer(layers.Layer):
             use_cache=use_cache,
             training=training,
         )
+        
+        if isinstance(layer_outputs, tuple):
+            hidden_states = layer_outputs[0]
+            self_attn = layer_outputs[1] if len(layer_outputs) > 1 else None
+            present_key_value = layer_outputs[2] if len(layer_outputs) > 2 else None
+        else:
+            hidden_states = layer_outputs
+            self_attn = None
+            present_key_value = None
+            
+        return hidden_states, self_attn, present_key_value
 
 
 class OmniGenLayer(layers.Layer):
@@ -664,17 +691,18 @@ class OmniGenLayer(layers.Layer):
             position_ids=position_ids,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
+            use_cache=use_cache,
             training=training,
         )
         
         if isinstance(attn_outputs, tuple):
             attn_output = attn_outputs[0]
             attn_weights = attn_outputs[1] if len(attn_outputs) > 1 else None
-            past_key_value = attn_outputs[2] if len(attn_outputs) > 2 else None
+            present_key_value = attn_outputs[2] if len(attn_outputs) > 2 else None
         else:
             attn_output = attn_outputs
             attn_weights = None
-            past_key_value = None
+            present_key_value = None
             
         hidden_states = attn_output + residual
         
@@ -688,9 +716,9 @@ class OmniGenLayer(layers.Layer):
         if output_attentions:
             outputs += (attn_weights,)
         if use_cache:
-            outputs += (past_key_value,)
+            outputs += (present_key_value,)
             
-        return outputs if len(outputs) > 1 else outputs[0]
+        return outputs
 
 
 class OmniGenAttention(layers.Layer):
@@ -752,8 +780,7 @@ class OmniGenAttention(layers.Layer):
             v = tf.concat([past_value, v], axis=2)
             
         # Save current key and value if needed
-        if use_cache:
-            present = (k, v)
+        present = (k, v) if use_cache else None
             
         # Compute attention scores
         scale = tf.cast(1.0 / tf.math.sqrt(tf.cast(self.head_dim, tf.float32)), hidden_states.dtype)
@@ -788,7 +815,7 @@ class OmniGenAttention(layers.Layer):
         if use_cache:
             outputs += (present,)
             
-        return outputs if len(outputs) > 1 else outputs[0]
+        return outputs
 
 
 class OmniGenMLP(layers.Layer):
