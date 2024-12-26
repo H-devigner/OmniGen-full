@@ -384,10 +384,13 @@ class OmniGenScheduler:
         Returns:
             Tensor or Dict: Denoised sample
         """
-        # Ensure consistent precision (use float32 for computations)
+        # Ensure consistent precision and shape compatibility
         model_output = tf.cast(model_output, tf.float32)
         sample = tf.cast(sample, tf.float32)
         timestep = tf.cast(timestep, tf.int32)
+        
+        # Ensure timestep is a scalar
+        timestep = tf.squeeze(timestep)
         
         # Compute noise schedule parameters
         alpha_prod_t = tf.cast(self.alphas_cumprod[timestep], tf.float32)
@@ -395,14 +398,24 @@ class OmniGenScheduler:
             self.alphas_cumprod[timestep - 1] if timestep > 0 else 1.0, 
             tf.float32
         )
+        
+        # Broadcast scalar values to match sample shape
+        alpha_prod_t = tf.broadcast_to(alpha_prod_t, sample.shape)
+        alpha_prod_t_prev = tf.broadcast_to(alpha_prod_t_prev, sample.shape)
+        
+        # Compute beta product
         beta_prod_t = 1 - alpha_prod_t
         
         # Compute predicted original sample
         if self.prediction_type == "epsilon":
             # Noise prediction
+            # Ensure compatible shapes for subtraction and division
+            sqrt_beta_prod_t = tf.sqrt(beta_prod_t)
+            sqrt_alpha_prod_t = tf.sqrt(alpha_prod_t)
+            
             pred_original_sample = (
-                sample - (beta_prod_t ** 0.5) * model_output
-            ) / (alpha_prod_t ** 0.5)
+                sample - sqrt_beta_prod_t * model_output
+            ) / sqrt_alpha_prod_t
         elif self.prediction_type == "sample":
             # Direct sample prediction
             pred_original_sample = model_output
@@ -419,10 +432,15 @@ class OmniGenScheduler:
         std_dev = variance * model_output
         
         # Compute next sample
+        sqrt_alpha_prod_t_prev = tf.sqrt(alpha_prod_t_prev)
         next_sample = (
-            pred_original_sample * (alpha_prod_t_prev ** 0.5) + 
+            pred_original_sample * sqrt_alpha_prod_t_prev + 
             std_dev
         )
+        
+        # Clip sample if needed
+        if self.clip_sample:
+            next_sample = tf.clip_by_value(next_sample, -1, 1)
         
         # Cast back to original dtype of sample
         next_sample = tf.cast(next_sample, sample.dtype)
