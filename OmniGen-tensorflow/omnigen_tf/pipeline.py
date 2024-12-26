@@ -73,15 +73,15 @@ class OmniGenPipeline:
             attention_mask = tf.cast(inputs.get("attention_mask", None), tf.int32)
             
             # Initialize latents on GPU with smaller batch size
-            latents_shape = (1, height // 8, width // 8, 4)
+            # Note: latent size is 8x smaller than final image size
+            latent_height = height // 8
+            latent_width = width // 8
+            latents_shape = (1, latent_height, latent_width, 4)
             latents = tf.random.normal(latents_shape, dtype=tf.float16)
             
             # Set timesteps
             self.scheduler.set_timesteps(num_inference_steps)
-            timesteps = self.scheduler.timesteps
-            
-            # Pre-compute static tensors on GPU
-            timesteps = tf.cast(timesteps, tf.int32)
+            timesteps = tf.cast(self.scheduler.timesteps, tf.int32)
             
             # Denoising loop with memory-efficient processing
             for i, t in enumerate(timesteps):
@@ -117,9 +117,9 @@ class OmniGenPipeline:
                 elif isinstance(noise_pred_text, dict):
                     noise_pred_text = noise_pred_text["sample"]
                 
-                # Convert predictions to match latents shape
-                noise_pred_uncond = self._convert_single_noise_pred(noise_pred_uncond, latents)
-                noise_pred_text = self._convert_single_noise_pred(noise_pred_text, latents)
+                # Convert predictions to match latents shape (all in float16)
+                noise_pred_uncond = tf.cast(self._convert_single_noise_pred(noise_pred_uncond, latents), tf.float16)
+                noise_pred_text = tf.cast(self._convert_single_noise_pred(noise_pred_text, latents), tf.float16)
                 
                 # Perform guidance (keep on GPU)
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
@@ -130,10 +130,21 @@ class OmniGenPipeline:
                 # If step returns a dict, extract the sample
                 if isinstance(latents, dict):
                     latents = latents["prev_sample"]
+                
+                # Ensure latents stay in float16
+                latents = tf.cast(latents, tf.float16)
             
             # Scale and decode the image latents
-            latents = latents * 0.18215
+            latents = tf.cast(latents * 0.18215, tf.float16)
             image = self.model.decode(latents)
+            
+            # Resize to requested dimensions if needed
+            if image.shape[1:3] != (height, width):
+                image = tf.image.resize(
+                    image,
+                    (height, width),
+                    method=tf.image.ResizeMethod.BICUBIC
+                )
             
             # Post-process image (keep on GPU until final conversion)
             image = (image / 2 + 0.5)  # Normalize to [0, 1]
@@ -145,6 +156,9 @@ class OmniGenPipeline:
             
             # Convert to PIL Image
             pil_image = Image.fromarray(image_np)
+            
+            # Print final image size for verification
+            print(f"Final image size: {pil_image.size}")
             
             return pil_image
             
