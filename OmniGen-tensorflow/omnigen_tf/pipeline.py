@@ -248,8 +248,8 @@ class OmniGenPipeline:
         # Generate image
         image = self(
             prompt=prompt,
-            height=512,
-            width=512,
+            height=128,  # Reduced height for faster generation
+            width=128,   # Reduced width for faster generation
             num_inference_steps=50,
             guidance_scale=7.5
         )
