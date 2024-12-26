@@ -384,6 +384,14 @@ class OmniGenScheduler:
         Returns:
             Tensor or Dict: Denoised sample
         """
+        # Debug print tensor shapes and dtypes
+        def debug_tensor_info(tensor, name):
+            print(f"{name} - Shape: {tensor.shape}, Dtype: {tensor.dtype}")
+        
+        debug_tensor_info(model_output, "model_output")
+        debug_tensor_info(timestep, "timestep")
+        debug_tensor_info(sample, "sample")
+        
         # Ensure consistent precision and shape compatibility
         model_output = tf.cast(model_output, tf.float32)
         sample = tf.cast(sample, tf.float32)
@@ -393,15 +401,21 @@ class OmniGenScheduler:
         timestep = tf.squeeze(timestep)
         
         # Compute noise schedule parameters
-        alpha_prod_t = tf.cast(self.alphas_cumprod[timestep], tf.float32)
-        alpha_prod_t_prev = tf.cast(
-            self.alphas_cumprod[timestep - 1] if timestep > 0 else 1.0, 
-            tf.float32
-        )
+        try:
+            alpha_prod_t = tf.cast(self.alphas_cumprod[timestep], tf.float32)
+            alpha_prod_t_prev = tf.cast(
+                self.alphas_cumprod[timestep - 1] if timestep > 0 else 1.0, 
+                tf.float32
+            )
+        except Exception as e:
+            print(f"Error accessing alphas_cumprod: {e}")
+            print(f"Timestep value: {timestep}")
+            print(f"Alphas_cumprod shape: {self.alphas_cumprod.shape}")
+            raise
         
-        # Broadcast scalar values to match sample shape
-        alpha_prod_t = tf.broadcast_to(alpha_prod_t, sample.shape)
-        alpha_prod_t_prev = tf.broadcast_to(alpha_prod_t_prev, sample.shape)
+        # Ensure scalar values are compatible with sample shape
+        alpha_prod_t = tf.ones_like(sample) * alpha_prod_t
+        alpha_prod_t_prev = tf.ones_like(sample) * alpha_prod_t_prev
         
         # Compute beta product
         beta_prod_t = 1 - alpha_prod_t
@@ -412,6 +426,11 @@ class OmniGenScheduler:
             # Ensure compatible shapes for subtraction and division
             sqrt_beta_prod_t = tf.sqrt(beta_prod_t)
             sqrt_alpha_prod_t = tf.sqrt(alpha_prod_t)
+            
+            # Ensure model_output matches sample shape
+            if model_output.shape != sample.shape:
+                print(f"Shape mismatch: model_output {model_output.shape}, sample {sample.shape}")
+                model_output = tf.broadcast_to(model_output, sample.shape)
             
             pred_original_sample = (
                 sample - sqrt_beta_prod_t * model_output
