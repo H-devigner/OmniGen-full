@@ -831,8 +831,7 @@ class OmniGenMLP(layers.Layer):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         
-        # Initialize components with smaller chunks
-        self.chunk_size = 16  # Process 16 tokens at a time
+        # Initialize components
         self.gate_up_proj = layers.Dense(2 * intermediate_size, use_bias=True)
         self.down_proj = layers.Dense(hidden_size, use_bias=True)
         
@@ -854,28 +853,24 @@ class OmniGenMLP(layers.Layer):
         
     def call(self, x, training=False):
         """Forward pass with memory optimization."""
-        batch_size, seq_length = tf.shape(x)[0], tf.shape(x)[1]
+        batch_size, seq_length, hidden_size = tf.shape(x)[0], tf.shape(x)[1], tf.shape(x)[2]
         
-        # Calculate number of chunks
-        num_chunks = (seq_length + self.chunk_size - 1) // self.chunk_size
-        outputs = tf.TensorArray(x.dtype, size=num_chunks, dynamic_size=False)
+        # Process in smaller chunks to save memory
+        chunk_size = 8  # Smaller chunk size
+        outputs = []
         
-        # Process in chunks
-        for i in range(num_chunks):
-            start_idx = i * self.chunk_size
-            end_idx = tf.minimum(start_idx + self.chunk_size, seq_length)
-            
-            # Extract chunk
-            chunk = tf.slice(x, [0, start_idx, 0], [-1, end_idx - start_idx, -1])
+        for i in range(0, seq_length, chunk_size):
+            # Get chunk indices
+            end_idx = tf.minimum(i + chunk_size, seq_length)
+            chunk = x[:, i:end_idx, :]
             
             # Process chunk
             if training:
                 chunk_output = tf.recompute_grad(self._process_chunk)(chunk, training)
             else:
                 chunk_output = self._process_chunk(chunk, training)
-                
-            # Store result
-            outputs = outputs.write(i, chunk_output)
             
-        # Combine chunks
-        return tf.concat(outputs.stack(), axis=1)
+            outputs.append(chunk_output)
+        
+        # Combine all chunks
+        return tf.concat(outputs, axis=1)
