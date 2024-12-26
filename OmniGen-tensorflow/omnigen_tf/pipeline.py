@@ -162,15 +162,15 @@ class OmniGenPipeline:
             # Post-process image
             image = (image / 2 + 0.5)  # Normalize to [0, 1]
             image = tf.clip_by_value(image, 0, 1)  # Ensure values are in [0, 1]
+            image = tf.cast(image * 255, tf.uint8)  # Scale to [0, 255] and convert to uint8
             
-            # Convert to numpy and scale to [0, 255]
-            image = image.numpy()
-            image = (image * 255).astype(np.uint8)
+            # Convert to numpy array
+            image_np = image[0].numpy()  # Remove batch dimension
             
             # Convert to PIL Image
-            image = Image.fromarray(image[0])
+            pil_image = Image.fromarray(image_np)
             
-            return image
+            return pil_image
             
     def _convert_single_noise_pred(self, noise_pred, latents):
         """Convert a single noise prediction to match latents shape."""
@@ -224,16 +224,46 @@ class OmniGenPipeline:
             # Post-process image
             image = (image / 2 + 0.5)  # Normalize to [0, 1]
             image = tf.clip_by_value(image, 0, 1)  # Ensure values are in [0, 1]
+            image = tf.cast(image * 255, tf.uint8)  # Scale to [0, 255] and convert to uint8
             
-            # Convert to numpy and scale to [0, 255]
-            image = image.numpy()
-            image = (image * 255).astype(np.uint8)
+            # Convert to numpy array
+            image_np = image[0].numpy()  # Remove batch dimension
             
             # Convert to PIL Image
-            image = Image.fromarray(image[0])
+            pil_image = Image.fromarray(image_np)
             
-            return image
+            return pil_image
             
+    def generate_image(self, prompt, output_path=None, show_image=False):
+        """Generate an image from a text prompt.
+        
+        Args:
+            prompt (str): Text prompt to generate image from
+            output_path (str, optional): Path to save generated image
+            show_image (bool): Whether to display the image
+            
+        Returns:
+            PIL.Image: Generated image
+        """
+        # Generate image
+        image = self(
+            prompt=prompt,
+            height=512,
+            width=512,
+            num_inference_steps=50,
+            guidance_scale=7.5
+        )
+        
+        # Save image if output path provided
+        if output_path:
+            image.save(output_path)
+            
+        # Show image if requested
+        if show_image:
+            image.show()
+            
+        return image
+
     @classmethod
     def from_pretrained(cls, model_name):
         """Load pretrained model."""
