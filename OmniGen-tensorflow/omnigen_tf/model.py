@@ -299,6 +299,70 @@ class OmniGen(Model):
         
         return x
 
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs):
+        """Load pretrained model from HuggingFace Hub or local path."""
+        import os
+        import json
+        from huggingface_hub import snapshot_download
+        from safetensors.tensorflow import load_file
+        
+        # Get model path
+        model_path = pretrained_model_name_or_path
+        if not os.path.exists(model_path):
+            cache_folder = os.getenv('HF_HUB_CACHE', None)
+            model_path = snapshot_download(
+                repo_id=pretrained_model_name_or_path,
+                cache_dir=cache_folder,
+                ignore_patterns=['flax_model.msgpack', 'rust_model.ot', 'tf_model.h5']
+            )
+            
+        # Load config
+        config_path = os.path.join(model_path, "config.json")
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config_dict = json.load(f)
+        else:
+            config_dict = {}
+            
+        # Update config with kwargs
+        config_dict.update(kwargs)
+        
+        # Create model
+        model = cls(transformer_config=config_dict)
+        
+        # Load weights
+        weights_file = os.path.join(model_path, "model.safetensors")
+        if os.path.exists(weights_file):
+            # Load safetensors weights
+            state_dict = load_file(weights_file)
+            
+            # Map weights to TensorFlow format
+            for name, weight in state_dict.items():
+                try:
+                    # Find corresponding layer in TF model
+                    if name.startswith('transformer.'):
+                        tf_name = name.replace('transformer.', 'transformer/')
+                    else:
+                        tf_name = name.replace('.', '/')
+                        
+                    # Get layer by name
+                    layer = model.get_layer(tf_name)
+                    if layer is not None:
+                        # Assign weights
+                        if 'weight' in name:
+                            layer.kernel.assign(weight)
+                        elif 'bias' in name:
+                            layer.bias.assign(weight)
+                except Exception as e:
+                    print(f"Warning: Could not load weight {name}: {str(e)}")
+                    
+            print("Weights loaded successfully!")
+        else:
+            print(f"No weights found at {weights_file}")
+            
+        return model
+
 def get_2d_sincos_pos_embed(
     embed_dim,
     grid_size_h,

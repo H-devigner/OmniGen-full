@@ -50,6 +50,25 @@ class OmniGenPipeline:
         # Create device strategy
         self.strategy = tf.distribute.OneDeviceStrategy(device)
         
+    @classmethod
+    def from_pretrained(cls, model_name):
+        """Load pretrained model."""
+        if not os.path.exists(model_name):
+            print(f"Model not found at {model_name}, downloading from HuggingFace...")
+            cache_folder = os.getenv('HF_HUB_CACHE')
+            model_name = snapshot_download(
+                repo_id=model_name,
+                cache_dir=cache_folder,
+                ignore_patterns=['flax_model.msgpack', 'rust_model.ot', 'tf_model.h5']
+            )
+            
+        # Initialize components
+        model = OmniGen.from_pretrained(model_name)  # Config will be loaded from model_name/config.json
+        processor = OmniGenProcessor.from_pretrained(model_name)
+        scheduler = OmniGenScheduler()
+        
+        return cls(model, scheduler, processor)
+
     def __call__(
         self,
         prompt,
@@ -59,185 +78,89 @@ class OmniGenPipeline:
         guidance_scale=7.5,
     ):
         """Generate image from text prompt using GPU acceleration."""
-        # Use distribution strategy for GPU operations
-        with self.strategy.scope():
-            # Process text
-            inputs = self.processor(
-                prompt,
+        # Process text prompt
+        text_inputs = self.processor(
+            prompt,
+            padding="max_length",
+            max_length=77,
+            truncation=True,
+            return_tensors="tf"
+        )
+        
+        # Create latents
+        latents_shape = (1, height // 8, width // 8, 4)
+        latents = tf.random.normal(latents_shape, dtype=tf.float32)
+        
+        # Scale the initial noise by the standard deviation required by the scheduler
+        latents = latents * self.scheduler.init_noise_sigma
+        
+        # Set timesteps
+        self.scheduler.set_timesteps(num_inference_steps)
+        timesteps = self.scheduler.timesteps
+        
+        # Prepare text embeddings
+        do_classifier_free_guidance = guidance_scale > 1.0
+        if do_classifier_free_guidance:
+            max_length = text_inputs["input_ids"].shape[1]
+            uncond_input = self.processor(
+                [""] * 2,
                 padding="max_length",
-                max_length=77,
+                max_length=max_length,
                 truncation=True,
-                return_tensors="tf"
+                return_tensors="tf",
             )
-            input_ids = tf.cast(inputs["input_ids"], tf.int32)
-            attention_mask = tf.cast(inputs.get("attention_mask", None), tf.int32)
+            uncond_embeddings = uncond_input["input_ids"]
+            text_embeddings = tf.concat([uncond_embeddings, text_inputs["input_ids"]], axis=0)
+            attention_mask = tf.concat([uncond_input["attention_mask"], text_inputs["attention_mask"]], axis=0)
+        else:
+            text_embeddings = text_inputs["input_ids"]
+            attention_mask = text_inputs["attention_mask"]
+        
+        # Denoising loop
+        for i, t in enumerate(timesteps):
+            # Expand latents for classifier free guidance
+            latent_model_input = tf.repeat(latents, 2, axis=0) if do_classifier_free_guidance else latents
             
-            # Initialize latents on GPU with smaller batch size
-            # Note: latent size is 8x smaller than final image size
-            latent_height = height // 8
-            latent_width = width // 8
-            latents_shape = (1, latent_height, latent_width, 4)
-            latents = tf.random.normal(latents_shape, dtype=tf.float16)
-            
-            # Set timesteps
-            self.scheduler.set_timesteps(num_inference_steps)
-            timesteps = tf.cast(self.scheduler.timesteps, tf.int32)
-            
-            # Denoising loop with memory-efficient processing
-            for i, t in enumerate(timesteps):
-                # Convert timestep to scalar
-                timestep = tf.cast(t, tf.int32)
-                
-                # Process unconditional and conditional separately to save memory
-                # First process unconditional (no prompt)
-                noise_pred_uncond = self.model(
-                    latents=latents,
-                    timestep=timestep,
-                    input_ids=input_ids,
+            # Predict noise residual
+            with tf.device(self.device):
+                noise_pred = self.model(
+                    latent_model_input,
+                    t,
+                    input_ids=text_embeddings,
                     attention_mask=attention_mask,
                     training=False
                 )
-                
-                if isinstance(noise_pred_uncond, tuple):
-                    noise_pred_uncond = noise_pred_uncond[0]
-                elif isinstance(noise_pred_uncond, dict):
-                    noise_pred_uncond = noise_pred_uncond["sample"]
-                
-                # Then process conditional (with prompt)
-                noise_pred_text = self.model(
-                    latents=latents,
-                    timestep=timestep,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    training=False
-                )
-                
-                if isinstance(noise_pred_text, tuple):
-                    noise_pred_text = noise_pred_text[0]
-                elif isinstance(noise_pred_text, dict):
-                    noise_pred_text = noise_pred_text["sample"]
-                
-                # Convert predictions to match latents shape (all in float16)
-                noise_pred_uncond = tf.cast(self._convert_single_noise_pred(noise_pred_uncond, latents), tf.float16)
-                noise_pred_text = tf.cast(self._convert_single_noise_pred(noise_pred_text, latents), tf.float16)
-                
-                # Perform guidance (keep on GPU)
+            
+            # Perform guidance
+            if do_classifier_free_guidance:
+                noise_pred_uncond, noise_pred_text = tf.split(noise_pred, 2, axis=0)
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-                
-                # Compute previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, timestep, latents)
-                
-                # If step returns a dict, extract the sample
-                if isinstance(latents, dict):
-                    latents = latents["prev_sample"]
-                
-                # Ensure latents stay in float16
-                latents = tf.cast(latents, tf.float16)
             
-            # Scale and decode the image latents
-            latents = tf.cast(latents * 0.18215, tf.float16)
-            image = self.model.decode(latents)
+            # Compute previous noisy sample x_t -> x_t-1
+            latents = self.scheduler.step(noise_pred, t, latents).prev_sample
             
-            # Resize to requested dimensions if needed
-            if image.shape[1:3] != (height, width):
-                image = tf.image.resize(
-                    image,
-                    (height, width),
-                    method=tf.image.ResizeMethod.BICUBIC
-                )
-            
-            # Post-process image (keep on GPU until final conversion)
-            image = (image / 2 + 0.5)  # Normalize to [0, 1]
-            image = tf.clip_by_value(image, 0, 1)  # Ensure values are in [0, 1]
-            image = tf.cast(image * 255, tf.uint8)  # Scale to [0, 255] and convert to uint8
-            
-            # Final conversion to CPU for PIL Image creation
-            image_np = image[0].numpy()
-            
-            # Convert to PIL Image
-            pil_image = Image.fromarray(image_np)
-            
-            # Print final image size for verification
-            print(f"Final image size: {pil_image.size}")
-            
-            return pil_image
-            
-    def _convert_single_noise_pred(self, noise_pred, latents):
-        """Convert a single noise prediction to match latents shape."""
-        # Debug print shapes
-        print(f"Single noise_pred shape: {noise_pred.shape}")
-        print(f"Target latents shape: {latents.shape}")
+        # Scale and decode the image latents with vae
+        latents = 1 / 0.18215 * latents
         
-        # If noise_pred is from transformer output (B, seq_len, hidden_dim)
-        if len(noise_pred.shape) == 3:
-            # Reduce sequence length dimension
-            noise_pred = tf.reduce_mean(noise_pred, axis=1)  # Now (B, hidden_dim)
-            
-            # Calculate target dimensions
-            batch_size = latents.shape[0]
-            height = latents.shape[1]
-            width = latents.shape[2]
-            channels = latents.shape[3]
-            
-            # For transformer output (3072 features), reshape to intermediate size
-            if noise_pred.shape[-1] == 3072:
-                # Reshape to 24x32x4 (3072 = 24*32*4)
-                noise_pred = tf.reshape(noise_pred, (batch_size, 24, 32, channels))
-            else:
-                # For other sizes, try to maintain aspect ratio
-                total_pixels = noise_pred.shape[-1] // channels
-                side_length = int(tf.sqrt(float(total_pixels)))
-                noise_pred = tf.reshape(noise_pred, (batch_size, side_length, -1, channels))
-            
-            # Resize to target dimensions using bicubic interpolation
-            noise_pred = tf.image.resize(
-                noise_pred,
-                (height, width),
-                method=tf.image.ResizeMethod.BICUBIC
-            )
-            
-            # Ensure the output has the correct shape
-            noise_pred.set_shape([batch_size, height, width, channels])
+        # Convert to image
+        image = self.decode_latents(latents)
         
-        # If shape still doesn't match the target latents shape
-        if noise_pred.shape[1:3] != latents.shape[1:3]:
-            noise_pred = tf.image.resize(
-                noise_pred,
-                (latents.shape[1], latents.shape[2]),
-                method=tf.image.ResizeMethod.BICUBIC
-            )
-        
-        # Ensure the last dimension matches
-        if noise_pred.shape[-1] != latents.shape[-1]:
-            noise_pred = noise_pred[..., :latents.shape[-1]]
-        
-        # Print final shape for debugging
-        print(f"Converted noise_pred shape: {noise_pred.shape}")
-        
-        return noise_pred
+        return image
 
     def decode_latents(self, latents):
-        """Decode latents to image using GPU."""
+        """Decode latents to image."""
         with tf.device(self.device):
-            # Scale latents
-            latents = latents * 0.18215
-            
-            # Decode
-            image = self.model.decode(latents)
-            
-            # Post-process image
-            image = (image / 2 + 0.5)  # Normalize to [0, 1]
-            image = tf.clip_by_value(image, 0, 1)  # Ensure values are in [0, 1]
-            image = tf.cast(image * 255, tf.uint8)  # Scale to [0, 255] and convert to uint8
-            
-            # Convert to numpy array
-            image_np = image[0].numpy()  # Remove batch dimension
+            # Ensure proper shape and scaling
+            image = tf.transpose(latents, [0, 3, 1, 2])  # NHWC -> NCHW
+            image = image / 2 + 0.5  # Scale to [0, 1]
+            image = tf.clip_by_value(image, 0, 1)
+            image = tf.cast(image * 255, tf.uint8)
+            image = tf.transpose(image, [0, 2, 3, 1])  # NCHW -> NHWC
             
             # Convert to PIL Image
-            pil_image = Image.fromarray(image_np)
-            
-            return pil_image
-            
+            image = image[0].numpy()  # Remove batch dimension
+            return Image.fromarray(image)
+
     def generate_image(self, prompt, output_path=None, show_image=False):
         """Generate an image from a text prompt.
         
@@ -267,25 +190,3 @@ class OmniGenPipeline:
             image.show()
             
         return image
-
-    @classmethod
-    def from_pretrained(cls, model_name):
-        """Load pretrained model."""
-        if not os.path.exists(model_name):
-            print(f"Model not found at {model_name}, downloading from HuggingFace...")
-            cache_folder = os.getenv('HF_HUB_CACHE')
-            model_name = snapshot_download(
-                repo_id=model_name,
-                cache_dir=cache_folder,
-                ignore_patterns=['flax_model.msgpack', 'rust_model.ot', 'tf_model.h5']
-            )
-            
-        # Initialize components
-        model = OmniGen.from_pretrained(model_name)  # Config will be loaded from model_name/config.json
-        processor = OmniGenProcessor.from_pretrained(model_name)
-        scheduler = OmniGenScheduler()
-        
-        # Enable memory optimizations by default
-        model.enable_memory_efficient_inference()
-        
-        return cls(model, scheduler, processor)
