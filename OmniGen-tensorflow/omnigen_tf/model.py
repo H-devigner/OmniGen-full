@@ -20,6 +20,8 @@ import gc
 
 from omnigen_tf.transformer import Phi3Config, Phi3Transformer
 
+# Enable mixed precision
+tf.keras.mixed_precision.set_global_policy('mixed_float16')
 
 @tf.function(jit_compile=True)
 def modulate(x, shift, scale):
@@ -181,7 +183,7 @@ class FinalLayer(layers.Layer):
         return x
 
 
-class OmniGen(Model):
+class OmniGen(tf.keras.Model):
     """OmniGen model implementation."""
     
     def __init__(
@@ -189,16 +191,19 @@ class OmniGen(Model):
         transformer_config,
         patch_size=2,
         in_channels=4,
-        pe_interpolation=1.0,
-        pos_embed_max_size=192,
-        **kwargs
+        pe_interpolation: float = 1.0,
+        pos_embed_max_size: int = 192,
     ):
-        """Initialize model."""
-        super().__init__(**kwargs)
-        
-        if not isinstance(transformer_config, Phi3Config):
-            transformer_config = Phi3Config(**transformer_config)
-        
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = in_channels
+        self.patch_size = patch_size
+        self.pos_embed_max_size = pos_embed_max_size
+
+        # Set compute dtype to float16 for better GPU performance
+        self.compute_dtype = tf.float16
+        self.variable_dtype = tf.float32
+
         hidden_size = transformer_config.hidden_size
         
         # Initialize embedders
@@ -222,14 +227,27 @@ class OmniGen(Model):
         # Initialize transformer
         self.transformer = Phi3Transformer(transformer_config, name="transformer")
         
-        # Store configs
-        self.patch_size = patch_size
-        self.in_channels = in_channels
-        self.pos_embed_max_size = pos_embed_max_size
-        self.pe_interpolation = pe_interpolation
-        self.hidden_size = hidden_size
-        
     def call(
+        self,
+        inputs,
+        timestep,
+        input_ids=None,
+        attention_mask=None,
+        training=False,
+    ):
+        """Forward pass with automatic mixed precision."""
+        # Cast inputs to compute dtype (float16)
+        inputs = tf.cast(inputs, self.compute_dtype)
+        
+        # Run forward pass in float16
+        outputs = self.forward_pass(inputs, timestep, input_ids, attention_mask, training)
+        
+        # Cast outputs back to variable dtype (float32) for stability
+        outputs = tf.cast(outputs, self.variable_dtype)
+        
+        return outputs
+
+    def forward_pass(
         self,
         latents,
         timestep,
@@ -295,7 +313,7 @@ class OmniGen(Model):
         w_unpatched = w * p
         
         # Reshape to image dimensions
-        x = tf.reshape(x, [-1, h, w, self.hidden_size])  # [B, H, W, C]
+        x = tf.reshape(x, [-1, h, w, self.out_channels])  # [B, H, W, C]
         
         return x
 
@@ -328,41 +346,41 @@ class OmniGen(Model):
         # Update config with kwargs
         config_dict.update(kwargs)
         
-        # Create model
-        model = cls(transformer_config=config_dict)
+        # Create model with mixed precision
+        with tf.keras.mixed_precision.policy('mixed_float16'):
+            model = cls(transformer_config=config_dict)
         
         # Load weights
         weights_file = os.path.join(model_path, "model.safetensors")
         if os.path.exists(weights_file):
             print("Loading weights from safetensors...")
             
-            # Load weights on CPU first
-            with tf.device('/CPU:0'):
-                state_dict = load_file(weights_file)
-                
-                # Map weights to TensorFlow format
-                for name, weight in state_dict.items():
-                    try:
-                        # Convert weight to numpy array on CPU
-                        weight_np = weight.numpy()
+            # Load weights
+            state_dict = load_file(weights_file)
+            
+            # Map weights to TensorFlow format
+            for name, weight in state_dict.items():
+                try:
+                    # Convert weight to float16 for GPU operations
+                    weight = tf.cast(weight, tf.float16)
+                    
+                    # Find corresponding layer in TF model
+                    if name.startswith('transformer.'):
+                        tf_name = name.replace('transformer.', 'transformer/')
+                    else:
+                        tf_name = name.replace('.', '/')
                         
-                        # Find corresponding layer in TF model
-                        if name.startswith('transformer.'):
-                            tf_name = name.replace('transformer.', 'transformer/')
-                        else:
-                            tf_name = name.replace('.', '/')
-                            
-                        # Get layer by name
-                        layer = model.get_layer(tf_name)
-                        if layer is not None:
-                            # Assign weights
-                            if 'weight' in name:
-                                layer.kernel.assign(weight_np)
-                            elif 'bias' in name:
-                                layer.bias.assign(weight_np)
-                    except Exception as e:
-                        print(f"Warning: Could not load weight {name}: {str(e)}")
-                        
+                    # Get layer by name
+                    layer = model.get_layer(tf_name)
+                    if layer is not None:
+                        # Assign weights
+                        if 'weight' in name:
+                            layer.kernel.assign(weight)
+                        elif 'bias' in name:
+                            layer.bias.assign(weight)
+                except Exception as e:
+                    print(f"Warning: Could not load weight {name}: {str(e)}")
+                    
             print("Weights loaded successfully!")
         else:
             print(f"No weights found at {weights_file}")

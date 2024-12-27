@@ -1,4 +1,4 @@
-"""OmniGen Pipeline for image generation."""
+"""OmniGen Pipeline for text-to-image generation."""
 
 import os
 import tensorflow as tf
@@ -12,12 +12,16 @@ from omnigen_tf.model import OmniGen
 from omnigen_tf.scheduler import OmniGenScheduler
 from omnigen_tf.processor import OmniGenProcessor
 
+# Enable mixed precision
+tf.keras.mixed_precision.set_global_policy('mixed_float16')
+
 # Configure GPU memory growth
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
     try:
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
+        print("GPU memory growth enabled")
     except RuntimeError as e:
         print(f"GPU memory growth setting failed: {e}")
 
@@ -35,27 +39,25 @@ class OmniGenPipeline:
             # Use GPU if available
             if tf.config.list_physical_devices('GPU'):
                 device = '/GPU:0'
-                # Set mixed precision policy
-                tf.keras.mixed_precision.set_global_policy('mixed_float16')
+                print("Using GPU for inference")
             else:
                 device = '/CPU:0'
-        self.device = device
+                print("No GPU available, using CPU (this will be slow)")
         
-        # Create device strategy
+        self.device = device
         self.strategy = tf.distribute.OneDeviceStrategy(device)
         
+        # Set model to mixed precision
+        if device == '/GPU:0':
+            self.compute_dtype = tf.float16
+            self.variable_dtype = tf.float32
+        else:
+            self.compute_dtype = tf.float32
+            self.variable_dtype = tf.float32
+            
     @classmethod
     def from_pretrained(cls, model_name):
         """Load pretrained model."""
-        # Configure GPU memory growth
-        gpus = tf.config.list_physical_devices('GPU')
-        if gpus:
-            try:
-                for gpu in gpus:
-                    tf.config.experimental.set_memory_growth(gpu, True)
-            except RuntimeError as e:
-                print(f"GPU memory growth setting failed: {e}")
-        
         if not os.path.exists(model_name):
             print(f"Model not found at {model_name}, downloading from HuggingFace...")
             cache_folder = os.getenv('HF_HUB_CACHE')
@@ -65,8 +67,8 @@ class OmniGenPipeline:
                 ignore_patterns=['flax_model.msgpack', 'rust_model.ot', 'tf_model.h5']
             )
             
-        # Initialize components on CPU first
-        with tf.device('/CPU:0'):
+        # Initialize components with GPU support
+        with tf.device('/GPU:0'):
             model = OmniGen.from_pretrained(model_name)
             processor = OmniGenProcessor.from_pretrained(model_name)
             scheduler = OmniGenScheduler()
@@ -76,94 +78,91 @@ class OmniGenPipeline:
     def __call__(
         self,
         prompt,
-        height=512,
-        width=512,
+        height=1024,
+        width=1024,
         num_inference_steps=50,
-        guidance_scale=7.5,
+        guidance_scale=3.0,
+        negative_prompt=None,
     ):
-        """Generate image from text prompt using GPU acceleration."""
-        # Process text prompt
-        text_inputs = self.processor(
-            prompt,
-            padding="max_length",
-            max_length=77,
-            truncation=True,
-            return_tensors="tf"
-        )
+        """Generate images from text prompt."""
         
-        # Create latents
-        latents_shape = (1, height // 8, width // 8, 4)
-        latents = tf.random.normal(latents_shape, dtype=tf.float32)
-        
-        # Scale the initial noise by the standard deviation required by the scheduler
-        latents = latents * self.scheduler.init_noise_sigma
-        
-        # Set timesteps
-        self.scheduler.set_timesteps(num_inference_steps)
-        timesteps = self.scheduler.timesteps
-        
-        # Prepare text embeddings
-        do_classifier_free_guidance = guidance_scale > 1.0
-        if do_classifier_free_guidance:
-            max_length = text_inputs["input_ids"].shape[1]
-            uncond_input = self.processor(
-                [""] * 2,
-                padding="max_length",
-                max_length=max_length,
-                truncation=True,
-                return_tensors="tf",
+        # Process inputs on GPU
+        with tf.device(self.device):
+            # Convert inputs to compute dtype
+            latents = tf.random.normal(
+                [1, height // 8, width // 8, 4],
+                dtype=self.compute_dtype
             )
-            uncond_embeddings = uncond_input["input_ids"]
-            text_embeddings = tf.concat([uncond_embeddings, text_inputs["input_ids"]], axis=0)
-            attention_mask = tf.concat([uncond_input["attention_mask"], text_inputs["attention_mask"]], axis=0)
-        else:
-            text_embeddings = text_inputs["input_ids"]
-            attention_mask = text_inputs["attention_mask"]
-        
-        # Denoising loop
-        for i, t in enumerate(timesteps):
-            # Expand latents for classifier free guidance
-            latent_model_input = tf.repeat(latents, 2, axis=0) if do_classifier_free_guidance else latents
             
-            # Predict noise residual
-            with tf.device(self.device):
-                noise_pred = self.model(
-                    latent_model_input,
+            # Process text prompt
+            text_inputs = self.processor(
+                prompt,
+                padding="max_length",
+                max_length=77,
+                truncation=True,
+                return_tensors="tf"
+            )
+            
+            # Run diffusion process
+            for i, t in enumerate(self.scheduler.timesteps):
+                # Convert timestep to tensor
+                timestep = tf.convert_to_tensor([t], dtype=self.compute_dtype)
+                
+                # Get model prediction
+                with tf.GradientTape() as tape:
+                    noise_pred = self.model(
+                        latents,
+                        timestep,
+                        input_ids=text_inputs["input_ids"],
+                        attention_mask=text_inputs["attention_mask"],
+                        training=False
+                    )
+                
+                # Update latents
+                latents = self.scheduler.step(
+                    noise_pred,
                     t,
-                    input_ids=text_embeddings,
-                    attention_mask=attention_mask,
-                    training=False
+                    latents
                 )
             
-            # Perform guidance
-            if do_classifier_free_guidance:
-                noise_pred_uncond, noise_pred_text = tf.split(noise_pred, 2, axis=0)
-                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+            # Decode latents to image
+            images = self.decode_latents(latents)
             
-            # Compute previous noisy sample x_t -> x_t-1
-            latents = self.scheduler.step(noise_pred, t, latents).prev_sample
-            
-        # Scale and decode the image latents with vae
-        latents = 1 / 0.18215 * latents
-        
-        # Convert to image
-        image = self.decode_latents(latents)
-        
-        return image
-
+        return self.numpy_to_pil(images)
+    
     def decode_latents(self, latents):
-        """Decode latents to image."""
+        """Decode the latents into images."""
         with tf.device(self.device):
-            # Ensure proper shape and scaling
+            # Scale and decode the image latents with vae
+            latents = 1 / 0.18215 * latents
+            
+            # Convert to float32 for post-processing
+            latents = tf.cast(latents, tf.float32)
+            
+            # Rescale to [0, 1]
+            latents = (latents / 2 + 0.5)
+            latents = tf.clip_by_value(latents, 0.0, 1.0)
+            
+            # Convert to uint8
+            latents = tf.cast(latents * 255, tf.uint8)
+            
+            # Convert to image
             image = tf.transpose(latents, [0, 3, 1, 2])  # NHWC -> NCHW
-            image = image / 2 + 0.5  # Scale to [0, 1]
-            image = tf.clip_by_value(image, 0, 1)
-            image = tf.cast(image * 255, tf.uint8)
             image = tf.transpose(image, [0, 2, 3, 1])  # NCHW -> NHWC
             
             # Convert to PIL Image
             image = image[0].numpy()  # Remove batch dimension
             return Image.fromarray(image)
+        
+    def numpy_to_pil(self, images):
+        """Convert a numpy image to a PIL image."""
+        if images.ndim == 3:
+            images = images[None, ...]
+        images = tf.image.convert_image_dtype(images, tf.uint8)
+        
+        pil_images = [Image.fromarray(image.numpy()) for image in images]
+        
+        return pil_images
 
     def generate_image(self, prompt, output_path=None, show_image=False):
         """Generate an image from a text prompt.
