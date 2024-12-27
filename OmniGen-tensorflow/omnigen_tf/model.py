@@ -20,8 +20,9 @@ import gc
 
 from omnigen_tf.transformer import Phi3Config, Phi3Transformer
 
-# Enable mixed precision
-tf.keras.mixed_precision.set_global_policy('mixed_float16')
+# Enable mixed precision globally
+policy = tf.keras.mixed_precision.Policy('mixed_float16')
+tf.keras.mixed_precision.set_global_policy(policy)
 
 @tf.function(jit_compile=True)
 def modulate(x, shift, scale):
@@ -347,8 +348,7 @@ class OmniGen(tf.keras.Model):
         config_dict.update(kwargs)
         
         # Create model with mixed precision
-        with tf.keras.mixed_precision.policy('mixed_float16'):
-            model = cls(transformer_config=config_dict)
+        model = cls(transformer_config=config_dict)
         
         # Load weights
         weights_file = os.path.join(model_path, "model.safetensors")

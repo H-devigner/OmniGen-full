@@ -12,8 +12,9 @@ from omnigen_tf.model import OmniGen
 from omnigen_tf.scheduler import OmniGenScheduler
 from omnigen_tf.processor import OmniGenProcessor
 
-# Enable mixed precision
-tf.keras.mixed_precision.set_global_policy('mixed_float16')
+# Enable mixed precision globally
+policy = tf.keras.mixed_precision.Policy('mixed_float16')
+tf.keras.mixed_precision.set_global_policy(policy)
 
 # Configure GPU memory growth
 gpus = tf.config.list_physical_devices('GPU')
