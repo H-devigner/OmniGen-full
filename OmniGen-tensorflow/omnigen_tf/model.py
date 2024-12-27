@@ -201,13 +201,9 @@ class OmniGen(tf.keras.Model):
         self.patch_size = patch_size
         self.pos_embed_max_size = pos_embed_max_size
 
-        # Set compute dtype to float16 for better GPU performance
-        self.compute_dtype = tf.float16
-        self.variable_dtype = tf.float32
-
         hidden_size = transformer_config.hidden_size
         
-        # Initialize embedders
+        # Initialize embedders with mixed precision
         self.x_embedder = PatchEmbed(
             embed_dim=hidden_size,
             patch_size=patch_size,
@@ -227,7 +223,7 @@ class OmniGen(tf.keras.Model):
         
         # Initialize transformer
         self.transformer = Phi3Transformer(transformer_config, name="transformer")
-        
+
     def call(
         self,
         inputs,
@@ -237,15 +233,8 @@ class OmniGen(tf.keras.Model):
         training=False,
     ):
         """Forward pass with automatic mixed precision."""
-        # Cast inputs to compute dtype (float16)
-        inputs = tf.cast(inputs, self.compute_dtype)
-        
-        # Run forward pass in float16
-        outputs = self.forward_pass(inputs, timestep, input_ids, attention_mask, training)
-        
-        # Cast outputs back to variable dtype (float32) for stability
-        outputs = tf.cast(outputs, self.variable_dtype)
-        
+        # Let TensorFlow handle dtype conversions
+        outputs = super().call(inputs, training=training)
         return outputs
 
     def forward_pass(
@@ -347,7 +336,7 @@ class OmniGen(tf.keras.Model):
         # Update config with kwargs
         config_dict.update(kwargs)
         
-        # Create model with mixed precision
+        # Create model
         model = cls(transformer_config=config_dict)
         
         # Load weights
@@ -361,8 +350,8 @@ class OmniGen(tf.keras.Model):
             # Map weights to TensorFlow format
             for name, weight in state_dict.items():
                 try:
-                    # Convert weight to float16 for GPU operations
-                    weight = tf.cast(weight, tf.float16)
+                    # Let TensorFlow handle dtype conversion
+                    weight = tf.convert_to_tensor(weight)
                     
                     # Find corresponding layer in TF model
                     if name.startswith('transformer.'):

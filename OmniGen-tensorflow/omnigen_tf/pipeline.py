@@ -6,7 +6,6 @@ import numpy as np
 from PIL import Image
 from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer
-import json
 
 from omnigen_tf.model import OmniGen
 from omnigen_tf.scheduler import OmniGenScheduler
@@ -47,14 +46,6 @@ class OmniGenPipeline:
         
         self.device = device
         self.strategy = tf.distribute.OneDeviceStrategy(device)
-        
-        # Set model to mixed precision
-        if device == '/GPU:0':
-            self.compute_dtype = tf.float16
-            self.variable_dtype = tf.float32
-        else:
-            self.compute_dtype = tf.float32
-            self.variable_dtype = tf.float32
             
     @classmethod
     def from_pretrained(cls, model_name):
@@ -84,45 +75,37 @@ class OmniGenPipeline:
         num_inference_steps=50,
         guidance_scale=3.0,
         negative_prompt=None,
+        **kwargs
     ):
         """Generate images from text prompt."""
         
         # Process inputs on GPU
         with tf.device(self.device):
-            # Convert inputs to compute dtype
+            # Generate initial latents
             latents = tf.random.normal(
-                [1, height // 8, width // 8, 4],
-                dtype=self.compute_dtype
+                [1, height // 8, width // 8, 4]
             )
             
             # Process text prompt
-            text_inputs = self.processor(
-                prompt,
-                padding="max_length",
-                max_length=77,
-                truncation=True,
-                return_tensors="tf"
-            )
+            text_inputs = self.processor.process_text(prompt)
             
             # Run diffusion process
-            for i, t in enumerate(self.scheduler.timesteps):
+            for t in range(num_inference_steps):
                 # Convert timestep to tensor
-                timestep = tf.convert_to_tensor([t], dtype=self.compute_dtype)
+                timestep = tf.convert_to_tensor([t])
                 
                 # Get model prediction
-                with tf.GradientTape() as tape:
-                    noise_pred = self.model(
-                        latents,
-                        timestep,
-                        input_ids=text_inputs["input_ids"],
-                        attention_mask=text_inputs["attention_mask"],
-                        training=False
-                    )
+                noise_pred = self.model(
+                    latents,
+                    timestep,
+                    text_inputs,
+                    training=False
+                )
                 
                 # Update latents
                 latents = self.scheduler.step(
                     noise_pred,
-                    t,
+                    timestep,
                     latents
                 )
             
@@ -137,32 +120,22 @@ class OmniGenPipeline:
             # Scale and decode the image latents with vae
             latents = 1 / 0.18215 * latents
             
-            # Convert to float32 for post-processing
-            latents = tf.cast(latents, tf.float32)
+            # Decode with VAE
+            images = self.model.vae.decode(latents)
             
-            # Rescale to [0, 1]
-            latents = (latents / 2 + 0.5)
-            latents = tf.clip_by_value(latents, 0.0, 1.0)
+            # Postprocess images
+            images = (images / 2 + 0.5)
+            images = tf.clip_by_value(images, 0.0, 1.0)
+            images = tf.cast(images * 255, tf.uint8)
             
-            # Convert to uint8
-            latents = tf.cast(latents * 255, tf.uint8)
-            
-            # Convert to image
-            image = tf.transpose(latents, [0, 3, 1, 2])  # NHWC -> NCHW
-            image = tf.transpose(image, [0, 2, 3, 1])  # NCHW -> NHWC
-            
-            # Convert to PIL Image
-            image = image[0].numpy()  # Remove batch dimension
-            return Image.fromarray(image)
+        return images
         
     def numpy_to_pil(self, images):
         """Convert a numpy image to a PIL image."""
         if images.ndim == 3:
             images = images[None, ...]
-        images = tf.image.convert_image_dtype(images, tf.uint8)
         
         pil_images = [Image.fromarray(image.numpy()) for image in images]
-        
         return pil_images
 
     def generate_image(self, prompt, output_path=None, show_image=False):
