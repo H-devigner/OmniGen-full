@@ -200,7 +200,13 @@ class OmniGen(tf.keras.Model):
         self.out_channels = in_channels
         self.patch_size = patch_size
         self.pos_embed_max_size = pos_embed_max_size
-
+        
+        # Convert dict to Phi3Config if needed
+        if isinstance(transformer_config, dict):
+            transformer_config = Phi3Config(**transformer_config)
+        elif not isinstance(transformer_config, Phi3Config):
+            raise ValueError("transformer_config must be either a dict or Phi3Config instance")
+        
         hidden_size = transformer_config.hidden_size
         
         # Initialize embedders with mixed precision
@@ -335,6 +341,26 @@ class OmniGen(tf.keras.Model):
             
         # Update config with kwargs
         config_dict.update(kwargs)
+        
+        # Ensure required config values are present
+        default_config = {
+            "hidden_size": 3072,
+            "intermediate_size": 12288,
+            "num_attention_heads": 48,
+            "num_hidden_layers": 32,
+            "layer_norm_eps": 1e-5,
+            "hidden_act": "gelu",
+            "initializer_range": 0.02,
+            "attention_probs_dropout_prob": 0.0,
+            "hidden_dropout_prob": 0.0,
+            "max_position_embeddings": 2048,
+        }
+        
+        # Update config with defaults for missing values
+        for key, value in default_config.items():
+            if key not in config_dict:
+                config_dict[key] = value
+                print(f"Using default value for {key}: {value}")
         
         # Create model
         model = cls(transformer_config=config_dict)
