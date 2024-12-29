@@ -116,37 +116,26 @@ class PatchEmbed(layers.Layer):
         
     def call(self, x):
         """Forward pass."""
-        # Rearrange input to NCHW format
-        if x.shape[-1] == self.in_channels:  # NHWC format
-            x = tf.transpose(x, [0, 3, 1, 2])
-            
-        B, C, H, W = x.shape
+        # Get input dtype
+        input_dtype = x.dtype
         
-        # Ensure input dimensions are compatible with patch size
-        if H % self.patch_size != 0 or W % self.patch_size != 0:
-            raise ValueError(
-                f"Input image dimensions ({H}, {W}) must be divisible by "
-                f"patch size ({self.patch_size})"
-            )
-            
-        # Convert back to NHWC for Conv2D
-        x = tf.transpose(x, [0, 2, 3, 1])
+        # Convert to float32 for computation
+        x = tf.cast(x, tf.float32)
         
-        # Apply patch embedding
+        # Project patches
         x = self.proj(x)
         
-        # Reshape to (B, N, C)
-        x = tf.reshape(x, [B, -1, self.embed_dim])
+        # Reshape to [B, H*W, C]
+        B, H, W, C = tf.shape(x)[0], tf.shape(x)[1], tf.shape(x)[2], tf.shape(x)[3]
+        x = tf.reshape(x, [B, H * W, C])
+        
+        # Convert back to input dtype
+        x = tf.cast(x, input_dtype)
         
         return x
         
     def get_num_patches(self, h, w):
         """Get number of patches for given input dimensions."""
-        if h % self.patch_size != 0 or w % self.patch_size != 0:
-            raise ValueError(
-                f"Input image dimensions ({h}, {w}) must be divisible by "
-                f"patch size ({self.patch_size})"
-            )
         return (h // self.patch_size) * (w // self.patch_size)
 
 
@@ -332,9 +321,12 @@ class OmniGen(tf.keras.Model):
         h = tf.shape(latents)[1]
         w = tf.shape(latents)[2]
         
+        # Get input dtype
+        input_dtype = latents.dtype
+        
         # Embed timesteps
-        t_emb = self.t_embedder(timestep)
-        time_token = self.time_token(timestep)
+        t_emb = tf.cast(self.t_embedder(timestep), input_dtype)
+        time_token = tf.cast(self.time_token(timestep), input_dtype)
         
         # Patch and embed input latents
         x = self.x_embedder(latents)
@@ -348,11 +340,11 @@ class OmniGen(tf.keras.Model):
                 w // self.patch_size,
                 cls_token=False
             )
-            pos_embed = tf.expand_dims(tf.convert_to_tensor(pos_embed, dtype=tf.float32), 0)
+            pos_embed = tf.expand_dims(tf.convert_to_tensor(pos_embed, dtype=input_dtype), 0)
             pos_embed = tf.tile(pos_embed, [batch_size, 1, 1])
         else:
             # Use provided position IDs
-            pos_embed = tf.gather(self.pos_embed, position_ids)
+            pos_embed = tf.cast(tf.gather(self.pos_embed, position_ids), input_dtype)
             
         x = x + pos_embed
         
@@ -368,7 +360,7 @@ class OmniGen(tf.keras.Model):
                 position_ids=position_ids,
                 training=training
             )
-            text_embeds = text_outputs.last_hidden_state
+            text_embeds = tf.cast(text_outputs.last_hidden_state, input_dtype)
             
             # Concatenate with image embeddings
             x = tf.concat([text_embeds, x], axis=1)
@@ -386,7 +378,7 @@ class OmniGen(tf.keras.Model):
             position_ids=position_ids,
             training=training
         )
-        hidden_states = outputs.last_hidden_state
+        hidden_states = tf.cast(outputs.last_hidden_state, input_dtype)
         
         # Process output
         if input_ids is not None:
