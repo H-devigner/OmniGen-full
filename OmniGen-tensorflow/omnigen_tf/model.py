@@ -66,8 +66,8 @@ class TimestepEmbedder(Model):
         Returns:
             an (N, D) Tensor of positional embeddings.
         """
-        # Convert inputs to float32
-        t = tf.cast(t, tf.float32)
+        # Ensure t is 1D and float32
+        t = tf.cast(tf.reshape(t, [-1]), tf.float32)
         half = dim // 2
         
         # Create frequencies
@@ -86,10 +86,6 @@ class TimestepEmbedder(Model):
         
     def call(self, t, dtype=tf.float32):
         """Forward pass with proper type handling."""
-        # Ensure input is the right shape
-        if len(tf.shape(t)) == 1:
-            t = t[:, None]
-            
         # Create frequency embeddings
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         t_freq = tf.cast(t_freq, dtype)
@@ -170,16 +166,9 @@ class TimeToken(tf.keras.layers.Layer):
         
     def call(self, t):
         """Forward pass."""
-        # Reshape timestep to [batch_size, 1]
-        if len(tf.shape(t)) == 0:
-            t = tf.expand_dims(t, 0)  # Add batch dimension
-        if len(tf.shape(t)) == 1:
-            t = tf.expand_dims(t, 1)  # Add feature dimension
-            
-        # Convert to float32
-        t = tf.cast(t, tf.float32)
-        
-        return self.mlp(t)
+        # Ensure t is 1D
+        t = tf.reshape(t, [-1])
+        return self.mlp(tf.cast(t[:, None], tf.float32))
         
     def get_config(self):
         """Get layer configuration."""
@@ -253,7 +242,7 @@ class OmniGen(tf.keras.Model):
         )
         
         # Initialize time embedders
-        self.time_token = TimestepEmbedder(hidden_size, name="time_token")
+        self.time_token = TimeToken(hidden_size, name="time_token")
         self.t_embedder = TimestepEmbedder(hidden_size, name="t_embedder")
         
         # Initialize positional embedding
@@ -297,6 +286,8 @@ class OmniGen(tf.keras.Model):
         if guidance_scale is not None and guidance_scale > 1.0:
             # Duplicate input for classifier-free guidance
             inputs = tf.concat([inputs] * 2, axis=0)
+            # Ensure timestep is 1D before duplicating
+            timestep = tf.reshape(timestep, [-1])
             timestep = tf.concat([timestep] * 2, axis=0)
             
             if input_ids is not None:
