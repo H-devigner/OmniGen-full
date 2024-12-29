@@ -53,8 +53,8 @@ class OmniGenProcessor:
     def _setup_image_transform(self):
         """Setup image transformation pipeline to match PyTorch exactly."""
         def normalize(x):
+            """Normalize exactly like PyTorch."""
             x = tf.cast(x, tf.float32)
-            # Match PyTorch's normalization exactly
             mean = tf.constant([0.5, 0.5, 0.5], dtype=tf.float32)
             std = tf.constant([0.5, 0.5, 0.5], dtype=tf.float32)
             x = (x - mean) / std
@@ -218,13 +218,12 @@ class OmniGenCollator:
         """Create position IDs exactly like PyTorch."""
         position_ids = []
         text_length = tf.shape(attention_mask)[-1]
-        img_length = max(num_tokens_for_output_images)
+        img_length = max(num_tokens_for_output_images)  
         
         for mask in attention_mask:
             temp_l = tf.reduce_sum(mask)
             # Add time embedding token
-            temp_position = ([0] * (text_length - temp_l) + 
-                           list(range(temp_l + img_length + 1)))
+            temp_position = [0] * (text_length - temp_l) + list(range(temp_l + img_length + 1))
             position_ids.append(temp_position)
             
         return tf.convert_to_tensor(position_ids, dtype=tf.int64)
@@ -235,8 +234,7 @@ class OmniGenCollator:
         padding_images = []
         text_length = tf.shape(attention_mask)[-1]
         img_length = max(num_tokens_for_output_images)
-        # Add time embedding token
-        seq_len = text_length + img_length + 1
+        seq_len = text_length + img_length + 1  # Add time embedding token
         
         for i, mask in enumerate(attention_mask):
             temp_l = tf.reduce_sum(mask)
@@ -324,88 +322,119 @@ class OmniGenCollator:
                 tf.convert_to_tensor(attention_mask, dtype=tf.int64),
                 new_image_sizes)
         
-    @tf.function(jit_compile=True)
-    def process_mllm_input(
-        self,
-        mllm_inputs: Dict[str, tf.Tensor],
-        target_img_size: Optional[Tuple[int, int]] = None
-    ) -> Dict[str, tf.Tensor]:
-        """Process multi-modal inputs with XLA optimization."""
-        input_ids = mllm_inputs["input_ids"]
-        pixel_values = mllm_inputs.get("pixel_values")
-        image_sizes = mllm_inputs.get("image_sizes")
+    def process_mllm_input(self, mllm_inputs, target_img_size):
+        """Process multi-modal inputs exactly like PyTorch."""
+        num_tokens_for_output_images = []
+        for img_size in target_img_size:
+            num_tokens_for_output_images.append(img_size[0] * img_size[1] // 16 // 16)
+            
+        pixel_values, image_sizes = [], {}
+        b_inx = 0
+        for x in mllm_inputs:
+            if x['pixel_values'] is not None:
+                pixel_values.extend(x['pixel_values'])
+                for size in x['image_sizes']:
+                    if b_inx not in image_sizes:
+                        image_sizes[b_inx] = [size]
+                    else:
+                        image_sizes[b_inx].append(size)
+            b_inx += 1
+            
+        pixel_values = [tf.expand_dims(x, 0) for x in pixel_values]
         
-        # Process input IDs
-        input_ids, attention_mask, image_sizes = self.pad_input_ids(input_ids, image_sizes)
-        
-        # Adjust for input images
+        input_ids = [x['input_ids'] for x in mllm_inputs]
+        padded_input_ids, attention_mask, image_sizes = self.pad_input_ids(input_ids, image_sizes)
+        position_ids = self.create_position(attention_mask, num_tokens_for_output_images)
+        attention_mask, padding_images = self.create_mask(attention_mask, num_tokens_for_output_images)
         attention_mask = self.adjust_attention_for_input_images(attention_mask, image_sizes)
         
-        # Create position IDs
-        position_ids = self.create_position(attention_mask, [0] * len(input_ids))
+        return (padded_input_ids, position_ids, attention_mask, padding_images, 
+                pixel_values, image_sizes)
         
-        # Process pixel values if present
-        if pixel_values is not None and target_img_size is not None:
-            # Resize images to target size
-            pixel_values = tf.image.resize(
-                pixel_values,
-                target_img_size,
-                method=tf.image.ResizeMethod.LANCZOS3
-            )
+    def __call__(self, features):
+        """Process features exactly like PyTorch."""
+        mllm_inputs = [f[0] for f in features]
+        cfg_mllm_inputs = [f[1] for f in features]
+        img_cfg_mllm_input = [f[2] for f in features]
+        target_img_size = [f[3] for f in features]
+        
+        if img_cfg_mllm_input[0] is not None:
+            mllm_inputs = mllm_inputs + cfg_mllm_inputs + img_cfg_mllm_input
+            target_img_size = target_img_size + target_img_size + target_img_size
+        else:
+            mllm_inputs = mllm_inputs + cfg_mllm_inputs
+            target_img_size = target_img_size + target_img_size
+            
+        (all_padded_input_ids, all_position_ids, all_attention_mask,
+         all_padding_images, all_pixel_values, all_image_sizes) = self.process_mllm_input(
+            mllm_inputs, target_img_size)
             
         return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "position_ids": position_ids,
-            "pixel_values": pixel_values,
-            "image_sizes": image_sizes
+            "input_ids": all_padded_input_ids,
+            "attention_mask": all_attention_mask,
+            "position_ids": all_position_ids,
+            "input_pixel_values": all_pixel_values,
+            "input_image_sizes": all_image_sizes,
+            "padding_images": all_padding_images
         }
         
-    def __call__(self, features: List[Dict[str, tf.Tensor]]) -> Dict[str, tf.Tensor]:
-        """Process batch of features with memory optimization."""
-        if not features:
-            return {}
-            
-        # Extract components
-        input_ids = [f["input_ids"] for f in features]
-        pixel_values = [f.get("pixel_values") for f in features]
-        image_sizes = [f.get("image_sizes") for f in features]
-        
-        # Process with XLA optimization
-        return self.process_mllm_input(
-            {
-                "input_ids": input_ids,
-                "pixel_values": pixel_values[0] if pixel_values else None,
-                "image_sizes": image_sizes
-            }
-        )
-
-
-class OmniGenSeparateCollator:
+class OmniGenSeparateCollator(OmniGenCollator):
     """TensorFlow separate collator with exact PyTorch equivalence."""
     
-    def __call__(self, features: List[Dict[str, tf.Tensor]]) -> List[Dict[str, tf.Tensor]]:
-        """Process features separately with memory optimization."""
-        if not features:
-            return []
+    def __call__(self, features):
+        """Process features exactly like PyTorch."""
+        mllm_inputs = [f[0] for f in features]
+        cfg_mllm_inputs = [f[1] for f in features]
+        img_cfg_mllm_input = [f[2] for f in features]
+        target_img_size = [f[3] for f in features]
+        
+        all_padded_input_ids = []
+        all_attention_mask = []
+        all_position_ids = []
+        all_pixel_values = []
+        all_image_sizes = []
+        all_padding_images = []
+        
+        # Process main inputs
+        (padded_input_ids, position_ids, attention_mask, padding_images,
+         pixel_values, image_sizes) = self.process_mllm_input(mllm_inputs, target_img_size)
+         
+        all_padded_input_ids.append(padded_input_ids)
+        all_attention_mask.append(attention_mask)
+        all_position_ids.append(position_ids)
+        all_pixel_values.append(pixel_values)
+        all_image_sizes.append(image_sizes)
+        all_padding_images.append(padding_images)
+        
+        # Process cfg inputs if present
+        if cfg_mllm_inputs[0] is not None:
+            (padded_input_ids, position_ids, attention_mask, padding_images,
+             pixel_values, image_sizes) = self.process_mllm_input(cfg_mllm_inputs, target_img_size)
+             
+            all_padded_input_ids.append(padded_input_ids)
+            all_attention_mask.append(attention_mask)
+            all_position_ids.append(position_ids)
+            all_pixel_values.append(pixel_values)
+            all_image_sizes.append(image_sizes)
+            all_padding_images.append(padding_images)
             
-        processed_features = []
-        for feature in features:
-            # Process each feature independently
-            processed = OmniGenCollator().process_mllm_input(
-                {
-                    "input_ids": [feature["input_ids"]],
-                    "pixel_values": feature.get("pixel_values"),
-                    "image_sizes": feature.get("image_sizes")
-                }
-            )
+        # Process img cfg inputs if present
+        if img_cfg_mllm_input[0] is not None:
+            (padded_input_ids, position_ids, attention_mask, padding_images,
+             pixel_values, image_sizes) = self.process_mllm_input(img_cfg_mllm_input, target_img_size)
+             
+            all_padded_input_ids.append(padded_input_ids)
+            all_attention_mask.append(attention_mask)
+            all_position_ids.append(position_ids)
+            all_pixel_values.append(pixel_values)
+            all_image_sizes.append(image_sizes)
+            all_padding_images.append(padding_images)
             
-            # Remove batch dimension
-            processed = {
-                k: v[0] if isinstance(v, tf.Tensor) and len(v.shape) > 0 else v
-                for k, v in processed.items()
-            }
-            
-            processed_features.append(processed)
-            
-        return processed_features
+        return {
+            "input_ids": all_padded_input_ids,
+            "attention_mask": all_attention_mask,
+            "position_ids": all_position_ids,
+            "input_pixel_values": all_pixel_values,
+            "input_image_sizes": all_image_sizes,
+            "padding_images": all_padding_images
+        }
