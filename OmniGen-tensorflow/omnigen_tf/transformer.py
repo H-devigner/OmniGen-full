@@ -135,44 +135,41 @@ class Phi3Transformer(TFPreTrainedModel):
         self.chunk_size = None  # For chunked processing
         
         # Initialize embeddings
-        self.wte = layers.Embedding(config.vocab_size, self.hidden_size, dtype='float16')
+        self.wte = layers.Embedding(
+            config.vocab_size,
+            config.hidden_size,
+            name="wte"
+        )
         self.drop = layers.Dropout(config.hidden_dropout)
         
         # Initialize transformer layers
-        self.transformer = OmniGenTransformer(config)
-        self.ln_f = layers.LayerNormalization(epsilon=config.layer_norm_epsilon, dtype='float16')
-        
-        # Setup memory optimization
-        self._setup_memory_optimization()
-    
-    def _setup_memory_optimization(self):
-        """Setup memory optimization configurations."""
-        self._is_gpu_available = len(tf.config.list_physical_devices('GPU')) > 0
-        
-        if self._is_gpu_available:
-            # Enable memory growth
-            for device in tf.config.list_physical_devices('GPU'):
-                try:
-                    tf.config.experimental.set_memory_growth(device, True)
-                    # Use 70% of available memory
-                    memory_limit = int(tf.config.experimental.get_memory_info('GPU:0')['free'] * 0.7)
-                    tf.config.set_logical_device_configuration(
-                        device,
-                        [tf.config.LogicalDeviceConfiguration(memory_limit=memory_limit)]
-                    )
-                except:
-                    pass
+        self.layers = []
+        for i in range(config.num_hidden_layers):
+            self.layers.append(
+                TransformerLayer(
+                    hidden_size=config.hidden_size,
+                    num_attention_heads=config.num_attention_heads,
+                    max_position_embeddings=config.max_position_embeddings,
+                    layer_norm_epsilon=config.layer_norm_epsilon,
+                    hidden_dropout_prob=config.hidden_dropout,
+                    attention_probs_dropout_prob=config.attention_dropout,
+                    name=f"layer_{i}"
+                )
+            )
             
-            # Use mixed precision
-            tf.keras.mixed_precision.set_global_policy('mixed_float16')
-    
+        # Initialize final layer norm
+        self.ln_f = layers.LayerNormalization(
+            epsilon=config.layer_norm_epsilon,
+            name="ln_f"
+        )
+        
     def prefetch_layer(self, layer_idx: int):
         """Starts prefetching the next layer cache."""
         if not self._is_gpu_available:
             return
             
         with tf.device('/GPU:0'):
-            layer = self.transformer.layers[layer_idx]
+            layer = self.layers[layer_idx]
             # Non-blocking transfer
             for weight in layer.trainable_weights:
                 tf.identity(weight)
@@ -183,7 +180,7 @@ class Phi3Transformer(TFPreTrainedModel):
             return
             
         with tf.device('/CPU:0'):
-            prev_layer = self.transformer.layers[layer_idx - 1]
+            prev_layer = self.layers[layer_idx - 1]
             for weight in prev_layer.trainable_weights:
                 tf.identity(weight)
         
@@ -202,7 +199,7 @@ class Phi3Transformer(TFPreTrainedModel):
         self.evict_previous_layer(layer_idx)
         
         # Prefetch next layer
-        next_layer_idx = (layer_idx + 1) % len(self.transformer.layers)
+        next_layer_idx = (layer_idx + 1) % len(self.layers)
         self.prefetch_layer(next_layer_idx)
     
     def enable_gradient_checkpointing(self):
@@ -243,7 +240,7 @@ class Phi3Transformer(TFPreTrainedModel):
     def _process_chunk(self, hidden_states):
         """Process a single chunk through the transformer layers."""
         # Apply transformer layers
-        for layer in self.transformer.layers:
+        for layer in self.layers:
             if self.gradient_checkpointing_enabled:
                 hidden_states = tf.stop_gradient(hidden_states)
             hidden_states = layer(hidden_states)
@@ -316,7 +313,7 @@ class Phi3Transformer(TFPreTrainedModel):
             hidden_states = tf.cast(self.drop(inputs_embeds, training=training), tf.float16)
 
         # Process through layers
-        for idx, layer in enumerate(self.transformer.layers):
+        for idx, layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
@@ -412,6 +409,188 @@ class Phi3Transformer(TFPreTrainedModel):
         return model
 
 
+class TransformerLayer(layers.Layer):
+    """Transformer layer."""
+    
+    def __init__(
+        self,
+        hidden_size,
+        num_attention_heads,
+        max_position_embeddings,
+        layer_norm_epsilon,
+        hidden_dropout_prob,
+        attention_probs_dropout_prob,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        
+        self.hidden_size = hidden_size
+        self.num_attention_heads = num_attention_heads
+        self.max_position_embeddings = max_position_embeddings
+        self.layer_norm_epsilon = layer_norm_epsilon
+        self.hidden_dropout_prob = hidden_dropout_prob
+        self.attention_probs_dropout_prob = attention_probs_dropout_prob
+        
+        # Initialize components
+        self.self_attn = MultiHeadAttention(
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            dropout=attention_probs_dropout_prob,
+            name="self_attn"
+        )
+        self.self_attn_layer_norm = layers.LayerNormalization(
+            epsilon=layer_norm_epsilon,
+            name="self_attn_layer_norm"
+        )
+        self.self_attn_dropout = layers.Dropout(hidden_dropout_prob)
+        
+        self.intermediate = layers.Dense(
+            hidden_size,
+            activation="relu",
+            name="intermediate"
+        )
+        self.output = layers.Dense(
+            hidden_size,
+            name="output"
+        )
+        self.output_layer_norm = layers.LayerNormalization(
+            epsilon=layer_norm_epsilon,
+            name="output_layer_norm"
+        )
+        self.output_dropout = layers.Dropout(hidden_dropout_prob)
+        
+    def call(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        output_attentions=False,
+        use_cache=False,
+        training=False,
+    ):
+        """Forward pass."""
+        # Self attention
+        attention_outputs = self.self_attn(
+            hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            training=training
+        )
+        
+        if isinstance(attention_outputs, tuple):
+            attention_output = attention_outputs[0]
+            attention_weights = attention_outputs[1] if len(attention_outputs) > 1 else None
+            present_key_value = attention_outputs[2] if len(attention_outputs) > 2 else None
+        else:
+            attention_output = attention_outputs
+            attention_weights = None
+            present_key_value = None
+            
+        # Apply self attention dropout
+        attention_output = self.self_attn_dropout(attention_output, training=training)
+        
+        # Apply self attention layer norm
+        attention_output = self.self_attn_layer_norm(attention_output + hidden_states)
+        
+        # Intermediate
+        intermediate_output = self.intermediate(attention_output)
+        
+        # Output
+        output = self.output(intermediate_output)
+        
+        # Apply output dropout
+        output = self.output_dropout(output, training=training)
+        
+        # Apply output layer norm
+        output = self.output_layer_norm(output + attention_output)
+        
+        outputs = (output,)
+        if output_attentions:
+            outputs += (attention_weights,)
+        if use_cache:
+            outputs += (present_key_value,)
+            
+        return outputs
+
+
+class MultiHeadAttention(layers.Layer):
+    """Multi-head attention layer."""
+    
+    def __init__(
+        self,
+        hidden_size,
+        num_attention_heads,
+        dropout,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        
+        self.hidden_size = hidden_size
+        self.num_attention_heads = num_attention_heads
+        self.dropout = dropout
+        
+        # Initialize components
+        self.query = layers.Dense(hidden_size, name="query")
+        self.key = layers.Dense(hidden_size, name="key")
+        self.value = layers.Dense(hidden_size, name="value")
+        
+        self.dropout_layer = layers.Dropout(dropout)
+        
+    def call(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        output_attentions=False,
+        use_cache=False,
+        training=False,
+    ):
+        """Forward pass."""
+        # Get query, key, value
+        query = self.query(hidden_states)
+        key = self.key(hidden_states)
+        value = self.value(hidden_states)
+        
+        # Get past key and value if provided
+        if past_key_value is not None:
+            past_key, past_value = past_key_value
+            key = tf.concat([past_key, key], axis=1)
+            value = tf.concat([past_value, value], axis=1)
+            
+        # Compute attention scores
+        attention_scores = tf.matmul(query, key, transpose_b=True)
+        attention_scores = attention_scores / tf.math.sqrt(tf.cast(self.hidden_size, tf.float32))
+        
+        # Add attention mask if provided
+        if attention_mask is not None:
+            attention_scores += attention_mask
+        
+        # Normalize attention scores
+        attention_weights = tf.nn.softmax(attention_scores, axis=-1)
+        
+        # Apply dropout
+        attention_weights = self.dropout_layer(attention_weights, training=training)
+        
+        # Compute attention output
+        attention_output = tf.matmul(attention_weights, value)
+        
+        # Save current key and value if needed
+        present_key_value = (key, value) if use_cache else None
+            
+        outputs = (attention_output,)
+        if output_attentions:
+            outputs += (attention_weights,)
+        if use_cache:
+            outputs += (present_key_value,)
+            
+        return outputs
+
+
 class OmniGenTransformer(layers.Layer):
     """Transformer model for OmniGen."""
     
@@ -424,7 +603,15 @@ class OmniGenTransformer(layers.Layer):
         self.chunk_size = 32  # Default chunk size for processing
         
         # Initialize components with mixed precision
-        self.h = [OmniGenLayer(config, name=f"h.{i}") for i in range(self.num_hidden_layers)]
+        self.h = [TransformerLayer(
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            max_position_embeddings=config.max_position_embeddings,
+            layer_norm_epsilon=config.layer_norm_epsilon,
+            hidden_dropout_prob=config.hidden_dropout,
+            attention_probs_dropout_prob=config.attention_dropout,
+            name=f"h.{i}"
+        ) for i in range(self.num_hidden_layers)]
         self.norm = layers.LayerNormalization(epsilon=1e-5, dtype=tf.float16, name="norm")
         
     def _process_chunk(self, chunk, layer_module, attention_mask, position_ids, past_key_value, output_attentions, use_cache, training):
