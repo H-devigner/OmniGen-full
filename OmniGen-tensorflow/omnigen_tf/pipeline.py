@@ -6,6 +6,7 @@ import numpy as np
 import tensorflow as tf
 from PIL import Image
 from typing import List, Optional, Union
+from huggingface_hub import snapshot_download
 
 from omnigen_tf.model import OmniGen
 from omnigen_tf.scheduler import OmniGenScheduler
@@ -50,24 +51,28 @@ class OmniGenPipeline:
             
     @classmethod
     def from_pretrained(cls, model_name):
-        """Load pretrained model."""
-        if not os.path.exists(model_name):
-            print(f"Model not found at {model_name}, downloading from HuggingFace...")
-            cache_folder = os.getenv('HF_HUB_CACHE')
-            model_name = snapshot_download(
-                repo_id=model_name,
-                cache_dir=cache_folder,
-                ignore_patterns=['flax_model.msgpack', 'rust_model.ot', 'tf_model.h5']
-            )
-            
-        # Initialize components with GPU support
-        with tf.device('/GPU:0'):
-            vae = OmniGen.from_pretrained(model_name)
-            model = OmniGen.from_pretrained(model_name)
+        """Load pretrained model with proper error handling."""
+        try:
+            if not os.path.exists(model_name):
+                print(f"Model not found at {model_name}, downloading from HuggingFace...")
+                cache_folder = os.getenv('HF_HUB_CACHE', os.path.expanduser('~/.cache/huggingface/hub'))
+                model_name = snapshot_download(
+                    repo_id=model_name,
+                    cache_dir=cache_folder,
+                    allow_patterns=["*.json", "*.bin", "*.pt", "*.pth", "*.safetensors"]
+                )
+                
+            # Initialize components
             processor = OmniGenProcessor.from_pretrained(model_name)
             scheduler = OmniGenScheduler()
-        
-        return cls(vae, model, scheduler, processor)
+            model = OmniGen.from_pretrained(model_name)
+            vae = model.get_vae()
+            
+            return cls(vae, model, scheduler, processor)
+            
+        except Exception as e:
+            print(f"Error loading model: {str(e)}")
+            raise
 
     def enable_model_cpu_offload(self):
         """Enable model CPU offloading to save GPU memory."""
