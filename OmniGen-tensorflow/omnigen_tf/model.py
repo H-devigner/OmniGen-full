@@ -329,8 +329,8 @@ class OmniGen(tf.keras.Model):
         import os
         import json
         from huggingface_hub import snapshot_download
-        from safetensors.tensorflow import load_file
-        import numpy as np
+        from safetensors.tensorflow import safe_open
+        import gc
         
         # Get model path
         model_path = pretrained_model_name_or_path
@@ -383,48 +383,66 @@ class OmniGen(tf.keras.Model):
             
             # Load weights on CPU first
             with tf.device('/CPU:0'):
-                state_dict = load_file(weights_file)
-                
-                # Process weights in chunks to avoid OOM
-                for name, weight in state_dict.items():
-                    try:
-                        # Convert to numpy first to ensure CPU processing
-                        weight_np = weight.numpy()
+                # Use safe_open to load weights in chunks
+                with safe_open(weights_file, framework="tf") as f:
+                    # Get list of keys first
+                    weight_keys = f.keys()
+                    
+                    # Group keys by layer for more efficient loading
+                    layer_groups = {}
+                    for key in weight_keys:
+                        layer_name = key.split('.')[0]
+                        if layer_name not in layer_groups:
+                            layer_groups[layer_name] = []
+                        layer_groups[layer_name].append(key)
+                    
+                    # Load weights layer by layer
+                    for layer_name, keys in layer_groups.items():
+                        print(f"Loading {layer_name} weights...")
                         
-                        # Process in chunks if tensor is large
-                        if weight_np.size > 1e6:  # Process in chunks if > 1M elements
-                            chunk_size = int(1e6)
-                            chunks = []
-                            
-                            for i in range(0, weight_np.size, chunk_size):
-                                end = min(i + chunk_size, weight_np.size)
-                                chunk = weight_np.flat[i:end]
-                                chunk_tensor = tf.convert_to_tensor(chunk, dtype=tf.float16)
-                                chunks.append(chunk_tensor)
-                            
-                            # Concatenate chunks and reshape back to original shape
-                            weight_tensor = tf.concat(chunks, axis=0)
-                            weight_tensor = tf.reshape(weight_tensor, weight_np.shape)
-                        else:
-                            # Small tensor - process directly
-                            weight_tensor = tf.convert_to_tensor(weight_np, dtype=tf.float16)
+                        # Load weights for current layer
+                        for key in keys:
+                            try:
+                                # Get tensor shape and dtype first
+                                tensor_info = f.get_tensor_info(key)
+                                shape = tensor_info['shape']
+                                dtype = tensor_info['dtype']
+                                
+                                # Skip if tensor is too large
+                                if np.prod(shape) > 1e8:  # Skip tensors larger than 100M elements
+                                    print(f"Skipping large tensor {key} with shape {shape}")
+                                    continue
+                                
+                                # Load tensor
+                                weight = f.get_tensor(key)
+                                
+                                # Convert to float16 for GPU memory efficiency
+                                weight = tf.cast(weight, tf.float16)
+                                
+                                # Find corresponding layer in TF model
+                                if key.startswith('transformer.'):
+                                    tf_name = key.replace('transformer.', 'transformer/')
+                                else:
+                                    tf_name = key.replace('.', '/')
+                                    
+                                # Get layer by name
+                                layer = model.get_layer(tf_name)
+                                if layer is not None:
+                                    # Assign weights
+                                    if 'weight' in key:
+                                        layer.kernel.assign(weight)
+                                    elif 'bias' in key:
+                                        layer.bias.assign(weight)
+                                
+                                # Clear memory
+                                del weight
+                                gc.collect()
+                                
+                            except Exception as e:
+                                print(f"Warning: Could not load weight {key}: {str(e)}")
                         
-                        # Find corresponding layer in TF model
-                        if name.startswith('transformer.'):
-                            tf_name = name.replace('transformer.', 'transformer/')
-                        else:
-                            tf_name = name.replace('.', '/')
-                            
-                        # Get layer by name
-                        layer = model.get_layer(tf_name)
-                        if layer is not None:
-                            # Assign weights
-                            if 'weight' in name:
-                                layer.kernel.assign(weight_tensor)
-                            elif 'bias' in name:
-                                layer.bias.assign(weight_tensor)
-                    except Exception as e:
-                        print(f"Warning: Could not load weight {name}: {str(e)}")
+                        # Clear memory after each layer
+                        gc.collect()
                     
             print("Weights loaded successfully!")
         else:
