@@ -155,9 +155,21 @@ class TimeToken(tf.keras.layers.Layer):
         
     def call(self, t):
         """Forward pass."""
-        # Ensure t is 1D
-        t = tf.reshape(t, [-1])
-        return self.mlp(tf.cast(t[:, None], tf.float32))
+        # Get input shape
+        batch_size = tf.shape(t)[0]
+        
+        # Ensure t is 1D for each batch element
+        t = tf.reshape(t, [batch_size, -1])
+        t = t[:, 0]  # Take first element from each batch
+        
+        # Convert to float32 for computation
+        t = tf.cast(t, tf.float32)
+        
+        # Add feature dimension
+        t = t[:, None]
+        
+        # Pass through MLP
+        return self.mlp(t)  # Shape: [batch_size, embed_dim]
         
     def get_config(self):
         """Get layer configuration."""
@@ -326,10 +338,10 @@ class OmniGen(tf.keras.Model):
         
         # Embed timesteps
         t_emb = tf.cast(self.t_embedder(timestep), input_dtype)
-        time_token = tf.cast(self.time_token(timestep), input_dtype)
+        time_token = tf.cast(self.time_token(timestep), input_dtype)  # Shape: [batch_size, embed_dim]
         
         # Patch and embed input latents
-        x = self.x_embedder(latents)
+        x = self.x_embedder(latents)  # Shape: [batch_size, num_patches, embed_dim]
         
         # Add positional embeddings
         if position_ids is None:
@@ -348,8 +360,9 @@ class OmniGen(tf.keras.Model):
             
         x = x + pos_embed
         
-        # Add time token
-        x = tf.concat([time_token[:, None, :], x], axis=1)
+        # Add time token - reshape to match batch dimension
+        time_token = tf.expand_dims(time_token, axis=1)  # Shape: [batch_size, 1, embed_dim]
+        x = tf.concat([time_token, x], axis=1)
         
         # Process text input if provided
         if input_ids is not None:
