@@ -170,9 +170,15 @@ class Phi3Transformer(layers.Layer):
         """Forward pass."""
         # Get input embeddings
         if input_ids is not None:
+            # Add batch dimension if needed
+            if len(tf.shape(input_ids)) == 1:
+                input_ids = tf.expand_dims(input_ids, 0)
             input_shape = tf.shape(input_ids)
             inputs_embeds = self.wte(input_ids)
         elif inputs_embeds is not None:
+            # Add batch dimension if needed
+            if len(tf.shape(inputs_embeds)) == 2:
+                inputs_embeds = tf.expand_dims(inputs_embeds, 0)
             input_shape = tf.shape(inputs_embeds)[:-1]
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
@@ -181,11 +187,24 @@ class Phi3Transformer(layers.Layer):
         batch_size = input_shape[0]
         seq_length = input_shape[1]
         
+        tf.print("Transformer input shapes:")
+        tf.print("batch_size:", batch_size)
+        tf.print("seq_length:", seq_length)
+        
         # Initialize hidden states and attention outputs
         hidden_states = inputs_embeds
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
         
+        # Add attention mask if needed
+        if attention_mask is not None:
+            # Add batch dimension if needed
+            if len(tf.shape(attention_mask)) == 1:
+                attention_mask = tf.expand_dims(attention_mask, 0)
+            # Convert to float and create causal mask
+            attention_mask = tf.cast(attention_mask[:, tf.newaxis, tf.newaxis, :], hidden_states.dtype)
+            attention_mask = (1.0 - attention_mask) * -10000.0
+            
         # Process through blocks
         for idx, block in enumerate(self.blocks):
             if output_hidden_states:
@@ -193,6 +212,8 @@ class Phi3Transformer(layers.Layer):
                 
             # Get past key value
             past_key_value = past_key_values[idx] if past_key_values is not None else None
+            
+            tf.print(f"Block {idx} input shape:", tf.shape(hidden_states))
             
             # Process through block
             layer_outputs = block(
@@ -213,7 +234,7 @@ class Phi3Transformer(layers.Layer):
                 all_attentions = all_attentions + (layer_outputs[1],)
                 
         # Final layer norm
-        hidden_states = self.ln_f(hidden_states)
+        hidden_states = tf.cast(self.ln_f(hidden_states), inputs_embeds.dtype)
         
         # Add final hidden states
         if output_hidden_states:
@@ -385,18 +406,34 @@ class MultiHeadAttention(layers.Layer):
         training=False,
     ):
         """Forward pass."""
+        # Add batch dimension if needed
+        if len(tf.shape(hidden_states)) == 2:
+            hidden_states = tf.expand_dims(hidden_states, 0)
+            
         batch_size = tf.shape(hidden_states)[0]
         seq_length = tf.shape(hidden_states)[1]
+        
+        tf.print("MultiHeadAttention input shape:", tf.shape(hidden_states))
         
         # Project query, key, value
         query = self.q_proj(hidden_states)
         key = self.k_proj(hidden_states)
         value = self.v_proj(hidden_states)
         
+        tf.print("After projection shapes:")
+        tf.print("query:", tf.shape(query))
+        tf.print("key:", tf.shape(key))
+        tf.print("value:", tf.shape(value))
+        
         # Split heads
         query = self._split_heads(query)
         key = self._split_heads(key)
         value = self._split_heads(value)
+        
+        tf.print("After split heads shapes:")
+        tf.print("query:", tf.shape(query))
+        tf.print("key:", tf.shape(key))
+        tf.print("value:", tf.shape(value))
         
         # Use past key value if provided
         if past_key_value is not None:
@@ -414,6 +451,8 @@ class MultiHeadAttention(layers.Layer):
         scale = tf.cast(tf.math.sqrt(tf.cast(self.head_size, tf.float32)), hidden_states.dtype)
         attention_scores = tf.matmul(query, tf.transpose(key, [0, 1, 3, 2])) / scale
         
+        tf.print("attention_scores shape:", tf.shape(attention_scores))
+        
         # Apply attention mask if provided
         if attention_mask is not None:
             attention_scores = attention_scores + attention_mask
@@ -427,11 +466,17 @@ class MultiHeadAttention(layers.Layer):
         # Apply attention to values
         context = tf.matmul(attention_probs, value)
         
+        tf.print("context shape before merge:", tf.shape(context))
+        
         # Merge heads
         context = self._merge_heads(context)
         
+        tf.print("context shape after merge:", tf.shape(context))
+        
         # Apply output projection
         output = self.o_proj(context)
+        
+        tf.print("output shape:", tf.shape(output))
         
         outputs = (output,)
         if output_attentions:
