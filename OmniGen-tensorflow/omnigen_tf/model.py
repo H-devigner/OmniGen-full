@@ -159,21 +159,23 @@ class TimeToken(tf.keras.layers.Layer):
         
     def call(self, t):
         """Forward pass."""
-        # Get input shape
+        # Get batch size
         batch_size = tf.shape(t)[0]
         
-        # Ensure t is 1D for each batch element
-        t = tf.reshape(t, [batch_size, -1])
-        t = t[:, 0]  # Take first element from each batch
-        
+        # Take first element from each sequence if input is 2D
+        if len(tf.shape(t)) > 1:
+            t = t[:, 0]
+            
         # Convert to float32 for computation
         t = tf.cast(t, tf.float32)
         
         # Add feature dimension
         t = t[:, None]
         
-        # Pass through MLP
-        return self.mlp(t)  # Shape: [batch_size, embed_dim]
+        # Pass through MLP and ensure output shape is [batch_size, embed_dim]
+        output = self.mlp(t)
+        tf.print("TimeToken output shape:", tf.shape(output))
+        return output  # Shape: [batch_size, embed_dim]
         
     def get_config(self):
         """Get layer configuration."""
@@ -342,6 +344,11 @@ class OmniGen(tf.keras.Model):
         h = tf.shape(latents)[1]
         w = tf.shape(latents)[2]
         
+        # Debug prints
+        tf.print("Input shapes:")
+        tf.print("latents:", tf.shape(latents))
+        tf.print("timestep:", tf.shape(timestep))
+        
         # Get input dtype
         input_dtype = latents.dtype
         
@@ -349,8 +356,13 @@ class OmniGen(tf.keras.Model):
         t_emb = tf.cast(self.t_embedder(timestep), input_dtype)
         time_token = tf.cast(self.time_token(timestep), input_dtype)  # Shape: [batch_size, embed_dim]
         
+        tf.print("After embedding:")
+        tf.print("t_emb:", tf.shape(t_emb))
+        tf.print("time_token:", tf.shape(time_token))
+        
         # Patch and embed input latents
         x = self.x_embedder(latents)  # Shape: [batch_size, num_patches, embed_dim]
+        tf.print("x after embedding:", tf.shape(x))
         
         # Add positional embeddings
         if position_ids is None:
@@ -367,11 +379,15 @@ class OmniGen(tf.keras.Model):
             # Use provided position IDs
             pos_embed = tf.cast(tf.gather(self.pos_embed, position_ids), input_dtype)
             
+        tf.print("pos_embed:", tf.shape(pos_embed))
         x = x + pos_embed
         
         # Add time token - reshape to match batch dimension
-        time_token = tf.expand_dims(time_token, axis=1)  # Shape: [batch_size, 1, embed_dim]
+        time_token = tf.reshape(time_token, [batch_size, 1, -1])  # Shape: [batch_size, 1, embed_dim]
+        tf.print("time_token reshaped:", tf.shape(time_token))
+        tf.print("x before concat:", tf.shape(x))
         x = tf.concat([time_token, x], axis=1)
+        tf.print("x after concat:", tf.shape(x))
         
         # Process text input if provided
         if input_ids is not None:
@@ -383,9 +399,11 @@ class OmniGen(tf.keras.Model):
                 training=training
             )
             text_embeds = tf.cast(text_outputs.last_hidden_state, input_dtype)
+            tf.print("text_embeds:", tf.shape(text_embeds))
             
             # Concatenate with image embeddings
             x = tf.concat([text_embeds, x], axis=1)
+            tf.print("x after text concat:", tf.shape(x))
             
             # Update attention mask if needed
             if attention_mask is not None:
