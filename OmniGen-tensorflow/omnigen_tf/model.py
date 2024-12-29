@@ -46,6 +46,7 @@ class TimestepEmbedder(Model):
     """Embeds scalar timesteps into vector representations."""
     
     def __init__(self, hidden_size, frequency_embedding_size=256, **kwargs):
+        """Initialize embedder with PyTorch equivalence."""
         super().__init__(**kwargs)
         self.mlp = tf.keras.Sequential([
             layers.Dense(hidden_size, use_bias=True),
@@ -53,31 +54,47 @@ class TimestepEmbedder(Model):
             layers.Dense(hidden_size, use_bias=True)
         ])
         self.frequency_embedding_size = frequency_embedding_size
-
-    @staticmethod
-    @tf.function(jit_compile=True)
-    def timestep_embedding(t, dim, max_period=10000):
+        
+    def timestep_embedding(self, t, dim, max_period=10000):
+        """Create sinusoidal timestep embeddings.
+        
+        Args:
+            t: a 1-D Tensor of N indices, one per batch element.
+            dim: the dimension of the output.
+            max_period: controls the minimum frequency of the embeddings.
+            
+        Returns:
+            an (N, D) Tensor of positional embeddings.
         """
-        Create sinusoidal timestep embeddings.
-        :param t: a 1-D Tensor of N indices, one per batch element.
-                          These may be fractional.
-        :param dim: the dimension of the output.
-        :param max_period: controls the minimum frequency of the embeddings.
-        :return: an (N, D) Tensor of positional embeddings.
-        """
+        # Convert inputs to float32
+        t = tf.cast(t, tf.float32)
         half = dim // 2
-        freqs = tf.exp(
-            -math.log(max_period) * tf.range(half, dtype=t.dtype) / half
-        )
-        args = tf.cast(t[:, None], dtype=freqs.dtype) * freqs[None]
+        
+        # Create frequencies
+        freqs = tf.cast(tf.range(half, dtype=tf.float32), tf.float32)
+        freqs = freqs * (-math.log(float(max_period)) / half)
+        freqs = tf.exp(freqs)
+        
+        # Create embeddings
+        args = t[:, None] * freqs[None]
         embedding = tf.concat([tf.cos(args), tf.sin(args)], axis=-1)
+        
         if dim % 2:
-            embedding = tf.concat([embedding, tf.zeros_like(embedding[:, :1])], axis=-1)
+            embedding = tf.pad(embedding, [[0, 0], [0, 1]])
+            
         return embedding
-
+        
     def call(self, t, dtype=tf.float32):
+        """Forward pass with proper type handling."""
+        # Ensure input is the right shape
+        if len(tf.shape(t)) == 1:
+            t = t[:, None]
+            
+        # Create frequency embeddings
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         t_freq = tf.cast(t_freq, dtype)
+        
+        # Pass through MLP
         t_emb = self.mlp(t_freq)
         return t_emb
 
