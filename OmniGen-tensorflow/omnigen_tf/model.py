@@ -187,83 +187,73 @@ class TimeToken(tf.keras.layers.Layer):
 
 
 class FinalLayer(layers.Layer):
-    """Final layer for image generation."""
+    """Final projection layer."""
     
-    def __init__(self, patch_size, in_channels, embed_dim, **kwargs):
+    def __init__(self, hidden_size, out_channels, **kwargs):
+        """Initialize layer."""
         super().__init__(**kwargs)
-        self.patch_size = patch_size
-        self.in_channels = in_channels
-        self.embed_dim = embed_dim
         
-        # Initialize projection layer
-        self.proj = layers.Dense(patch_size * patch_size * in_channels, name="proj")
+        self.hidden_size = hidden_size
+        self.out_channels = out_channels
+        
+        # Use two smaller projections instead of one large one
+        self.time_proj = layers.Dense(hidden_size, name="time_proj")
+        self.intermediate = layers.Dense(hidden_size * 2, name="intermediate")
+        self.out_proj = layers.Dense(out_channels, name="out_proj")
         
     def call(self, x, time_emb):
         """Forward pass."""
-        # Add time embedding
-        x = x + time_emb[:, None, :]
+        # Project time embeddings
+        time_emb = self.time_proj(time_emb)  # [batch_size, hidden_size]
         
-        # Project to patch space
-        x = self.proj(x)
+        # Add time dimension for broadcasting
+        time_emb = tf.expand_dims(time_emb, 1)  # [batch_size, 1, hidden_size]
+        
+        # Add time embeddings
+        x = x + time_emb
+        
+        # Project through smaller layers
+        x = self.intermediate(x)
+        x = tf.nn.gelu(x)
+        x = self.out_proj(x)
         
         return x
 
 
 class OmniGen(tf.keras.Model):
-    """OmniGen model implementation."""
+    """OmniGen model."""
     
     def __init__(
         self,
         transformer_config,
-        patch_size=2,
+        patch_size=16,
         in_channels=4,
-        pe_interpolation: float = 1.0,
-        pos_embed_max_size: int = 192,
+        pe_interpolation=True,
+        pos_embed_max_size=128,
+        **kwargs
     ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = in_channels
+        """Initialize model."""
+        super().__init__(**kwargs)
+        
         self.patch_size = patch_size
+        self.in_channels = in_channels
+        self.pe_interpolation = pe_interpolation
         self.pos_embed_max_size = pos_embed_max_size
         
-        # Convert dict to Phi3Config if needed
-        if isinstance(transformer_config, dict):
-            transformer_config = Phi3Config(**transformer_config)
-        elif not isinstance(transformer_config, Phi3Config):
-            raise ValueError("transformer_config must be either a dict or Phi3Config instance")
-        
-        hidden_size = transformer_config.hidden_size
-        
-        # Initialize embedders with mixed precision
+        # Initialize components
+        self.t_embedder = TimestepEmbedder(
+            hidden_size=transformer_config.hidden_size,
+            name="t_embedder"
+        )
+        self.time_token = TimeToken(
+            hidden_size=transformer_config.hidden_size,
+            name="time_token"
+        )
         self.x_embedder = PatchEmbed(
-            embed_dim=hidden_size,
             patch_size=patch_size,
+            hidden_size=transformer_config.hidden_size,
             in_channels=in_channels,
             name="x_embedder"
-        )
-        self.input_x_embedder = PatchEmbed(
-            embed_dim=hidden_size,
-            patch_size=patch_size,
-            in_channels=in_channels,
-            name="input_x_embedder"
-        )
-        
-        # Initialize time embedders
-        self.time_token = TimeToken(hidden_size, name="time_token")
-        self.t_embedder = TimestepEmbedder(hidden_size, name="t_embedder")
-        
-        # Initialize positional embedding
-        self.pe_interpolation = pe_interpolation
-        pos_embed = get_2d_sincos_pos_embed(
-            hidden_size, 
-            pos_embed_max_size, 
-            interpolation_scale=self.pe_interpolation, 
-            base_size=64
-        )
-        self.pos_embed = tf.Variable(
-            initial_value=tf.expand_dims(tf.convert_to_tensor(pos_embed, dtype=tf.float32), 0),
-            trainable=False,
-            name="pos_embed"
         )
         
         # Initialize transformer
@@ -272,10 +262,13 @@ class OmniGen(tf.keras.Model):
         
         # Initialize final layer
         self.final_layer = FinalLayer(
-            hidden_size, 
-            patch_size, 
-            self.out_channels
+            hidden_size=transformer_config.hidden_size,
+            out_channels=patch_size * patch_size * in_channels,
+            name="final_layer"
         )
+        
+        # Initialize output channels
+        self.out_channels = in_channels
 
     def call(
         self,
