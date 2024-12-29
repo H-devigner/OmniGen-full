@@ -59,18 +59,22 @@ class TimestepEmbedder(Model):
         """Create sinusoidal timestep embeddings.
         
         Args:
-            t: a 1-D Tensor of N indices, one per batch element.
+            t: a 1-D or 2-D Tensor of N indices, one per batch element.
             dim: the dimension of the output.
             max_period: controls the minimum frequency of the embeddings.
             
         Returns:
             an (N, D) Tensor of positional embeddings.
         """
-        # Ensure t is 1D and float32
-        t = tf.cast(tf.reshape(t, [-1]), tf.float32)
-        half = dim // 2
+        # Ensure t is 2D [batch_size, sequence_length]
+        if len(tf.shape(t)) == 1:
+            t = tf.expand_dims(t, axis=-1)
+            
+        # Take first element from each sequence
+        t = tf.cast(t[:, 0], tf.float32)
         
         # Create frequencies
+        half = dim // 2
         freqs = tf.cast(tf.range(half, dtype=tf.float32), tf.float32)
         freqs = freqs * (-math.log(float(max_period)) / half)
         freqs = tf.exp(freqs)
@@ -283,14 +287,19 @@ class OmniGen(tf.keras.Model):
         **kwargs
     ):
         """Forward pass with classifier-free guidance support."""
+        # Get batch size
+        batch_size = tf.shape(inputs)[0]
+        
         # Handle classifier-free guidance
         if guidance_scale is not None and guidance_scale > 1.0:
-            # Duplicate input for classifier-free guidance
+            # Duplicate inputs for classifier-free guidance
             inputs = tf.concat([inputs] * 2, axis=0)
-            # Ensure timestep is 1D before duplicating
-            timestep = tf.reshape(timestep, [-1])
-            timestep = tf.concat([timestep] * 2, axis=0)
             
+            # Ensure timestep is 1D before duplicating
+            timestep = tf.reshape(timestep, [batch_size, -1])
+            timestep = tf.tile(timestep, [2, 1])
+            
+            # Duplicate other inputs if provided
             if input_ids is not None:
                 input_ids = tf.concat([input_ids] * 2, axis=0)
             if attention_mask is not None:
