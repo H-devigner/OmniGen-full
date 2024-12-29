@@ -42,148 +42,84 @@ def modulate(x, shift, scale):
     return x * (1 + tf.expand_dims(scale, 1)) + tf.expand_dims(shift, 1)
 
 
-class TimestepEmbedder(Model):
-    """Embeds scalar timesteps into vector representations."""
+class TimeToken(layers.Layer):
+    """Time token layer."""
     
-    def __init__(self, hidden_size, frequency_embedding_size=256, **kwargs):
-        """Initialize embedder with PyTorch equivalence."""
+    def __init__(self, hidden_size=2048, **kwargs):
+        """Initialize layer."""
         super().__init__(**kwargs)
+        self.hidden_size = hidden_size
+        
+        # Initialize embedding layer
+        self.time_embed = layers.Dense(hidden_size, name="time_embed")
+        
+    def call(self, timesteps):
+        """Forward pass."""
+        # Convert timesteps to float32
+        timesteps = tf.cast(timesteps, tf.float32)
+        
+        # Project timesteps to embedding space
+        time_embed = self.time_embed(timesteps)
+        
+        tf.print("TimeToken output shape:", tf.shape(time_embed))
+        
+        return time_embed
+
+
+class TimestepEmbedder(layers.Layer):
+    """Timestep embedder layer."""
+    
+    def __init__(self, hidden_size=2048, **kwargs):
+        """Initialize layer."""
+        super().__init__(**kwargs)
+        self.hidden_size = hidden_size
+        
+        # Initialize MLP layers
         self.mlp = tf.keras.Sequential([
-            layers.Dense(hidden_size, use_bias=True),
-            layers.Activation('silu'),
-            layers.Dense(hidden_size, use_bias=True)
-        ])
-        self.frequency_embedding_size = frequency_embedding_size
+            layers.Dense(hidden_size * 4, activation="gelu", name="mlp_1"),
+            layers.Dense(hidden_size, name="mlp_2")
+        ], name="mlp")
         
-    def timestep_embedding(self, t, dim, max_period=10000):
-        """Create sinusoidal timestep embeddings.
+    def call(self, timesteps):
+        """Forward pass."""
+        # Convert timesteps to float32
+        timesteps = tf.cast(timesteps, tf.float32)
         
-        Args:
-            t: a 1-D or 2-D Tensor of N indices, one per batch element.
-            dim: the dimension of the output.
-            max_period: controls the minimum frequency of the embeddings.
-            
-        Returns:
-            an (N, D) Tensor of positional embeddings.
-        """
-        # Ensure t is 2D [batch_size, sequence_length]
-        if len(tf.shape(t)) == 1:
-            t = tf.expand_dims(t, axis=-1)
-            
-        # Take first element from each sequence
-        t = tf.cast(t[:, 0], tf.float32)
+        # Project timesteps through MLP
+        time_embed = self.mlp(timesteps)
         
-        # Create frequencies
-        half = dim // 2
-        freqs = tf.cast(tf.range(half, dtype=tf.float32), tf.float32)
-        freqs = freqs * (-math.log(float(max_period)) / half)
-        freqs = tf.exp(freqs)
-        
-        # Create embeddings
-        args = t[:, None] * freqs[None]
-        embedding = tf.concat([tf.cos(args), tf.sin(args)], axis=-1)
-        
-        if dim % 2:
-            embedding = tf.pad(embedding, [[0, 0], [0, 1]])
-            
-        return embedding
-        
-    def call(self, t, dtype=tf.float32):
-        """Forward pass with proper type handling."""
-        # Create frequency embeddings
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        t_freq = tf.cast(t_freq, dtype)
-        
-        # Pass through MLP
-        t_emb = self.mlp(t_freq)
-        return t_emb
+        return time_embed
 
 
 class PatchEmbed(layers.Layer):
-    """2D Image to Patch Embedding."""
+    """Patch embedding layer."""
     
-    def __init__(self, embed_dim=768, patch_size=16, in_channels=3, **kwargs):
-        """Initialize patch embedding layer."""
+    def __init__(self, patch_size, hidden_size, in_channels=4, **kwargs):
+        """Initialize layer."""
         super().__init__(**kwargs)
-        self.embed_dim = embed_dim
+        
         self.patch_size = patch_size
+        self.hidden_size = hidden_size
         self.in_channels = in_channels
         
         # Initialize projection layer
         self.proj = layers.Conv2D(
-            filters=embed_dim,
+            filters=hidden_size,
             kernel_size=patch_size,
             strides=patch_size,
-            padding='valid',
-            name='proj'
+            name="proj"
         )
         
     def call(self, x):
         """Forward pass."""
-        # Get input dtype
-        input_dtype = x.dtype
-        
-        # Convert to float32 for computation
-        x = tf.cast(x, tf.float32)
-        
         # Project patches
         x = self.proj(x)
         
-        # Reshape to [B, H*W, C]
-        B, H, W, C = tf.shape(x)[0], tf.shape(x)[1], tf.shape(x)[2], tf.shape(x)[3]
-        x = tf.reshape(x, [B, H * W, C])
-        
-        # Convert back to input dtype
-        x = tf.cast(x, input_dtype)
+        # Reshape to [batch_size, num_patches, hidden_size]
+        batch_size = tf.shape(x)[0]
+        x = tf.reshape(x, [batch_size, -1, self.hidden_size])
         
         return x
-        
-    def get_num_patches(self, h, w):
-        """Get number of patches for given input dimensions."""
-        return (h // self.patch_size) * (w // self.patch_size)
-
-
-class TimeToken(tf.keras.layers.Layer):
-    """Time token embedding layer."""
-    
-    def __init__(self, embed_dim=2048, **kwargs):
-        """Initialize layer."""
-        super().__init__(**kwargs)
-        self.embed_dim = embed_dim
-        
-        # Create MLP for time embedding
-        self.mlp = tf.keras.Sequential([
-            tf.keras.layers.Dense(embed_dim, activation='gelu'),
-            tf.keras.layers.Dense(embed_dim)
-        ])
-        
-    def call(self, t):
-        """Forward pass."""
-        # Get batch size
-        batch_size = tf.shape(t)[0]
-        
-        # Take first element from each sequence if input is 2D
-        if len(tf.shape(t)) > 1:
-            t = t[:, 0]
-            
-        # Convert to float32 for computation
-        t = tf.cast(t, tf.float32)
-        
-        # Add feature dimension
-        t = t[:, None]
-        
-        # Pass through MLP and ensure output shape is [batch_size, embed_dim]
-        output = self.mlp(t)
-        tf.print("TimeToken output shape:", tf.shape(output))
-        return output  # Shape: [batch_size, embed_dim]
-        
-    def get_config(self):
-        """Get layer configuration."""
-        config = super().get_config()
-        config.update({
-            'embed_dim': self.embed_dim
-        })
-        return config
 
 
 class FinalLayer(layers.Layer):
