@@ -238,16 +238,29 @@ class OmniGen(tf.keras.Model):
         self.time_token = TimestepEmbedder(hidden_size, name="time_token")
         self.t_embedder = TimestepEmbedder(hidden_size, name="t_embedder")
         
+        # Initialize positional embedding
+        self.pe_interpolation = pe_interpolation
+        pos_embed = get_2d_sincos_pos_embed(
+            hidden_size, 
+            pos_embed_max_size, 
+            interpolation_scale=self.pe_interpolation, 
+            base_size=64
+        )
+        self.pos_embed = tf.Variable(
+            initial_value=tf.expand_dims(tf.convert_to_tensor(pos_embed, dtype=tf.float32), 0),
+            trainable=False,
+            name="pos_embed"
+        )
+        
         # Initialize transformer
         self.transformer = Phi3Transformer(transformer_config, name="transformer")
-
-        # Initialize VAE
-        self.vae = AutoencoderKL(
-            in_channels=3,
-            out_channels=3,
-            latent_channels=4,
-            scaling_factor=0.18215,
-            name="vae"
+        self.transformer.config.use_cache = False
+        
+        # Initialize final layer
+        self.final_layer = FinalLayer(
+            hidden_size, 
+            patch_size, 
+            self.out_channels
         )
 
     def call(
@@ -393,13 +406,6 @@ class OmniGen(tf.keras.Model):
                     del tensor
                     gc.collect()
             print("\nModel weights loaded successfully!")
-
-        # Load VAE weights
-        vae_dir = os.path.join(model_name_or_path, "vae")
-        if os.path.exists(vae_dir):
-            print("Loading VAE weights...")
-            model.vae = AutoencoderKL.from_pretrained(vae_dir)
-            print("VAE weights loaded successfully!")
 
         # Final memory cleanup
         if tf.config.list_physical_devices('GPU'):

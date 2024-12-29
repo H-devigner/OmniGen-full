@@ -12,6 +12,7 @@ import json
 from omnigen_tf.model import OmniGen
 from omnigen_tf.scheduler import OmniGenScheduler
 from omnigen_tf.processor import OmniGenProcessor
+from diffusers import AutoencoderKL
 
 # Enable mixed precision globally
 policy = tf.keras.mixed_precision.Policy('mixed_float16')
@@ -30,31 +31,51 @@ if gpus:
 class OmniGenPipeline:
     """OmniGen pipeline for text-to-image generation."""
     
-    def __init__(self, processor=None, model=None):
+    def __init__(self, vae=None, model=None, processor=None, device=None):
         """Initialize pipeline with memory optimizations.
         
         Args:
-            processor: OmniGenProcessor instance
+            vae: VAE model instance
             model: OmniGen model instance
+            processor: OmniGenProcessor instance
+            device: Device to use (CPU/GPU)
         """
-        self.processor = processor
+        self.vae = vae
         self.model = model
+        self.processor = processor
         self.scheduler = OmniGenScheduler()
+        
+        # Set device strategy
+        if device is None:
+            if tf.config.list_physical_devices('GPU'):
+                device = '/GPU:0'
+                print("Using GPU for inference")
+            else:
+                print("No GPU available, using CPU (this will be slow)")
+                device = '/CPU:0'
+        self.device = device
+        
+        # Initialize model in mixed precision
+        if tf.config.list_physical_devices('GPU'):
+            tf.keras.mixed_precision.set_global_policy('mixed_float16')
+        
         self.model_cpu_offload = False
             
     @classmethod
-    def from_pretrained(cls, model_name, **kwargs):
+    def from_pretrained(cls, model_name, vae_path=None):
         """Load pipeline from pretrained model with optimized memory usage."""
         if not os.path.exists(model_name):
-            print(f"Downloading model {model_name} from HuggingFace Hub...")
+            print(f"Model not found, downloading {model_name}...")
             cache_folder = os.getenv('HF_HUB_CACHE')
             try:
                 model_name = snapshot_download(
                     repo_id=model_name,
                     cache_dir=cache_folder,
-                    local_files_only=False,  # Allow download first time
-                    resume_download=True  # Resume partial downloads
+                    local_files_only=False,
+                    resume_download=True,
+                    ignore_patterns=['flax_model.msgpack', 'rust_model.ot', 'tf_model.h5', 'model.pt']
                 )
+                print(f"Downloaded model to {model_name}")
             except Exception as e:
                 print(f"Error downloading model: {str(e)}")
                 raise
@@ -62,20 +83,38 @@ class OmniGenPipeline:
         # Load processor with optimized settings
         processor = OmniGenProcessor.from_pretrained(model_name)
         
-        # Load model config
-        config_file = os.path.join(model_name, "config.json")
-        with open(config_file, 'r') as f:
-            config = json.load(f)
+        # Load model with optimized settings
+        model = OmniGen.from_pretrained(model_name)
         
-        # Create model with optimized memory settings
-        model = OmniGen.from_pretrained(model_name, **kwargs)
+        # Load or download VAE
+        if os.path.exists(os.path.join(model_name, "vae")):
+            print("Loading VAE from model directory...")
+            vae = AutoencoderKL.from_pretrained(
+                os.path.join(model_name, "vae"),
+                use_safetensors=True,
+                low_cpu_mem_usage=True
+            )
+        elif vae_path is not None:
+            print(f"Loading VAE from {vae_path}...")
+            vae = AutoencoderKL.from_pretrained(
+                vae_path,
+                use_safetensors=True,
+                low_cpu_mem_usage=True
+            )
+        else:
+            print("No VAE found, downloading stabilityai/sdxl-vae...")
+            vae = AutoencoderKL.from_pretrained(
+                "stabilityai/sdxl-vae",
+                use_safetensors=True,
+                low_cpu_mem_usage=True
+            )
         
         # Clear memory after loading
         if tf.config.list_physical_devices('GPU'):
             tf.keras.backend.clear_session()
         gc.collect()
         
-        return cls(processor=processor, model=model)
+        return cls(vae=vae, model=model, processor=processor)
             
     def enable_model_cpu_offload(self):
         """Enable model CPU offloading to save GPU memory."""
@@ -101,12 +140,12 @@ class OmniGenPipeline:
         """Encode images using VAE with memory optimization."""
         if self.model_cpu_offload:
             with tf.device(self.device):
-                encoded = self.model.vae.encode(x)
+                encoded = self.vae.encode(x)
             # Clear GPU memory
             tf.keras.backend.clear_session()
             gc.collect()
         else:
-            encoded = self.model.vae.encode(x)
+            encoded = self.vae.encode(x)
         return tf.cast(encoded, dtype)
         
     def generate_latents(
@@ -302,17 +341,17 @@ class OmniGenPipeline:
             
             # Post-process samples
             samples = tf.cast(samples, tf.float32)
-            samples = samples / self.model.vae.config.scaling_factor
+            samples = samples / self.vae.config.scaling_factor
             
-            if hasattr(self.model.vae.config, 'shift_factor') and self.model.vae.config.shift_factor is not None:
-                samples = samples + self.model.vae.config.shift_factor
+            if hasattr(self.vae.config, 'shift_factor') and self.vae.config.shift_factor is not None:
+                samples = samples + self.vae.config.shift_factor
                 
             # Decode with VAE
             if self.model_cpu_offload:
                 with tf.device(self.device):
-                    samples = self.model.vae.decode(samples)
+                    samples = self.vae.decode(samples)
             else:
-                samples = self.model.vae.decode(samples)
+                samples = self.vae.decode(samples)
                 
             # Final processing
             samples = tf.clip_by_value(samples * 0.5 + 0.5, 0, 1)
@@ -336,7 +375,7 @@ class OmniGenPipeline:
             latents = 1 / 0.18215 * latents
             
             # Decode with VAE
-            images = self.model.vae.decode(latents)
+            images = self.vae.decode(latents)
             
             # Postprocess images
             images = (images / 2 + 0.5)

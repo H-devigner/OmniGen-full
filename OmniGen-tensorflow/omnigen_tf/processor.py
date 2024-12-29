@@ -42,38 +42,27 @@ class OmniGenProcessor:
         """
         self.text_tokenizer = text_tokenizer
         self.max_image_size = max_image_size
-        self.config = ProcessorConfig()
         
         # Setup optimized image processing
         self._setup_image_transform()
-        self._setup_memory_optimization()
         
         # Initialize collators
         self.collator = OmniGenCollator()
         self.separate_collator = OmniGenSeparateCollator()
         
-    def _setup_memory_optimization(self):
-        """Setup memory optimization configurations."""
-        if tf.config.list_physical_devices('GPU'):
-            if self.config.mixed_precision:
-                tf.keras.mixed_precision.set_global_policy('mixed_float16')
-                
-            for device in tf.config.list_physical_devices('GPU'):
-                try:
-                    if self.config.memory_growth:
-                        tf.config.experimental.set_memory_growth(device, True)
-                except RuntimeError as e:
-                    print(f"Memory optimization warning: {e}")
-                    
     def _setup_image_transform(self):
-        """Setup image transformation pipeline."""
+        """Setup image transformation pipeline to match PyTorch exactly."""
         def normalize(x):
             x = tf.cast(x, tf.float32)
-            x = (x / 127.5) - 1.0  # Normalize to [-1, 1] like PyTorch
+            # Match PyTorch's normalization exactly
+            mean = tf.constant([0.5, 0.5, 0.5], dtype=tf.float32)
+            std = tf.constant([0.5, 0.5, 0.5], dtype=tf.float32)
+            x = (x - mean) / std
             return x
             
         self.image_transform = tf.keras.Sequential([
             tf.keras.layers.Lambda(lambda x: crop_arr(x, self.max_image_size)),
+            tf.keras.layers.Lambda(lambda x: tf.cast(x, tf.float32) / 255.0),
             tf.keras.layers.Lambda(normalize)
         ])
         
@@ -87,28 +76,22 @@ class OmniGenProcessor:
                 model_name = snapshot_download(
                     repo_id=model_name,
                     cache_dir=cache_folder,
-                    local_files_only=False,  # Allow download first time
-                    resume_download=True,  # Resume partial downloads
                     allow_patterns="*.json"
                 )
             except Exception as e:
                 print(f"Error downloading tokenizer: {str(e)}")
                 raise
-            
-        # Load tokenizer with optimized settings
-        text_tokenizer = AutoTokenizer.from_pretrained(
-            model_name,
-            use_fast=True  # Use faster tokenizer implementation
-        )
-        
-        # Clear any cached tensors
-        if tf.config.list_physical_devices('GPU'):
-            tf.keras.backend.clear_session()
-            gc.collect()
-            
+                
+        text_tokenizer = AutoTokenizer.from_pretrained(model_name)
         return cls(text_tokenizer)
-    
-    @tf.function(jit_compile=True)
+
+    def add_prefix_instruction(self, prompt: str) -> str:
+        """Add instruction prefix exactly like PyTorch."""
+        user_prompt = '''
+# Instruction: Continue implementing processor
+'''
+        return user_prompt + prompt
+
     def process_image(self, image) -> tf.Tensor:
         """Process image with XLA optimization.
         
@@ -130,7 +113,6 @@ class OmniGenProcessor:
             
         return image
     
-    @tf.function(jit_compile=True)
     def process_multi_modal_prompt(
         self, 
         text: str,
@@ -201,28 +183,16 @@ class OmniGenProcessor:
             "image_sizes": img_positions
         }
     
-    def add_prefix_instruction(self, prompt: str) -> str:
-        """Add instruction prefix to prompt, matching PyTorch exactly."""
-        user_prompt = '''
-# Instruction: Continue implementing processor
-'''
-        return user_prompt + prompt
-
     def process_text(self, prompt, max_length=77):
-        """Process text input.
-        
-        Args:
-            prompt (str or List[str]): Text prompt(s)
-            max_length (int): Maximum sequence length
-            
-        Returns:
-            tf.Tensor: Processed text embeddings
-        """
+        """Process text input with PyTorch equivalence."""
         # Handle single prompt
         if isinstance(prompt, str):
             prompt = [prompt]
             
-        # Tokenize
+        # Add instruction prefix
+        prompt = [self.add_prefix_instruction(p) for p in prompt]
+            
+        # Tokenize exactly like PyTorch
         text_inputs = self.text_tokenizer(
             prompt,
             padding="max_length",
@@ -231,130 +201,128 @@ class OmniGenProcessor:
             return_tensors="tf"
         )
         
-        # Convert to float16 for mixed precision
-        input_ids = tf.cast(text_inputs.input_ids, tf.float16)
-        attention_mask = tf.cast(text_inputs.attention_mask, tf.float16)
-        
         return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask
+            "input_ids": text_inputs.input_ids,
+            "attention_mask": text_inputs.attention_mask
         }
 
 class OmniGenCollator:
     """TensorFlow collator with exact PyTorch equivalence."""
     
     def __init__(self, pad_token_id: int = 2, hidden_size: int = 3072):
-        """Initialize collator.
-        
-        Args:
-            pad_token_id: Token ID for padding
-            hidden_size: Hidden size for position embeddings
-        """
+        """Initialize collator with PyTorch equivalence."""
         self.pad_token_id = pad_token_id
         self.hidden_size = hidden_size
         
-    @tf.function(jit_compile=True)
-    def create_position(
-        self,
-        attention_mask: tf.Tensor,
-        num_tokens_for_output_images: int
-    ) -> tf.Tensor:
-        """Create position IDs with XLA optimization."""
-        batch_size = tf.shape(attention_mask)[0]
-        seq_length = tf.shape(attention_mask)[1]
+    def create_position(self, attention_mask, num_tokens_for_output_images):
+        """Create position IDs exactly like PyTorch."""
+        position_ids = []
+        text_length = tf.shape(attention_mask)[-1]
+        img_length = max(num_tokens_for_output_images)
         
-        # Create position IDs
-        position_ids = tf.range(seq_length, dtype=tf.int32)
-        position_ids = tf.expand_dims(position_ids, axis=0)
-        position_ids = tf.tile(position_ids, [batch_size, 1])
-        
-        # Add output image tokens
-        if num_tokens_for_output_images > 0:
-            output_position_ids = tf.range(
-                seq_length,
-                seq_length + num_tokens_for_output_images,
-                dtype=tf.int32
-            )
-            output_position_ids = tf.expand_dims(output_position_ids, axis=0)
-            output_position_ids = tf.tile(output_position_ids, [batch_size, 1])
-            position_ids = tf.concat([position_ids, output_position_ids], axis=1)
+        for mask in attention_mask:
+            temp_l = tf.reduce_sum(mask)
+            # Add time embedding token
+            temp_position = ([0] * (text_length - temp_l) + 
+                           list(range(temp_l + img_length + 1)))
+            position_ids.append(temp_position)
             
-        return position_ids
+        return tf.convert_to_tensor(position_ids, dtype=tf.int64)
         
-    @tf.function(jit_compile=True)
-    def create_mask(
-        self,
-        attention_mask: tf.Tensor,
-        num_tokens_for_output_images: int
-    ) -> tf.Tensor:
-        """Create attention mask with XLA optimization."""
-        batch_size = tf.shape(attention_mask)[0]
+    def create_mask(self, attention_mask, num_tokens_for_output_images):
+        """Create attention mask exactly like PyTorch."""
+        extended_mask = []
+        padding_images = []
+        text_length = tf.shape(attention_mask)[-1]
+        img_length = max(num_tokens_for_output_images)
+        # Add time embedding token
+        seq_len = text_length + img_length + 1
         
-        if num_tokens_for_output_images > 0:
-            # Add mask for output image tokens
-            output_attention_mask = tf.ones(
-                [batch_size, num_tokens_for_output_images],
-                dtype=attention_mask.dtype
-            )
-            attention_mask = tf.concat(
-                [attention_mask, output_attention_mask],
-                axis=1
+        for i, mask in enumerate(attention_mask):
+            temp_l = tf.reduce_sum(mask)
+            pad_l = text_length - temp_l
+            
+            # Create causal mask for text
+            temp_mask = tf.linalg.band_part(
+                tf.ones((temp_l + 1, temp_l + 1)), -1, 0
             )
             
+            # Add image mask
+            image_mask = tf.zeros((temp_l + 1, img_length))
+            temp_mask = tf.concat([temp_mask, image_mask], axis=-1)
+            
+            # Add full attention for image tokens
+            image_mask = tf.ones((img_length, temp_l + img_length + 1))
+            temp_mask = tf.concat([temp_mask, image_mask], axis=0)
+            
+            # Handle padding
+            if pad_l > 0:
+                pad_mask = tf.zeros((temp_l + 1 + img_length, pad_l))
+                temp_mask = tf.concat([pad_mask, temp_mask], axis=-1)
+                
+                pad_mask = tf.ones((pad_l, seq_len))
+                temp_mask = tf.concat([pad_mask, temp_mask], axis=0)
+                
+            # Handle image padding
+            true_img_length = num_tokens_for_output_images[i]
+            pad_img_length = img_length - true_img_length
+            if pad_img_length > 0:
+                temp_mask = tf.tensor_scatter_nd_update(
+                    temp_mask,
+                    tf.expand_dims(tf.range(-pad_img_length, 0), 1),
+                    tf.zeros((pad_img_length,))
+                )
+                temp_padding_imgs = tf.zeros((1, pad_img_length, self.hidden_size))
+            else:
+                temp_padding_imgs = None
+                
+            extended_mask.append(tf.expand_dims(temp_mask, 0))
+            padding_images.append(temp_padding_imgs)
+            
+        return tf.concat(extended_mask, axis=0), padding_images
+        
+    def adjust_attention_for_input_images(self, attention_mask, image_sizes):
+        """Adjust attention mask for input images exactly like PyTorch."""
+        for b_inx in image_sizes:
+            for start_inx, end_inx in image_sizes[b_inx]:
+                indices = tf.range(start_inx, end_inx)
+                updates = tf.ones((end_inx - start_inx, end_inx - start_inx))
+                attention_mask = tf.tensor_scatter_nd_update(
+                    attention_mask,
+                    tf.stack([
+                        tf.repeat(indices, end_inx - start_inx),
+                        tf.tile(indices, [end_inx - start_inx])
+                    ], axis=1),
+                    tf.reshape(updates, [-1])
+                )
         return attention_mask
         
-    @tf.function(jit_compile=True)
-    def adjust_attention_for_input_images(
-        self,
-        attention_mask: tf.Tensor,
-        image_sizes: List[List[int]]
-    ) -> tf.Tensor:
-        """Adjust attention mask for input images with XLA optimization."""
-        if not image_sizes:
-            return attention_mask
+    def pad_input_ids(self, input_ids, image_sizes):
+        """Pad input IDs exactly like PyTorch."""
+        max_l = max(len(x) for x in input_ids)
+        padded_ids = []
+        attention_mask = []
+        new_image_sizes = {}
+        
+        for i, ids in enumerate(input_ids):
+            temp_l = len(ids)
+            pad_l = max_l - temp_l
             
-        batch_size = tf.shape(attention_mask)[0]
-        seq_length = tf.shape(attention_mask)[1]
-        
-        # Create mask for each batch
-        for b in range(batch_size):
-            if b < len(image_sizes):
-                for start, end in image_sizes[b]:
-                    # Zero out attention for image tokens
-                    attention_mask = tf.tensor_scatter_nd_update(
-                        attention_mask,
-                        [[b, i] for i in range(start, end)],
-                        tf.zeros([end - start], dtype=attention_mask.dtype)
-                    )
-                    
-        return attention_mask
-        
-    @tf.function(jit_compile=True)
-    def pad_input_ids(
-        self,
-        input_ids: List[List[int]],
-        image_sizes: List[List[int]]
-    ) -> tf.Tensor:
-        """Pad input IDs with XLA optimization."""
-        if not input_ids:
-            return tf.zeros([0, 0], dtype=tf.int32)
-            
-        # Find max length
-        max_length = max(len(ids) for ids in input_ids)
-        batch_size = len(input_ids)
-        
-        # Create padded tensor
-        padded = tf.zeros([batch_size, max_length], dtype=tf.int32)
-        
-        # Fill with actual values
-        for b, ids in enumerate(input_ids):
-            padded = tf.tensor_scatter_nd_update(
-                padded,
-                [[b, i] for i in range(len(ids))],
-                tf.constant(ids, dtype=tf.int32)
-            )
-            
-        return padded
+            if pad_l == 0:
+                attention_mask.append([1] * max_l)
+                padded_ids.append(ids)
+            else:
+                attention_mask.append([0] * pad_l + [1] * temp_l)
+                padded_ids.append([self.pad_token_id] * pad_l + ids)
+                
+            if i in image_sizes:
+                new_image_sizes[i] = [
+                    [x + pad_l for x in pos] for pos in image_sizes[i]
+                ]
+                
+        return (tf.convert_to_tensor(padded_ids, dtype=tf.int64),
+                tf.convert_to_tensor(attention_mask, dtype=tf.int64),
+                new_image_sizes)
         
     @tf.function(jit_compile=True)
     def process_mllm_input(
@@ -368,16 +336,13 @@ class OmniGenCollator:
         image_sizes = mllm_inputs.get("image_sizes")
         
         # Process input IDs
-        input_ids = self.pad_input_ids(input_ids, image_sizes)
-        attention_mask = tf.cast(input_ids != self.pad_token_id, tf.float32)
+        input_ids, attention_mask, image_sizes = self.pad_input_ids(input_ids, image_sizes)
         
         # Adjust for input images
-        attention_mask = self.adjust_attention_for_input_images(
-            attention_mask, image_sizes
-        )
+        attention_mask = self.adjust_attention_for_input_images(attention_mask, image_sizes)
         
         # Create position IDs
-        position_ids = self.create_position(attention_mask, 0)
+        position_ids = self.create_position(attention_mask, [0] * len(input_ids))
         
         # Process pixel values if present
         if pixel_values is not None and target_img_size is not None:
