@@ -329,7 +329,7 @@ class OmniGen(tf.keras.Model):
         import os
         import json
         from huggingface_hub import snapshot_download
-        from safetensors.tensorflow import safe_open
+        from safetensors.tensorflow import load_file
         import gc
         
         # Get model path
@@ -383,67 +383,55 @@ class OmniGen(tf.keras.Model):
             
             # Load weights on CPU first
             with tf.device('/CPU:0'):
-                # Use safe_open to load weights in chunks
-                with safe_open(weights_file, framework="tf") as f:
-                    # Get list of keys first
-                    weight_keys = f.keys()
+                # Load all weights at once
+                state_dict = load_file(weights_file)
+                
+                # Group weights by layer
+                layer_groups = {}
+                for key in state_dict.keys():
+                    layer_name = key.split('.')[0]
+                    if layer_name not in layer_groups:
+                        layer_groups[layer_name] = []
+                    layer_groups[layer_name].append(key)
+                
+                # Load weights layer by layer
+                for layer_name, keys in layer_groups.items():
+                    print(f"Loading {layer_name} weights...")
                     
-                    # Group keys by layer for more efficient loading
-                    layer_groups = {}
-                    for key in weight_keys:
-                        layer_name = key.split('.')[0]
-                        if layer_name not in layer_groups:
-                            layer_groups[layer_name] = []
-                        layer_groups[layer_name].append(key)
+                    # Load weights for current layer
+                    for key in keys:
+                        try:
+                            # Get weight tensor
+                            weight = state_dict[key]
+                            
+                            # Convert to float16 for GPU memory efficiency
+                            weight = tf.cast(weight, tf.float16)
+                            
+                            # Find corresponding layer in TF model
+                            if key.startswith('transformer.'):
+                                tf_name = key.replace('transformer.', 'transformer/')
+                            else:
+                                tf_name = key.replace('.', '/')
+                                
+                            # Get layer by name
+                            layer = model.get_layer(tf_name)
+                            if layer is not None:
+                                # Assign weights
+                                if 'weight' in key:
+                                    layer.kernel.assign(weight)
+                                elif 'bias' in key:
+                                    layer.bias.assign(weight)
+                            
+                            # Clear memory
+                            del weight
+                            gc.collect()
+                            
+                        except Exception as e:
+                            print(f"Warning: Could not load weight {key}: {str(e)}")
                     
-                    # Load weights layer by layer
-                    for layer_name, keys in layer_groups.items():
-                        print(f"Loading {layer_name} weights...")
-                        
-                        # Load weights for current layer
-                        for key in keys:
-                            try:
-                                # Get tensor shape and dtype first
-                                tensor_info = f.get_tensor_info(key)
-                                shape = tensor_info['shape']
-                                dtype = tensor_info['dtype']
-                                
-                                # Skip if tensor is too large
-                                if np.prod(shape) > 1e8:  # Skip tensors larger than 100M elements
-                                    print(f"Skipping large tensor {key} with shape {shape}")
-                                    continue
-                                
-                                # Load tensor
-                                weight = f.get_tensor(key)
-                                
-                                # Convert to float16 for GPU memory efficiency
-                                weight = tf.cast(weight, tf.float16)
-                                
-                                # Find corresponding layer in TF model
-                                if key.startswith('transformer.'):
-                                    tf_name = key.replace('transformer.', 'transformer/')
-                                else:
-                                    tf_name = key.replace('.', '/')
-                                    
-                                # Get layer by name
-                                layer = model.get_layer(tf_name)
-                                if layer is not None:
-                                    # Assign weights
-                                    if 'weight' in key:
-                                        layer.kernel.assign(weight)
-                                    elif 'bias' in key:
-                                        layer.bias.assign(weight)
-                                
-                                # Clear memory
-                                del weight
-                                gc.collect()
-                                
-                            except Exception as e:
-                                print(f"Warning: Could not load weight {key}: {str(e)}")
-                        
-                        # Clear memory after each layer
-                        gc.collect()
-                    
+                    # Clear memory after each layer
+                    gc.collect()
+                
             print("Weights loaded successfully!")
         else:
             print(f"No weights found at {weights_file}")

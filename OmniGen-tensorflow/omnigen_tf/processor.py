@@ -151,6 +151,38 @@ class OmniGenProcessor:
         user_prompt += '# Instruction: Implement the logic for building combined input sequence in the process_multi_modal_prompt method\n'
         return user_prompt + prompt
 
+    def process_text(self, prompt, max_length=77):
+        """Process text input.
+        
+        Args:
+            prompt (str or List[str]): Text prompt(s)
+            max_length (int): Maximum sequence length
+            
+        Returns:
+            tf.Tensor: Processed text embeddings
+        """
+        # Handle single prompt
+        if isinstance(prompt, str):
+            prompt = [prompt]
+            
+        # Tokenize
+        text_inputs = self.tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=max_length,
+            truncation=True,
+            return_tensors="tf"
+        )
+        
+        # Convert to float16 for mixed precision
+        input_ids = tf.cast(text_inputs.input_ids, tf.float16)
+        attention_mask = tf.cast(text_inputs.attention_mask, tf.float16)
+        
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask
+        }
+
 class OmniGenCollator:
     """Collator class for OmniGen model."""
     
