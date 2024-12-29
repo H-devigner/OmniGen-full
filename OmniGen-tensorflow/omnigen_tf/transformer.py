@@ -110,42 +110,25 @@ class Phi3Config(PretrainedConfig):
         return output
 
 
-class Phi3Transformer(TFPreTrainedModel):
-    """
-    Transformer decoder consisting of *config.num_hidden_layers* layers.
-    Matches PyTorch's implementation while optimizing for TensorFlow.
-    """
-    config_class = Phi3Config
-    base_model_prefix = "transformer"
+class Phi3Transformer(layers.Layer):
+    """Phi-3 transformer model."""
     
     def __init__(self, config, **kwargs):
         """Initialize transformer."""
-        # Initialize parent class with config
-        super().__init__(config, **kwargs)
-        
+        super().__init__(**kwargs)
         self.config = config
-        self.hidden_size = config.hidden_size
-        self.num_hidden_layers = config.num_hidden_layers
-        self.num_attention_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_attention_heads
         
-        # Enable memory optimization flags
-        self.gradient_checkpointing_enabled = False
-        self.use_mixed_precision = True
-        self.chunk_size = None  # For chunked processing
-        
-        # Initialize embeddings
+        # Create embedding layers
         self.wte = layers.Embedding(
             config.vocab_size,
             config.hidden_size,
             name="wte"
         )
-        self.drop = layers.Dropout(config.hidden_dropout)
         
-        # Initialize transformer layers
-        self.layers = []
+        # Create transformer blocks
+        self.blocks = []
         for i in range(config.num_hidden_layers):
-            self.layers.append(
+            self.blocks.append(
                 TransformerLayer(
                     hidden_size=config.hidden_size,
                     num_attention_heads=config.num_attention_heads,
@@ -153,260 +136,96 @@ class Phi3Transformer(TFPreTrainedModel):
                     layer_norm_epsilon=config.layer_norm_epsilon,
                     hidden_dropout_prob=config.hidden_dropout,
                     attention_probs_dropout_prob=config.attention_dropout,
-                    name=f"layer_{i}"
+                    name=f"block_{i}"
                 )
             )
             
-        # Initialize final layer norm
+        # Create final layer norm
         self.ln_f = layers.LayerNormalization(
             epsilon=config.layer_norm_epsilon,
             name="ln_f"
         )
         
-    def prefetch_layer(self, layer_idx: int):
-        """Starts prefetching the next layer cache."""
-        if not self._is_gpu_available:
-            return
-            
-        with tf.device('/GPU:0'):
-            layer = self.layers[layer_idx]
-            # Non-blocking transfer
-            for weight in layer.trainable_weights:
-                tf.identity(weight)
-    
-    def evict_previous_layer(self, layer_idx: int):
-        """Moves the previous layer cache to the CPU."""
-        if not self._is_gpu_available or layer_idx <= 0:
-            return
-            
-        with tf.device('/CPU:0'):
-            prev_layer = self.layers[layer_idx - 1]
-            for weight in prev_layer.trainable_weights:
-                tf.identity(weight)
-        
-        # Clear GPU memory
-        tf.keras.backend.clear_session()
-    
-    def get_offload_layer(self, layer_idx: int):
-        """Manages layer offloading for memory efficiency."""
-        if not self._is_gpu_available:
-            return
-            
-        # Make sure current layer is ready
-        tf.keras.backend.clear_session()
-        
-        # Move previous layer to CPU
-        self.evict_previous_layer(layer_idx)
-        
-        # Prefetch next layer
-        next_layer_idx = (layer_idx + 1) % len(self.layers)
-        self.prefetch_layer(next_layer_idx)
-    
-    def enable_gradient_checkpointing(self):
-        """Enable gradient checkpointing for memory efficiency."""
-        self.gradient_checkpointing_enabled = True
-        
-    def disable_gradient_checkpointing(self):
-        """Disable gradient checkpointing."""
-        self.gradient_checkpointing_enabled = False
-        
-    def set_chunk_size(self, chunk_size: Optional[int]):
-        """Set chunk size for processing large inputs."""
-        self.chunk_size = chunk_size
-        
-    def process_in_chunks(self, hidden_states):
-        """Process hidden states in chunks to save memory."""
-        if not self.chunk_size or hidden_states.shape[1] <= self.chunk_size:
-            return hidden_states
-            
-        chunks = tf.split(
-            hidden_states,
-            num_or_size_splits=[self.chunk_size] * (hidden_states.shape[1] // self.chunk_size) + [hidden_states.shape[1] % self.chunk_size],
-            axis=1
-        )
-        
-        # Remove empty chunks
-        chunks = [chunk for chunk in chunks if chunk.shape[1] > 0]
-        
-        # Process each chunk
-        processed_chunks = []
-        for chunk in chunks:
-            processed_chunk = self._process_chunk(chunk)
-            processed_chunks.append(processed_chunk)
-            
-        # Concatenate chunks
-        return tf.concat(processed_chunks, axis=1)
-        
-    def _process_chunk(self, hidden_states):
-        """Process a single chunk through the transformer layers."""
-        # Apply transformer layers
-        for layer in self.layers:
-            if self.gradient_checkpointing_enabled:
-                hidden_states = tf.stop_gradient(hidden_states)
-            hidden_states = layer(hidden_states)
-            
-        # Apply final normalization
-        hidden_states = self.ln_f(hidden_states)
-        return hidden_states
+    def build(self, input_shape):
+        """Build the model."""
+        # Add blocks to the layer
+        for block in self.blocks:
+            self._tracker.track(block)
+        super().build(input_shape)
         
     def call(
         self,
-        input_ids: Optional[tf.Tensor] = None,
-        attention_mask: Optional[tf.Tensor] = None,
-        position_ids: Optional[tf.Tensor] = None,
-        past_key_values: Optional[Tuple[Tuple[tf.Tensor, tf.Tensor], ...]] = None,
-        inputs_embeds: Optional[tf.Tensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        offload_model: Optional[bool] = False,
-        training: bool = False,
-    ) -> Union[Tuple[Any, ...], Dict[str, Any]]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both input_ids and inputs_embeds")
-            
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        offload_model=False,
+        training=False,
+    ):
+        """Forward pass."""
+        # Get input embeddings
         if input_ids is not None:
-            # Move embedding to CPU and cast to float16 for GPU operations
-            with tf.device('/CPU:0'):
-                inputs_embeds = tf.cast(self.wte(input_ids), tf.float16)
-            batch_size, seq_length = tf.shape(input_ids)[0], tf.shape(input_ids)[1]
+            input_shape = tf.shape(input_ids)
+            inputs_embeds = self.wte(input_ids)
         elif inputs_embeds is not None:
-            # Cast inputs to float16 for GPU operations
-            inputs_embeds = tf.cast(inputs_embeds, tf.float16)
-            batch_size, seq_length = tf.shape(inputs_embeds)[0], tf.shape(inputs_embeds)[1]
+            input_shape = tf.shape(inputs_embeds)[:-1]
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
-
-        # Generate position IDs on CPU
-        if position_ids is None:
-            with tf.device('/CPU:0'):
-                position_ids = tf.range(seq_length, dtype=tf.int32)[tf.newaxis, :]
-
-        # Handle cache conversion
-        return_legacy_cache = False
-        if use_cache and not isinstance(past_key_values, Cache):
-            return_legacy_cache = True
-            if past_key_values is None:
-                past_key_values = DynamicCache()
-            else:
-                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-
-        # Process attention mask with float16
-        if attention_mask is not None:
-            with tf.device('/CPU:0'):
-                attention_mask = tf.cast(attention_mask, tf.float16)
-                attention_mask = (1.0 - attention_mask) * tf.float16.min
-
-        # Initialize outputs
+            
+        # Initialize states
+        batch_size = input_shape[0]
+        seq_length = input_shape[1]
+        
+        # Initialize hidden states and attention outputs
+        hidden_states = inputs_embeds
         all_hidden_states = () if output_hidden_states else None
-        all_self_attns = () if output_attentions else None
-        next_decoder_cache = None
-
-        # Process on CPU first
-        with tf.device('/CPU:0'):
-            hidden_states = tf.cast(self.drop(inputs_embeds, training=training), tf.float16)
-
-        # Process through layers
-        for idx, layer in enumerate(self.layers):
+        all_attentions = () if output_attentions else None
+        
+        # Process through blocks
+        for idx, block in enumerate(self.blocks):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
-
-            # Memory management
-            if offload_model and not training:
-                self.get_offload_layer(idx)
-
-            # Get layer cache
+                
+            # Get past key value
             past_key_value = past_key_values[idx] if past_key_values is not None else None
-
-            # Process layer with float16
-            layer_outputs = layer(
+            
+            # Process through block
+            layer_outputs = block(
                 hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_value=past_key_value,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
-                training=training,
+                training=training
             )
-
-            if isinstance(layer_outputs, tuple):
-                hidden_states = layer_outputs[0]
-                self_attn = layer_outputs[1] if len(layer_outputs) > 1 else None
-                present_key_value = layer_outputs[2] if len(layer_outputs) > 2 else None
-            else:
-                hidden_states = layer_outputs
-                self_attn = None
-                present_key_value = None
-                
-            if use_cache:
-                next_decoder_cache = next_decoder_cache + (present_key_value,) if next_decoder_cache is not None else (present_key_value,)
-
+            
+            # Update hidden states
+            hidden_states = layer_outputs[0]
+            
+            # Update attention outputs
             if output_attentions:
-                all_self_attns = all_self_attns + (self_attn,)
-
-            # Clear intermediate tensors
-            if tf.config.list_physical_devices('GPU'):
-                tf.keras.backend.clear_session()
-
-        # Final layer norm with float16
-        hidden_states = tf.cast(self.ln_f(hidden_states), tf.float16)
-
-        # Add final hidden state
+                all_attentions = all_attentions + (layer_outputs[1],)
+                
+        # Final layer norm
+        hidden_states = self.ln_f(hidden_states)
+        
+        # Add final hidden states
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
-
-        # Handle cache
-        if use_cache and return_legacy_cache and next_decoder_cache is not None:
-            next_decoder_cache = next_decoder_cache.to_legacy_cache()
-
-        # Clear any remaining GPU memory
-        if tf.config.list_physical_devices('GPU'):
-            tf.keras.backend.clear_session()
-
-        if not return_dict:
-            return tuple(v for v in [hidden_states, next_decoder_cache, all_hidden_states, all_self_attns] if v is not None)
-
-        return {
-            "last_hidden_state": hidden_states,
-            "past_key_values": next_decoder_cache,
-            "hidden_states": all_hidden_states,
-            "attentions": all_self_attns,
-        }
-        
-    def get_config(self):
-        """Get model configuration."""
-        config = super().get_config()
-        config.update({
-            'config': self.config.to_dict(),
-            'gradient_checkpointing_enabled': self.gradient_checkpointing_enabled,
-            'use_mixed_precision': self.use_mixed_precision,
-            'chunk_size': self.chunk_size,
-        })
-        return config
-        
-    @classmethod
-    def from_config(cls, config):
-        """Create model from configuration."""
-        # Extract transformer config
-        transformer_config = config.pop('config', None)
-        if transformer_config is not None:
-            transformer_config = Phi3Config(**transformer_config)
             
-        # Create model
-        model = cls(config=transformer_config)
-        
-        # Set optimization flags
-        model.gradient_checkpointing_enabled = config.get('gradient_checkpointing_enabled', False)
-        model.use_mixed_precision = config.get('use_mixed_precision', False)
-        model.chunk_size = config.get('chunk_size', None)
-        
-        return model
+        # Return outputs
+        return TransformerOutputs(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values,
+            hidden_states=all_hidden_states,
+            attentions=all_attentions
+        )
 
 
 class TransformerLayer(layers.Layer):
@@ -969,3 +788,11 @@ class OmniGenMLP(layers.Layer):
         
         # Project back to original dimension
         return self.down_proj(hidden_states)
+
+
+class TransformerOutputs:
+    def __init__(self, last_hidden_state, past_key_values=None, hidden_states=None, attentions=None):
+        self.last_hidden_state = last_hidden_state
+        self.past_key_values = past_key_values
+        self.hidden_states = hidden_states
+        self.attentions = attentions

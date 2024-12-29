@@ -392,11 +392,13 @@ class OmniGen(tf.keras.Model):
         # Process text input if provided
         if input_ids is not None:
             # Get text embeddings from transformer
-            text_outputs = self.transformer.wte(input_ids)
-            text_outputs = self.transformer.h[0](text_outputs)
-            for layer in self.transformer.h[1:]:
-                text_outputs = layer(text_outputs)
-            text_embeds = tf.cast(text_outputs, input_dtype)
+            text_outputs = self.transformer(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                training=training
+            )
+            text_embeds = tf.cast(text_outputs.last_hidden_state, input_dtype)
             tf.print("text_embeds:", tf.shape(text_embeds))
             
             # Concatenate with image embeddings
@@ -409,11 +411,16 @@ class OmniGen(tf.keras.Model):
                 image_mask = tf.ones((batch_size, tf.shape(x)[1] - tf.shape(text_embeds)[1]))
                 attention_mask = tf.concat([attention_mask, image_mask], axis=1)
         
-        # Pass through transformer
+        # Pass through transformer blocks
         hidden_states = x
-        for layer in self.transformer.h:
-            hidden_states = layer(hidden_states)
-        hidden_states = tf.cast(self.transformer.norm(hidden_states), input_dtype)
+        for block in self.transformer.blocks:
+            hidden_states = block(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                training=training
+            )
+        hidden_states = tf.cast(self.transformer.ln_f(hidden_states), input_dtype)
         
         # Process output
         if input_ids is not None:
