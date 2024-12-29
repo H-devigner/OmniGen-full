@@ -241,6 +241,7 @@ class TransformerLayer(layers.Layer):
         attention_probs_dropout_prob,
         **kwargs
     ):
+        """Initialize layer."""
         super().__init__(**kwargs)
         
         self.hidden_size = hidden_size
@@ -251,32 +252,32 @@ class TransformerLayer(layers.Layer):
         self.attention_probs_dropout_prob = attention_probs_dropout_prob
         
         # Initialize components
-        self.self_attn = MultiHeadAttention(
+        self.attention = MultiHeadAttention(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             dropout=attention_probs_dropout_prob,
-            name="self_attn"
+            name="attention"
         )
-        self.self_attn_layer_norm = layers.LayerNormalization(
+        self.attention_norm = layers.LayerNormalization(
             epsilon=layer_norm_epsilon,
-            name="self_attn_layer_norm"
+            name="attention_norm"
         )
-        self.self_attn_dropout = layers.Dropout(hidden_dropout_prob)
+        self.attention_dropout = layers.Dropout(hidden_dropout_prob)
         
-        self.intermediate = layers.Dense(
-            hidden_size,
-            activation="relu",
-            name="intermediate"
+        self.mlp_in = layers.Dense(
+            4 * hidden_size,
+            activation="gelu",
+            name="mlp_in"
         )
-        self.output = layers.Dense(
+        self.mlp_out = layers.Dense(
             hidden_size,
-            name="output"
+            name="mlp_out"
         )
-        self.output_layer_norm = layers.LayerNormalization(
+        self.mlp_norm = layers.LayerNormalization(
             epsilon=layer_norm_epsilon,
-            name="output_layer_norm"
+            name="mlp_norm"
         )
-        self.output_dropout = layers.Dropout(hidden_dropout_prob)
+        self.mlp_dropout = layers.Dropout(hidden_dropout_prob)
         
     def call(
         self,
@@ -290,7 +291,7 @@ class TransformerLayer(layers.Layer):
     ):
         """Forward pass."""
         # Self attention
-        attention_outputs = self.self_attn(
+        attn_outputs = self.attention(
             hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -300,64 +301,78 @@ class TransformerLayer(layers.Layer):
             training=training
         )
         
-        if isinstance(attention_outputs, tuple):
-            attention_output = attention_outputs[0]
-            attention_weights = attention_outputs[1] if len(attention_outputs) > 1 else None
-            present_key_value = attention_outputs[2] if len(attention_outputs) > 2 else None
+        if isinstance(attn_outputs, tuple):
+            attn_output = attn_outputs[0]
+            attention_weights = attn_outputs[1] if len(attn_outputs) > 1 else None
+            present_key_value = attn_outputs[2] if len(attn_outputs) > 2 else None
         else:
-            attention_output = attention_outputs
+            attn_output = attn_outputs
             attention_weights = None
             present_key_value = None
             
-        # Apply self attention dropout
-        attention_output = self.self_attn_dropout(attention_output, training=training)
+        # Apply attention dropout and residual connection
+        attn_output = self.attention_dropout(attn_output, training=training)
+        hidden_states = self.attention_norm(attn_output + hidden_states)
         
-        # Apply self attention layer norm
-        attention_output = self.self_attn_layer_norm(attention_output + hidden_states)
+        # MLP
+        mlp_output = self.mlp_in(hidden_states)
+        mlp_output = self.mlp_out(mlp_output)
+        mlp_output = self.mlp_dropout(mlp_output, training=training)
+        hidden_states = self.mlp_norm(mlp_output + hidden_states)
         
-        # Intermediate
-        intermediate_output = self.intermediate(attention_output)
-        
-        # Output
-        output = self.output(intermediate_output)
-        
-        # Apply output dropout
-        output = self.output_dropout(output, training=training)
-        
-        # Apply output layer norm
-        output = self.output_layer_norm(output + attention_output)
-        
-        outputs = (output,)
+        outputs = (hidden_states,)
         if output_attentions:
             outputs += (attention_weights,)
         if use_cache:
             outputs += (present_key_value,)
             
-        return outputs
+        return outputs[0] if len(outputs) == 1 else outputs
 
 
 class MultiHeadAttention(layers.Layer):
     """Multi-head attention layer."""
     
-    def __init__(
-        self,
-        hidden_size,
-        num_attention_heads,
-        dropout,
-        **kwargs
-    ):
+    def __init__(self, hidden_size, num_attention_heads, dropout, **kwargs):
+        """Initialize layer."""
         super().__init__(**kwargs)
         
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         self.dropout = dropout
+        self.head_size = hidden_size // num_attention_heads
         
-        # Initialize components
-        self.query = layers.Dense(hidden_size, name="query")
-        self.key = layers.Dense(hidden_size, name="key")
-        self.value = layers.Dense(hidden_size, name="value")
+        # Initialize query, key, value projections
+        self.q_proj = layers.Dense(hidden_size, use_bias=False, name="q_proj")
+        self.k_proj = layers.Dense(hidden_size, use_bias=False, name="k_proj")
+        self.v_proj = layers.Dense(hidden_size, use_bias=False, name="v_proj")
         
-        self.dropout_layer = layers.Dropout(dropout)
+        # Initialize output projection
+        self.o_proj = layers.Dense(hidden_size, use_bias=False, name="o_proj")
+        
+        # Initialize dropout
+        self.dropout = layers.Dropout(dropout)
+        
+    def _split_heads(self, x):
+        """Split heads."""
+        batch_size = tf.shape(x)[0]
+        seq_length = tf.shape(x)[1]
+        
+        # Reshape to [batch_size, seq_length, num_heads, head_size]
+        x = tf.reshape(x, [batch_size, seq_length, self.num_attention_heads, self.head_size])
+        
+        # Transpose to [batch_size, num_heads, seq_length, head_size]
+        return tf.transpose(x, [0, 2, 1, 3])
+        
+    def _merge_heads(self, x):
+        """Merge heads."""
+        batch_size = tf.shape(x)[0]
+        seq_length = tf.shape(x)[2]
+        
+        # Transpose back to [batch_size, seq_length, num_heads, head_size]
+        x = tf.transpose(x, [0, 2, 1, 3])
+        
+        # Reshape to [batch_size, seq_length, hidden_size]
+        return tf.reshape(x, [batch_size, seq_length, self.hidden_size])
         
     def call(
         self,
@@ -370,44 +385,61 @@ class MultiHeadAttention(layers.Layer):
         training=False,
     ):
         """Forward pass."""
-        # Get query, key, value
-        query = self.query(hidden_states)
-        key = self.key(hidden_states)
-        value = self.value(hidden_states)
+        batch_size = tf.shape(hidden_states)[0]
+        seq_length = tf.shape(hidden_states)[1]
         
-        # Get past key and value if provided
+        # Project query, key, value
+        query = self.q_proj(hidden_states)
+        key = self.k_proj(hidden_states)
+        value = self.v_proj(hidden_states)
+        
+        # Split heads
+        query = self._split_heads(query)
+        key = self._split_heads(key)
+        value = self._split_heads(value)
+        
+        # Use past key value if provided
         if past_key_value is not None:
             past_key, past_value = past_key_value
-            key = tf.concat([past_key, key], axis=1)
-            value = tf.concat([past_value, value], axis=1)
+            key = tf.concat([past_key, key], axis=2)
+            value = tf.concat([past_value, value], axis=2)
+            
+        # Save current key, value if using cache
+        if use_cache:
+            present_key_value = (key, value)
+        else:
+            present_key_value = None
             
         # Compute attention scores
-        attention_scores = tf.matmul(query, key, transpose_b=True)
-        attention_scores = attention_scores / tf.math.sqrt(tf.cast(self.hidden_size, tf.float32))
+        scale = tf.cast(tf.math.sqrt(tf.cast(self.head_size, tf.float32)), hidden_states.dtype)
+        attention_scores = tf.matmul(query, tf.transpose(key, [0, 1, 3, 2])) / scale
         
-        # Add attention mask if provided
+        # Apply attention mask if provided
         if attention_mask is not None:
-            attention_scores += attention_mask
-        
-        # Normalize attention scores
-        attention_weights = tf.nn.softmax(attention_scores, axis=-1)
+            attention_scores = attention_scores + attention_mask
+            
+        # Apply softmax
+        attention_probs = tf.nn.softmax(attention_scores, axis=-1)
         
         # Apply dropout
-        attention_weights = self.dropout_layer(attention_weights, training=training)
+        attention_probs = self.dropout(attention_probs, training=training)
         
-        # Compute attention output
-        attention_output = tf.matmul(attention_weights, value)
+        # Apply attention to values
+        context = tf.matmul(attention_probs, value)
         
-        # Save current key and value if needed
-        present_key_value = (key, value) if use_cache else None
-            
-        outputs = (attention_output,)
+        # Merge heads
+        context = self._merge_heads(context)
+        
+        # Apply output projection
+        output = self.o_proj(context)
+        
+        outputs = (output,)
         if output_attentions:
-            outputs += (attention_weights,)
+            outputs += (attention_probs,)
         if use_cache:
             outputs += (present_key_value,)
             
-        return outputs
+        return outputs[0] if len(outputs) == 1 else outputs
 
 
 class OmniGenTransformer(layers.Layer):
