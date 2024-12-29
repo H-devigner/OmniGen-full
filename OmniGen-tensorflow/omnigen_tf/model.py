@@ -17,6 +17,7 @@ from diffusers.loaders import PeftAdapterMixin
 import json
 from dataclasses import fields
 import gc
+import huggingface_hub
 
 from omnigen_tf.transformer import Phi3Config, Phi3Transformer
 from diffusers.models import AutoencoderKL
@@ -349,69 +350,62 @@ class OmniGen(tf.keras.Model):
     @classmethod
     def from_pretrained(cls, model_name_or_path: str, **kwargs):
         """Load model from pretrained weights with optimized memory usage."""
-        if not os.path.exists(model_name_or_path):
-            print(f"Downloading model weights from {model_name_or_path}...")
-            cache_folder = os.getenv('HF_HUB_CACHE')
-            try:
-                model_name_or_path = snapshot_download(
-                    repo_id=model_name_or_path,
-                    cache_dir=cache_folder,
-                    local_files_only=False,  # Allow download first time
-                    resume_download=True  # Resume partial downloads
-                )
-            except Exception as e:
-                print(f"Error downloading model weights: {str(e)}")
-                raise
-
-        # Load config
-        config_file = os.path.join(model_name_or_path, "config.json")
-        with open(config_file, 'r') as f:
-            config = json.load(f)
-
-        # Initialize model
-        model = cls(
-            transformer_config=config,
-            **kwargs
+        print(f"Loading model weights...")
+        
+        # Get model weights file
+        weights_file = huggingface_hub.hf_hub_download(
+            repo_id=model_name_or_path,
+            filename="model.safetensors",
+            cache_dir=os.getenv("HF_HUB_CACHE", None)
         )
-
-        # Load weights efficiently
-        weights_file = os.path.join(model_name_or_path, "model.safetensors")
-        if os.path.exists(weights_file):
-            print("Loading model weights...")
-            # Load safetensors metadata first
-            with open(weights_file, 'rb') as f:
-                header = f.read(8)
-                header_size = int.from_bytes(header, 'little')
-                metadata = f.read(header_size).decode('utf-8')
-                metadata = json.loads(metadata)
-
-            # Load weights in chunks with memory cleanup
-            total_tensors = len(metadata)
-            for i, (tensor_name, tensor_info) in enumerate(metadata.items(), 1):
-                if hasattr(model, tensor_name):
-                    print(f"\rLoading tensor {i}/{total_tensors}: {tensor_name}", end="")
-                    offset = tensor_info['data_offsets'][0]
-                    length = tensor_info['data_offsets'][1] - offset
-                    dtype = tensor_info['dtype']
-                    shape = tensor_info['shape']
-
-                    with open(weights_file, 'rb') as f:
-                        f.seek(8 + header_size + offset)
-                        tensor_bytes = f.read(length)
-                        tensor = np.frombuffer(tensor_bytes, dtype=dtype).reshape(shape)
-                        setattr(model, tensor_name, tf.convert_to_tensor(tensor))
-
-                    # Clear memory after each tensor
-                    del tensor_bytes
-                    del tensor
-                    gc.collect()
-            print("\nModel weights loaded successfully!")
-
+        
+        # Initialize model with default config
+        model = cls(transformer_config=Phi3Config(), **kwargs)
+        
+        # Load safetensors metadata first
+        with open(weights_file, 'rb') as f:
+            header = f.read(8)
+            header_size = int.from_bytes(header, 'little')
+            metadata = f.read(header_size).decode('utf-8')
+            metadata = json.loads(metadata)
+            
+        # Define dtype mapping
+        dtype_map = {
+            'F32': np.float32,
+            'F16': np.float16,
+            'BF16': np.float32,  # Convert bfloat16 to float32
+            'I32': np.int32,
+            'I64': np.int64
+        }
+        
+        # Load weights in chunks with memory cleanup
+        total_tensors = len(metadata)
+        for i, (tensor_name, tensor_info) in enumerate(metadata.items(), 1):
+            if hasattr(model, tensor_name):
+                print(f"\rLoading tensor {i}/{total_tensors}: {tensor_name}", end="")
+                offset = tensor_info['data_offsets'][0]
+                length = tensor_info['data_offsets'][1] - offset
+                dtype_str = tensor_info['dtype']
+                dtype = dtype_map.get(dtype_str, np.float32)  # Default to float32 if unknown
+                shape = tensor_info['shape']
+                
+                with open(weights_file, 'rb') as f:
+                    f.seek(8 + header_size + offset)
+                    tensor_bytes = f.read(length)
+                    tensor = np.frombuffer(tensor_bytes, dtype=dtype).reshape(shape)
+                    setattr(model, tensor_name, tf.convert_to_tensor(tensor))
+                
+                # Clear memory after each tensor
+                del tensor_bytes
+                del tensor
+                gc.collect()
+        print("\nModel weights loaded successfully!")
+        
         # Final memory cleanup
         if tf.config.list_physical_devices('GPU'):
             tf.keras.backend.clear_session()
         gc.collect()
-
+        
         return model
 
 def get_2d_sincos_pos_embed(
