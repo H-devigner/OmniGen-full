@@ -81,18 +81,23 @@ class OmniGenProcessor:
     def from_pretrained(cls, model_name):
         """Load processor from pretrained model with optimized memory usage."""
         if not os.path.exists(model_name):
+            print(f"Downloading tokenizer {model_name}...")
             cache_folder = os.getenv('HF_HUB_CACHE')
-            model_name = snapshot_download(
-                repo_id=model_name,
-                cache_dir=cache_folder,
-                allow_patterns="*.json",
-                local_files_only=True  # Prevent unnecessary downloads
-            )
+            try:
+                model_name = snapshot_download(
+                    repo_id=model_name,
+                    cache_dir=cache_folder,
+                    local_files_only=False,  # Allow download first time
+                    resume_download=True,  # Resume partial downloads
+                    allow_patterns="*.json"
+                )
+            except Exception as e:
+                print(f"Error downloading tokenizer: {str(e)}")
+                raise
             
         # Load tokenizer with optimized settings
         text_tokenizer = AutoTokenizer.from_pretrained(
             model_name,
-            local_files_only=True,  # Prevent unnecessary downloads
             use_fast=True  # Use faster tokenizer implementation
         )
         

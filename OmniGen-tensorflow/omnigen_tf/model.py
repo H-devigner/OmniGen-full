@@ -327,12 +327,18 @@ class OmniGen(tf.keras.Model):
     def from_pretrained(cls, model_name_or_path: str, **kwargs):
         """Load model from pretrained weights with optimized memory usage."""
         if not os.path.exists(model_name_or_path):
+            print(f"Downloading model weights from {model_name_or_path}...")
             cache_folder = os.getenv('HF_HUB_CACHE')
-            model_name_or_path = snapshot_download(
-                repo_id=model_name_or_path,
-                cache_dir=cache_folder,
-                local_files_only=True
-            )
+            try:
+                model_name_or_path = snapshot_download(
+                    repo_id=model_name_or_path,
+                    cache_dir=cache_folder,
+                    local_files_only=False,  # Allow download first time
+                    resume_download=True  # Resume partial downloads
+                )
+            except Exception as e:
+                print(f"Error downloading model weights: {str(e)}")
+                raise
 
         # Load config
         config_file = os.path.join(model_name_or_path, "config.json")
@@ -348,6 +354,7 @@ class OmniGen(tf.keras.Model):
         # Load weights efficiently
         weights_file = os.path.join(model_name_or_path, "model.safetensors")
         if os.path.exists(weights_file):
+            print("Loading model weights...")
             # Load safetensors metadata first
             with open(weights_file, 'rb') as f:
                 header = f.read(8)
@@ -356,8 +363,10 @@ class OmniGen(tf.keras.Model):
                 metadata = json.loads(metadata)
 
             # Load weights in chunks with memory cleanup
-            for tensor_name, tensor_info in metadata.items():
+            total_tensors = len(metadata)
+            for i, (tensor_name, tensor_info) in enumerate(metadata.items(), 1):
                 if hasattr(model, tensor_name):
+                    print(f"\rLoading tensor {i}/{total_tensors}: {tensor_name}", end="")
                     offset = tensor_info['data_offsets'][0]
                     length = tensor_info['data_offsets'][1] - offset
                     dtype = tensor_info['dtype']
@@ -373,6 +382,7 @@ class OmniGen(tf.keras.Model):
                     del tensor_bytes
                     del tensor
                     gc.collect()
+            print("\nModel weights loaded successfully!")
 
         # Final memory cleanup
         if tf.config.list_physical_devices('GPU'):

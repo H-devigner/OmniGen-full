@@ -54,12 +54,18 @@ class OmniGenPipeline:
     def from_pretrained(cls, model_name, **kwargs):
         """Load pipeline from pretrained model with optimized memory usage."""
         if not os.path.exists(model_name):
+            print(f"Downloading model {model_name} from HuggingFace Hub...")
             cache_folder = os.getenv('HF_HUB_CACHE')
-            model_name = snapshot_download(
-                repo_id=model_name,
-                cache_dir=cache_folder,
-                local_files_only=True
-            )
+            try:
+                model_name = snapshot_download(
+                    repo_id=model_name,
+                    cache_dir=cache_folder,
+                    local_files_only=False,  # Allow download first time
+                    resume_download=True  # Resume partial downloads
+                )
+            except Exception as e:
+                print(f"Error downloading model: {str(e)}")
+                raise
             
         # Load processor with optimized settings
         processor = OmniGenProcessor.from_pretrained(model_name)
