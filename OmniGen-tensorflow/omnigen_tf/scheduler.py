@@ -1,19 +1,22 @@
-"""OmniGen TensorFlow Scheduler
+"""OmniGen TensorFlow Scheduler with optimized memory management."""
 
-This module provides the TensorFlow implementation of the OmniGen scheduler,
-matching the PyTorch version's functionality while leveraging TensorFlow-specific optimizations.
-"""
-
+import tensorflow as tf
+import numpy as np
 from typing import Optional, Dict, Any, Tuple, List
 import gc
 from tqdm import tqdm
 
-import tensorflow as tf
-import numpy as np
-
+class CacheConfig:
+    """Configuration for cache memory management."""
+    def __init__(self):
+        self.memory_growth = True
+        self.memory_limit_factor = 0.7  # Use 70% of available GPU memory
+        self.mixed_precision = True
+        self.prefetch_buffer = 2
 
 @tf.function(jit_compile=True)
-def _update_cache_tensors(key_states: tf.Tensor, value_states: tf.Tensor, 
+def _update_cache_tensors(key_states: tf.Tensor, 
+                         value_states: tf.Tensor, 
                          existing_key: Optional[tf.Tensor] = None,
                          existing_value: Optional[tf.Tensor] = None) -> Tuple[tf.Tensor, tf.Tensor]:
     """Update cache tensors with XLA optimization."""
@@ -22,52 +25,114 @@ def _update_cache_tensors(key_states: tf.Tensor, value_states: tf.Tensor,
         value_states = tf.concat([existing_value, value_states], axis=-2)
     return key_states, value_states
 
-
 class OmniGenCache:
-    """TensorFlow implementation of dynamic cache for OmniGen model."""
-
-    def __init__(self, num_tokens_for_img: int, offload_kv_cache: bool = False) -> None:
-        """Initialize cache.
+    """TensorFlow implementation of dynamic cache with memory optimization."""
+    
+    def __init__(self, num_tokens_for_img: int, offload_kv_cache: bool = False):
+        """Initialize cache with memory optimization.
         
         Args:
             num_tokens_for_img: Number of tokens for image
-            offload_kv_cache: Whether to offload key-value cache to CPU
+            offload_kv_cache: Whether to offload KV cache to CPU
         """
-        if not tf.config.list_physical_devices('GPU'):
-            raise RuntimeError(
-                "OffloadedCache can only be used with a GPU. If there is no GPU, "
-                "you need to set use_kv_cache=False, which will result in longer inference time!"
-            )
-        
-        self.key_cache = []
-        self.value_cache = []
-        self._seen_tokens = 0
-        self.num_tokens_for_img = num_tokens_for_img
-        self.offload_kv_cache = offload_kv_cache
-        
-        # Enable mixed precision for cache operations
-        if tf.config.list_physical_devices('GPU'):
-            tf.keras.mixed_precision.set_global_policy('mixed_float16')
-        
-        # Setup memory growth
+        self.config = CacheConfig()
+        self._setup_device_strategy()
         self._setup_memory_optimization()
+        
+        with self.strategy.scope():
+            self.key_cache = []
+            self.value_cache = []
+            self.original_devices = []
+            self._seen_tokens = 0
+            self.num_tokens_for_img = num_tokens_for_img
+            self.offload_kv_cache = offload_kv_cache
+            
+            # Create prefetch dataset
+            self.prefetch_dataset = tf.data.Dataset.from_tensors(0).prefetch(
+                self.config.prefetch_buffer
+            )
     
+    def _setup_device_strategy(self):
+        """Setup device strategy based on available hardware."""
+        gpus = tf.config.list_physical_devices('GPU')
+        if not gpus and self.offload_kv_cache:
+            raise RuntimeError(
+                "OffloadedCache requires GPU. Set use_kv_cache=False for CPU-only operation."
+            )
+            
+        self.strategy = tf.distribute.OneDeviceStrategy(
+            "/GPU:0" if gpus else "/CPU:0"
+        )
+        
     def _setup_memory_optimization(self):
-        """Setup memory optimization configurations."""
+        """Configure memory optimization settings."""
         if tf.config.list_physical_devices('GPU'):
-            # Enable memory growth and limit GPU memory
+            if self.config.mixed_precision:
+                tf.keras.mixed_precision.set_global_policy('mixed_float16')
+                
             for device in tf.config.list_physical_devices('GPU'):
                 try:
-                    tf.config.experimental.set_memory_growth(device, True)
-                    # Use 70% of available memory
-                    memory_limit = int(tf.config.experimental.get_memory_info('GPU:0')['free'] * 0.7)
+                    if self.config.memory_growth:
+                        tf.config.experimental.set_memory_growth(device, True)
+                        
+                    # Set memory limit
+                    memory_info = tf.config.experimental.get_memory_info('GPU:0')
+                    memory_limit = int(memory_info['free'] * self.config.memory_limit_factor)
                     tf.config.set_logical_device_configuration(
                         device,
                         [tf.config.LogicalDeviceConfiguration(memory_limit=memory_limit)]
                     )
-                except:
-                    pass
-
+                except RuntimeError as e:
+                    print(f"Memory optimization warning: {e}")
+                    
+    @tf.function(jit_compile=True)
+    def prefetch_layer(self, layer_idx: int):
+        """Prefetch next layer with XLA optimization."""
+        if layer_idx < len(self.key_cache):
+            # Prefetch in separate thread
+            def prefetch_fn():
+                with tf.device("/GPU:0"):
+                    key = tf.identity(self.key_cache[layer_idx])
+                    value = tf.identity(self.value_cache[layer_idx])
+                return key, value
+                
+            return tf.py_function(prefetch_fn, [], [tf.float16, tf.float16])
+    
+    @tf.function(jit_compile=True)
+    def evict_layer(self, layer_idx: int):
+        """Move layer to CPU with XLA optimization."""
+        if len(self.key_cache) > 2:
+            prev_idx = (layer_idx - 1) % len(self.key_cache) if layer_idx > 0 else -1
+            
+            with tf.device("/CPU:0"):
+                self.key_cache[prev_idx] = tf.identity(self.key_cache[prev_idx])
+                self.value_cache[prev_idx] = tf.identity(self.value_cache[prev_idx])
+                
+            # Force memory cleanup
+            tf.keras.backend.clear_session()
+            gc.collect()
+    
+    def __getitem__(self, layer_idx: int) -> Tuple[tf.Tensor, tf.Tensor]:
+        """Get cache for layer with memory optimization."""
+        if layer_idx >= len(self.key_cache):
+            raise KeyError(f"Cache has {len(self.key_cache)} layers, tried to access {layer_idx}")
+            
+        if self.offload_kv_cache:
+            # Evict previous layer
+            self.evict_layer(layer_idx)
+            
+            # Load current layer
+            with tf.device("/GPU:0"):
+                key = tf.identity(self.key_cache[layer_idx])
+                value = tf.identity(self.value_cache[layer_idx])
+                
+            # Prefetch next layer
+            self.prefetch_layer((layer_idx + 1) % len(self.key_cache))
+            
+            return key, value
+        else:
+            return self.key_cache[layer_idx], self.value_cache[layer_idx]
+    
     @tf.function(jit_compile=True)
     def update(
         self,
@@ -76,90 +141,33 @@ class OmniGenCache:
         layer_idx: int,
         cache_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[tf.Tensor, tf.Tensor]:
-        """Update cache with new key and value states.
-        
-        Args:
-            key_states: New key states to cache
-            value_states: New value states to cache
-            layer_idx: Index of layer to cache states for
-            cache_kwargs: Additional arguments for cache
-            
-        Returns:
-            Tuple of updated key and value states
-        """
+        """Update cache with XLA optimization."""
         if len(self.key_cache) < layer_idx:
-            raise ValueError("Cache does not support skipping layers. Use DynamicCache.")
+            raise ValueError("Cannot skip layers in cache")
+            
         elif len(self.key_cache) == layer_idx:
-            # Only cache states for condition tokens
+            # Cache only condition tokens
             key_states = key_states[..., :-(self.num_tokens_for_img + 1), :]
             value_states = value_states[..., :-(self.num_tokens_for_img + 1), :]
-
-            # Update seen tokens count
+            
             if layer_idx == 0:
                 self._seen_tokens += tf.shape(key_states)[-2]
-
-            # Initialize cache for new layer with proper device placement
-            device = "/CPU:0" if self.offload_kv_cache else "/GPU:0"
-            with tf.device(device):
-                # Use float16 for GPU tensors
-                if device == "/GPU:0":
-                    key_states = tf.cast(key_states, tf.float16)
-                    value_states = tf.cast(value_states, tf.float16)
-                self.key_cache.append(key_states)
-                self.value_cache.append(value_states)
-        else:
-            # Update existing cache with XLA optimization
-            key_states, value_states = _update_cache_tensors(
-                key_states, value_states,
-                self.key_cache[layer_idx], self.value_cache[layer_idx]
-            )
-            self.key_cache[layer_idx] = key_states
-            self.value_cache[layer_idx] = value_states
-
+                
+            # Store with proper device placement
+            with tf.device("/GPU:0" if not self.offload_kv_cache else "/CPU:0"):
+                self.key_cache.append(tf.identity(key_states))
+                self.value_cache.append(tf.identity(value_states))
+                self.original_devices.append("/GPU:0")
+                
         return key_states, value_states
-
-    def __getitem__(self, layer_idx: int) -> List[Tuple[tf.Tensor]]:
-        """Get cache for layer, handling prefetch and eviction."""
-        if layer_idx < len(self.key_cache):
-            if self.offload_kv_cache:
-                # Evict previous layer
-                self.evict_previous_layer(layer_idx)
-                
-                # Load current layer to GPU with non-blocking transfer
-                with tf.device("/GPU:0"):
-                    key_tensor = tf.identity(self.key_cache[layer_idx])
-                    value_tensor = tf.identity(self.value_cache[layer_idx])
-                
-                # Prefetch next layer asynchronously
-                tf.function(self.prefetch_layer, jit_compile=True)((layer_idx + 1) % len(self.key_cache))
-            else:
-                key_tensor = self.key_cache[layer_idx]
-                value_tensor = self.value_cache[layer_idx]
-            return (key_tensor, value_tensor)
-        else:
-            raise KeyError(f"Cache only has {len(self.key_cache)} layers, attempted to access layer {layer_idx}")
-
-    @tf.function(experimental_compile=True)
-    def evict_previous_layer(self, layer_idx: int) -> None:
-        """Move previous layer cache to CPU with XLA optimization."""
-        if len(self.key_cache) > 2:
-            prev_layer_idx = -1 if layer_idx == 0 else (layer_idx - 1) % len(self.key_cache)
-            with tf.device("/CPU:0"):
-                # Non-blocking transfer
-                self.key_cache[prev_layer_idx] = tf.identity(self.key_cache[prev_layer_idx])
-                self.value_cache[prev_layer_idx] = tf.identity(self.value_cache[prev_layer_idx])
-                
-                # Clear GPU memory
-                tf.keras.backend.clear_session()
-
-    @tf.function(experimental_compile=True)
-    def prefetch_layer(self, layer_idx: int) -> None:
-        """Prefetch next layer to GPU with XLA optimization."""
-        if layer_idx < len(self.key_cache):
-            with tf.device("/GPU:0"):
-                # Non-blocking transfer with float16
-                self.key_cache[layer_idx] = tf.cast(tf.identity(self.key_cache[layer_idx]), tf.float16)
-                self.value_cache[layer_idx] = tf.cast(tf.identity(self.value_cache[layer_idx]), tf.float16)
+    
+    def cleanup(self):
+        """Force memory cleanup."""
+        tf.keras.backend.clear_session()
+        gc.collect()
+        
+    def __len__(self) -> int:
+        return len(self.key_cache)
 
 
 class DDIMScheduler:
@@ -286,6 +294,121 @@ class DDIMScheduler:
 
 
 class OmniGenScheduler:
+    """Optimized TensorFlow scheduler for OmniGen model."""
+    
+    def __init__(self, num_steps: int = 50, time_shifting_factor: int = 1):
+        """Initialize scheduler with memory optimization.
+        
+        Args:
+            num_steps: Number of inference steps
+            time_shifting_factor: Time shifting factor for sigma calculation
+        """
+        self.num_steps = num_steps
+        self.time_shift = time_shifting_factor
+        
+        # Initialize with proper device placement and XLA
+        with tf.device("/GPU:0" if tf.config.list_physical_devices('GPU') else "/CPU:0"):
+            t = tf.cast(tf.linspace(0.0, 1.0, num_steps + 1), tf.float32)
+            t = t / (t + time_shifting_factor - time_shifting_factor * t)
+            self.sigma = tf.cast(t, tf.float16)  # Use float16 for GPU efficiency
+            
+    @tf.function(jit_compile=True)
+    def _get_noise_noisy_sample(self, latents: tf.Tensor, t: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
+        """Get noise and noisy sample with XLA optimization."""
+        noise = tf.random.normal(tf.shape(latents), dtype=latents.dtype)
+        noisy = latents + noise * tf.expand_dims(tf.gather(self.sigma, t), axis=(1, 2, 3))
+        return noise, noisy
+    
+    @tf.function(jit_compile=True)
+    def _denoise_step(self, model_output: tf.Tensor, timestep: tf.Tensor, sample: tf.Tensor) -> tf.Tensor:
+        """Perform single denoising step with XLA optimization."""
+        sigma = tf.gather(self.sigma, timestep)
+        sigma_next = tf.gather(self.sigma, tf.maximum(timestep - 1, 0))
+        
+        # Expand dimensions for broadcasting
+        sigma = tf.expand_dims(sigma, axis=(1, 2, 3))
+        sigma_next = tf.expand_dims(sigma_next, axis=(1, 2, 3))
+        
+        # Compute denoised sample
+        pred_original_sample = sample - sigma * model_output
+        derivative = (sample - pred_original_sample) / sigma
+        dt = sigma_next - sigma
+        prev_sample = sample + derivative * dt
+        
+        return prev_sample
+    
+    @tf.function(jit_compile=True)
+    def step(self, model_output: tf.Tensor, timestep: tf.Tensor, sample: tf.Tensor) -> tf.Tensor:
+        """Scheduler step with memory optimization."""
+        # Cast inputs to float16 for GPU efficiency
+        model_output = tf.cast(model_output, tf.float16)
+        sample = tf.cast(sample, tf.float16)
+        
+        # Perform denoising step
+        prev_sample = self._denoise_step(model_output, timestep, sample)
+        
+        # Clear unnecessary tensors
+        tf.keras.backend.clear_session()
+        
+        return prev_sample
+    
+    @tf.function(jit_compile=True)
+    def add_noise(self, original_samples: tf.Tensor, noise: tf.Tensor, timesteps: tf.Tensor) -> tf.Tensor:
+        """Add noise to samples with XLA optimization."""
+        # Cast to float16 for GPU efficiency
+        original_samples = tf.cast(original_samples, tf.float16)
+        noise = tf.cast(noise, tf.float16)
+        
+        # Add noise
+        sigma = tf.gather(self.sigma, timesteps)
+        noisy = original_samples + noise * tf.expand_dims(sigma, axis=(1, 2, 3))
+        
+        return noisy
+    
+    def __call__(self, z: tf.Tensor, func, model_kwargs: dict, 
+                 use_kv_cache: bool = True, offload_kv_cache: bool = True) -> tf.Tensor:
+        """Run diffusion process with memory optimization."""
+        # Initialize cache if needed
+        if use_kv_cache:
+            cache = OmniGenCache(
+                num_tokens_for_img=model_kwargs.get('num_tokens_for_img', 0),
+                offload_kv_cache=offload_kv_cache
+            )
+            model_kwargs['cache'] = cache
+        
+        # Cast input to float16 for GPU efficiency
+        z = tf.cast(z, tf.float16)
+        
+        # Run diffusion process with progress bar
+        for t in tqdm(range(self.num_steps)):
+            # Clear GPU memory before each step
+            if t > 0:
+                tf.keras.backend.clear_session()
+                gc.collect()
+            
+            timestep = tf.constant([t] * tf.shape(z)[0], dtype=tf.int32)
+            
+            # Run model with memory optimization
+            with tf.device("/GPU:0"):
+                model_output = func(z, timestep, **model_kwargs)
+                z = self.step(model_output, timestep, z)
+        
+        # Final cleanup
+        if use_kv_cache:
+            cache.cleanup()
+        tf.keras.backend.clear_session()
+        gc.collect()
+        
+        return z
+    
+    @staticmethod
+    def debug_tensor_info(tensor: tf.Tensor, name: str = ""):
+        """Debug helper to print tensor information."""
+        print(f"{name} - Shape: {tensor.shape}, Dtype: {tensor.dtype}, "
+              f"Device: {tensor.device}, Memory: {tf.size(tensor) * tensor.dtype.size} bytes")
+
+
+class OmniGenSchedulerOriginal:
     """Scheduler for OmniGen model."""
     
     def __init__(

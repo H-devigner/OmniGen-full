@@ -1,12 +1,11 @@
 """OmniGen Pipeline for text-to-image generation."""
 
 import os
-import tensorflow as tf
-import numpy as np
-from PIL import Image
-from huggingface_hub import snapshot_download
-from transformers import AutoTokenizer
 import gc
+import numpy as np
+import tensorflow as tf
+from PIL import Image
+from typing import List, Optional, Union
 
 from omnigen_tf.model import OmniGen
 from omnigen_tf.scheduler import OmniGenScheduler
@@ -29,8 +28,9 @@ if gpus:
 class OmniGenPipeline:
     """Pipeline for text-to-image generation using OmniGen."""
     
-    def __init__(self, model, scheduler, processor, device=None):
+    def __init__(self, vae, model, scheduler, processor, device=None):
         """Initialize pipeline."""
+        self.vae = vae
         self.model = model
         self.scheduler = scheduler
         self.processor = processor
@@ -46,7 +46,6 @@ class OmniGenPipeline:
                 print("No GPU available, using CPU (this will be slow)")
         
         self.device = device
-        self.strategy = tf.distribute.OneDeviceStrategy(device)
         self.model_cpu_offload = False
             
     @classmethod
@@ -63,27 +62,45 @@ class OmniGenPipeline:
             
         # Initialize components with GPU support
         with tf.device('/GPU:0'):
+            vae = OmniGen.from_pretrained(model_name)
             model = OmniGen.from_pretrained(model_name)
             processor = OmniGenProcessor.from_pretrained(model_name)
             scheduler = OmniGenScheduler()
         
-        return cls(model, scheduler, processor)
+        return cls(vae, model, scheduler, processor)
 
     def enable_model_cpu_offload(self):
-        """Enable CPU offloading to save GPU memory."""
+        """Enable model CPU offloading to save GPU memory."""
         self.model_cpu_offload = True
         with tf.device('/CPU:0'):
-            self.model.to_cpu()
+            # Move model weights to CPU
+            for layer in self.model.layers:
+                if 'layers' in layer.name and 'layers.0' not in layer.name:
+                    layer.set_weights([w.numpy() for w in layer.weights])
         tf.keras.backend.clear_session()
         gc.collect()
-
+        
     def disable_model_cpu_offload(self):
-        """Disable CPU offloading."""
+        """Disable model CPU offloading."""
         self.model_cpu_offload = False
         with tf.device(self.device):
-            self.model.to_gpu()
-
-    @tf.function(jit_compile=True)
+            # Move model weights back to device
+            for layer in self.model.layers:
+                if hasattr(layer, 'weights'):
+                    layer.set_weights(layer.get_weights())
+        
+    def vae_encode(self, x, dtype=tf.float16):
+        """Encode images using VAE with memory optimization."""
+        if self.model_cpu_offload:
+            with tf.device(self.device):
+                encoded = self.vae.encode(x)
+            # Clear GPU memory
+            tf.keras.backend.clear_session()
+            gc.collect()
+        else:
+            encoded = self.vae.encode(x)
+        return tf.cast(encoded, dtype)
+        
     def generate_latents(
         self,
         text_embeddings,
@@ -161,69 +178,149 @@ class OmniGenPipeline:
         return latents
 
     def __call__(
-        self,
-        prompt,
-        input_images=None,
-        height=1024,
-        width=1024,
-        num_inference_steps=50,
-        guidance_scale=3.0,
-        use_img_guidance=True,
-        img_guidance_scale=1.6,
-        max_input_image_size=1024,
-        separate_cfg_infer=True,
-        use_kv_cache=True,
-        offload_kv_cache=True,
-        use_input_image_size_as_output=False,
-        seed=None,
-        output_type="pil",
-        **kwargs
+            self,
+            prompt: Union[str, List[str]],
+            input_images: Optional[Union[List[str], List[List[str]]]] = None,
+            height: int = 1024,
+            width: int = 1024,
+            num_inference_steps: int = 50,
+            guidance_scale: float = 3,
+            use_img_guidance: bool = True,
+            img_guidance_scale: float = 1.6,
+            max_input_image_size: int = 1024,
+            separate_cfg_infer: bool = True,
+            offload_model: bool = False,
+            use_kv_cache: bool = True,
+            offload_kv_cache: bool = True,
+            use_input_image_size_as_output: bool = False,
+            seed: Optional[int] = None,
+            output_type: str = "pil"
     ):
-        """Generate images from text prompt with advanced features."""
+        """Generate images with memory optimizations."""
+        # Input validation
+        if height % 16 != 0 or width % 16 != 0:
+            raise ValueError("Height and width must be multiples of 16")
+            
+        if input_images is None:
+            use_img_guidance = False
+            
+        if isinstance(prompt, str):
+            prompt = [prompt]
+            input_images = [input_images] if input_images is not None else None
+            
+        # Process inputs
+        input_data = self.processor.process_text(prompt)
+        
+        # Setup model offloading if requested
+        if offload_model:
+            self.enable_model_cpu_offload()
+        else:
+            self.disable_model_cpu_offload()
+            
+        # Generate initial latents
+        num_prompt = len(prompt)
+        num_cfg = 2 if use_img_guidance else 1
+        latent_size_h, latent_size_w = height // 8, width // 8
         
         if seed is not None:
             tf.random.set_seed(seed)
-        
-        # Process input size
-        if use_input_image_size_as_output and input_images is not None:
-            if len(input_images) == 1:
-                img = Image.open(input_images[0])
-                height, width = img.size
-        
-        # Process inputs
-        text_inputs = self.processor.process_text(prompt)
-        image_inputs = None
-        if input_images is not None:
-            image_inputs = self.processor.process_images(
-                input_images,
-                max_size=max_input_image_size
-            )
-        
-        # Generate latents
+            
+        # Generate on device then move to CPU if needed
         with tf.device(self.device):
-            latents = self.generate_latents(
-                text_inputs,
-                height,
-                width,
-                num_inference_steps,
-                guidance_scale,
-                use_img_guidance,
-                img_guidance_scale,
-                use_kv_cache,
-                offload_kv_cache
+            latents = tf.random.normal(
+                [num_prompt, latent_size_h, latent_size_w, 4],
+                dtype=tf.float16
             )
+            latents = tf.repeat(latents, 1 + num_cfg, axis=0)
             
-            # Decode latents
-            images = self.decode_latents(latents)
+        # Process input images with memory optimization
+        if input_images is not None:
+            input_img_latents = []
+            
+            # Move VAE to device temporarily
+            if self.model_cpu_offload:
+                with tf.device(self.device):
+                    for img_batch in input_images:
+                        img_latents = []
+                        for img in (img_batch if isinstance(img_batch, list) else [img_batch]):
+                            # Process image
+                            if isinstance(img, str):
+                                img = Image.open(img).convert('RGB')
+                            img_tensor = tf.convert_to_tensor(np.array(img))
+                            img_tensor = tf.cast(img_tensor, tf.float32) / 127.5 - 1.0
+                            
+                            # Encode with VAE
+                            img_latent = self.vae_encode(img_tensor)
+                            img_latents.append(img_latent)
+                            
+                        input_img_latents.append(img_latents)
+                
+                # Clear GPU memory
+                tf.keras.backend.clear_session()
+                gc.collect()
+                
+        # Generate images with memory-optimized inference
+        with tf.device(self.device):
+            # Run inference in chunks if separate_cfg_infer is True
+            if separate_cfg_infer:
+                samples = []
+                for i in range(0, len(latents), num_cfg):
+                    chunk = latents[i:i + num_cfg]
+                    chunk_result = self.model(
+                        chunk,
+                        input_data['input_ids'],
+                        input_data['attention_mask'],
+                        guidance_scale=guidance_scale,
+                        img_guidance_scale=img_guidance_scale if use_img_guidance else None,
+                        use_kv_cache=use_kv_cache
+                    )
+                    samples.append(chunk_result)
+                    
+                    # Clear memory after each chunk
+                    if offload_kv_cache:
+                        tf.keras.backend.clear_session()
+                        gc.collect()
+                        
+                samples = tf.concat(samples, axis=0)
+            else:
+                samples = self.model(
+                    latents,
+                    input_data['input_ids'],
+                    input_data['attention_mask'],
+                    guidance_scale=guidance_scale,
+                    img_guidance_scale=img_guidance_scale if use_img_guidance else None,
+                    use_kv_cache=use_kv_cache
+                )
+            
+            # Post-process samples
+            samples = tf.cast(samples, tf.float32)
+            samples = samples / self.vae.config.scaling_factor
+            
+            if hasattr(self.vae.config, 'shift_factor') and self.vae.config.shift_factor is not None:
+                samples = samples + self.vae.config.shift_factor
+                
+            # Decode with VAE
+            if self.model_cpu_offload:
+                with tf.device(self.device):
+                    samples = self.vae.decode(samples)
+            else:
+                samples = self.vae.decode(samples)
+                
+            # Final processing
+            samples = tf.clip_by_value(samples * 0.5 + 0.5, 0, 1)
+            
+        # Clear GPU memory
+        tf.keras.backend.clear_session()
+        gc.collect()
         
-        # Convert to output format
-        if output_type == "pil":
-            images = self.numpy_to_pil(images)
-        elif output_type == "pt":
-            images = tf.convert_to_tensor(images)
-            
-        return images
-    
+        # Return results in requested format
+        if output_type == "tf":
+            return samples
+        else:
+            samples = tf.cast(samples * 255, tf.uint8)
+            samples = samples.numpy()
+            return [Image.fromarray(img) for img in samples]
+        
     def decode_latents(self, latents):
         """Decode the latents into images."""
         with tf.device(self.device):
@@ -231,7 +328,7 @@ class OmniGenPipeline:
             latents = 1 / 0.18215 * latents
             
             # Decode with VAE
-            images = self.model.vae.decode(latents)
+            images = self.vae.decode(latents)
             
             # Postprocess images
             images = (images / 2 + 0.5)
