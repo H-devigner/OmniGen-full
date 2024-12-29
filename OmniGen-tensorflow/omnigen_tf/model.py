@@ -270,11 +270,43 @@ class OmniGen(tf.keras.Model):
         timestep,
         input_ids=None,
         attention_mask=None,
+        position_ids=None,
+        guidance_scale=None,
         training=False,
+        **kwargs
     ):
-        """Forward pass with automatic mixed precision."""
-        # Let TensorFlow handle dtype conversions
-        outputs = super().call(inputs, training=training)
+        """Forward pass with classifier-free guidance support."""
+        # Handle classifier-free guidance
+        if guidance_scale is not None and guidance_scale > 1.0:
+            # Duplicate input for classifier-free guidance
+            inputs = tf.concat([inputs] * 2, axis=0)
+            timestep = tf.concat([timestep] * 2, axis=0)
+            
+            if input_ids is not None:
+                input_ids = tf.concat([input_ids] * 2, axis=0)
+            if attention_mask is not None:
+                attention_mask = tf.concat([attention_mask] * 2, axis=0)
+            if position_ids is not None:
+                position_ids = tf.concat([position_ids] * 2, axis=0)
+        
+        # Regular forward pass
+        outputs = self.forward_pass(
+            inputs,
+            timestep,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            training=training
+        )
+        
+        # Apply classifier-free guidance
+        if guidance_scale is not None and guidance_scale > 1.0:
+            # Split unconditional and conditional outputs
+            uncond_output, cond_output = tf.split(outputs, num_or_size_splits=2, axis=0)
+            
+            # Apply classifier-free guidance formula
+            return uncond_output + guidance_scale * (cond_output - uncond_output)
+            
         return outputs
 
     def forward_pass(
@@ -283,69 +315,86 @@ class OmniGen(tf.keras.Model):
         timestep,
         input_ids=None,
         attention_mask=None,
+        position_ids=None,
         training=False,
     ):
         """Model forward pass."""
-        # Cast inputs to float32
-        latents = tf.cast(latents, tf.float32)
-        timestep = tf.cast(timestep, tf.int32)
-        
         # Get batch size and dimensions
         batch_size = tf.shape(latents)[0]
         h = tf.shape(latents)[1]
         w = tf.shape(latents)[2]
         
-        # Embed latents
-        x = self.x_embedder(latents)  # [B, H*W, C]
+        # Embed timesteps
+        t_emb = self.t_embedder(timestep)
+        time_token = self.time_token(timestep)
         
-        # Create position IDs
-        position_ids = tf.range(tf.shape(x)[1], dtype=tf.int32)[None]
-        position_ids = tf.tile(position_ids, [batch_size, 1])
+        # Patch and embed input latents
+        x = self.x_embedder(latents)
         
-        # Get timestep embeddings
-        t_emb = self.t_embedder(timestep[None])  # [1, C]
-        time_tokens = self.time_token(timestep[None])  # [1, C]
+        # Add positional embeddings
+        if position_ids is None:
+            # Use default positional embeddings
+            pos_embed = get_2d_sincos_pos_embed(
+                self.transformer.config.hidden_size,
+                h // self.patch_size,
+                w // self.patch_size,
+                cls_token=False
+            )
+            pos_embed = tf.expand_dims(tf.convert_to_tensor(pos_embed, dtype=tf.float32), 0)
+            pos_embed = tf.tile(pos_embed, [batch_size, 1, 1])
+        else:
+            # Use provided position IDs
+            pos_embed = tf.gather(self.pos_embed, position_ids)
+            
+        x = x + pos_embed
         
-        # Add time tokens to beginning of sequence
-        time_tokens = tf.tile(time_tokens, [batch_size, 1])  # [B, C]
-        time_tokens = time_tokens[:, None, :]  # [B, 1, C]
-        x = tf.concat([time_tokens, x], axis=1)  # [B, 1+H*W, C]
+        # Add time token
+        x = tf.concat([time_token[:, None, :], x], axis=1)
         
-        # Update position IDs for time token
-        position_ids = tf.pad(position_ids, [[0, 0], [1, 0]])
+        # Process text input if provided
+        if input_ids is not None:
+            # Get text embeddings from transformer
+            text_outputs = self.transformer(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                training=training
+            )
+            text_embeds = text_outputs.last_hidden_state
+            
+            # Concatenate with image embeddings
+            x = tf.concat([text_embeds, x], axis=1)
+            
+            # Update attention mask if needed
+            if attention_mask is not None:
+                # Create full attention mask
+                image_mask = tf.ones((batch_size, tf.shape(x)[1] - tf.shape(text_embeds)[1]))
+                attention_mask = tf.concat([attention_mask, image_mask], axis=1)
         
-        # Process through transformer
-        x = self.transformer(
-            x,
+        # Pass through transformer
+        outputs = self.transformer(
+            inputs_embeds=x,
             attention_mask=attention_mask,
             position_ids=position_ids,
             training=training
         )
+        hidden_states = outputs.last_hidden_state
         
+        # Process output
+        if input_ids is not None:
+            # Remove text embeddings
+            hidden_states = hidden_states[:, tf.shape(text_embeds)[1]:]
+            
         # Remove time token
-        x = x[:, 1:]  # [B, H*W, C]
+        hidden_states = hidden_states[:, 1:]
+        
+        # Final layer
+        output = self.final_layer(hidden_states, t_emb)
         
         # Reshape to image dimensions
-        x = self.unpatchify(x, h, w)  # [B, H, W, C]
+        output = tf.reshape(output, [batch_size, h, w, self.out_channels])
         
-        return x
-        
-    def unpatchify(self, x, h, w):
-        """
-        x: (N, T, patch_size**2 * C)
-        imgs: (N, H, W, C)
-        """
-        p = self.patch_size
-        c = self.in_channels
-        
-        # Calculate dimensions
-        h_unpatched = h * p
-        w_unpatched = w * p
-        
-        # Reshape to image dimensions
-        x = tf.reshape(x, [-1, h, w, self.out_channels])  # [B, H, W, C]
-        
-        return x
+        return output
 
     @classmethod
     def from_pretrained(cls, model_name_or_path: str, **kwargs):
