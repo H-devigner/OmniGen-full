@@ -352,12 +352,22 @@ class OmniGen(tf.keras.Model):
         """Load model from pretrained weights with optimized memory usage."""
         print(f"Loading model weights...")
         
-        # Get model weights file
-        weights_file = huggingface_hub.hf_hub_download(
-            repo_id=model_name_or_path,
-            filename="model.safetensors",
-            cache_dir=os.getenv("HF_HUB_CACHE", None)
-        )
+        # Handle local path vs HuggingFace repo
+        if os.path.exists(model_name_or_path):
+            weights_file = os.path.join(model_name_or_path, "model.safetensors")
+            if not os.path.exists(weights_file):
+                raise ValueError(f"Could not find model.safetensors in {model_name_or_path}")
+        else:
+            # Download from HuggingFace
+            try:
+                weights_file = huggingface_hub.hf_hub_download(
+                    repo_id=model_name_or_path,
+                    filename="model.safetensors",
+                    cache_dir=os.getenv("HF_HUB_CACHE", None)
+                )
+            except Exception as e:
+                print(f"Error downloading model: {str(e)}")
+                raise
         
         # Initialize model with default config
         model = cls(transformer_config=Phi3Config(), **kwargs)
