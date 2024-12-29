@@ -28,26 +28,18 @@ if gpus:
         print(f"GPU memory growth setting failed: {e}")
 
 class OmniGenPipeline:
-    """Pipeline for text-to-image generation using OmniGen."""
+    """OmniGen pipeline for text-to-image generation."""
     
-    def __init__(self, vae, model, scheduler, processor, device=None):
-        """Initialize pipeline."""
-        self.vae = vae
-        self.model = model
-        self.scheduler = scheduler
+    def __init__(self, processor=None, model=None):
+        """Initialize pipeline with memory optimizations.
+        
+        Args:
+            processor: OmniGenProcessor instance
+            model: OmniGen model instance
+        """
         self.processor = processor
-        
-        # Set device strategy
-        if device is None:
-            # Use GPU if available
-            if tf.config.list_physical_devices('GPU'):
-                device = '/GPU:0'
-                print("Using GPU for inference")
-            else:
-                device = '/CPU:0'
-                print("No GPU available, using CPU (this will be slow)")
-        
-        self.device = device
+        self.model = model
+        self.scheduler = OmniGenScheduler()
         self.model_cpu_offload = False
             
     @classmethod
@@ -109,12 +101,12 @@ class OmniGenPipeline:
         """Encode images using VAE with memory optimization."""
         if self.model_cpu_offload:
             with tf.device(self.device):
-                encoded = self.vae.encode(x)
+                encoded = self.model.vae.encode(x)
             # Clear GPU memory
             tf.keras.backend.clear_session()
             gc.collect()
         else:
-            encoded = self.vae.encode(x)
+            encoded = self.model.vae.encode(x)
         return tf.cast(encoded, dtype)
         
     def generate_latents(
@@ -310,17 +302,17 @@ class OmniGenPipeline:
             
             # Post-process samples
             samples = tf.cast(samples, tf.float32)
-            samples = samples / self.vae.config.scaling_factor
+            samples = samples / self.model.vae.config.scaling_factor
             
-            if hasattr(self.vae.config, 'shift_factor') and self.vae.config.shift_factor is not None:
-                samples = samples + self.vae.config.shift_factor
+            if hasattr(self.model.vae.config, 'shift_factor') and self.model.vae.config.shift_factor is not None:
+                samples = samples + self.model.vae.config.shift_factor
                 
             # Decode with VAE
             if self.model_cpu_offload:
                 with tf.device(self.device):
-                    samples = self.vae.decode(samples)
+                    samples = self.model.vae.decode(samples)
             else:
-                samples = self.vae.decode(samples)
+                samples = self.model.vae.decode(samples)
                 
             # Final processing
             samples = tf.clip_by_value(samples * 0.5 + 0.5, 0, 1)
@@ -344,7 +336,7 @@ class OmniGenPipeline:
             latents = 1 / 0.18215 * latents
             
             # Decode with VAE
-            images = self.vae.decode(latents)
+            images = self.model.vae.decode(latents)
             
             # Postprocess images
             images = (images / 2 + 0.5)

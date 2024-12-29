@@ -19,6 +19,7 @@ from dataclasses import fields
 import gc
 
 from omnigen_tf.transformer import Phi3Config, Phi3Transformer
+from diffusers.models import AutoencoderKL
 
 # Configure GPU memory growth
 gpus = tf.config.list_physical_devices('GPU')
@@ -240,6 +241,15 @@ class OmniGen(tf.keras.Model):
         # Initialize transformer
         self.transformer = Phi3Transformer(transformer_config, name="transformer")
 
+        # Initialize VAE
+        self.vae = AutoencoderKL(
+            in_channels=3,
+            out_channels=3,
+            latent_channels=4,
+            scaling_factor=0.18215,
+            name="vae"
+        )
+
     def call(
         self,
         inputs,
@@ -383,6 +393,13 @@ class OmniGen(tf.keras.Model):
                     del tensor
                     gc.collect()
             print("\nModel weights loaded successfully!")
+
+        # Load VAE weights
+        vae_dir = os.path.join(model_name_or_path, "vae")
+        if os.path.exists(vae_dir):
+            print("Loading VAE weights...")
+            model.vae = AutoencoderKL.from_pretrained(vae_dir)
+            print("VAE weights loaded successfully!")
 
         # Final memory cleanup
         if tf.config.list_physical_devices('GPU'):
