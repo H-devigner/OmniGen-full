@@ -20,6 +20,16 @@ import gc
 
 from omnigen_tf.transformer import Phi3Config, Phi3Transformer
 
+# Configure GPU memory growth
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print("GPU memory growth enabled")
+    except RuntimeError as e:
+        print(f"GPU memory growth setting failed: {e}")
+
 # Enable mixed precision globally
 policy = tf.keras.mixed_precision.Policy('mixed_float16')
 tf.keras.mixed_precision.set_global_policy(policy)
@@ -320,6 +330,7 @@ class OmniGen(tf.keras.Model):
         import json
         from huggingface_hub import snapshot_download
         from safetensors.tensorflow import load_file
+        import numpy as np
         
         # Get model path
         model_path = pretrained_model_name_or_path
@@ -370,31 +381,50 @@ class OmniGen(tf.keras.Model):
         if os.path.exists(weights_file):
             print("Loading weights from safetensors...")
             
-            # Load weights
-            state_dict = load_file(weights_file)
-            
-            # Map weights to TensorFlow format
-            for name, weight in state_dict.items():
-                try:
-                    # Let TensorFlow handle dtype conversion
-                    weight = tf.convert_to_tensor(weight)
-                    
-                    # Find corresponding layer in TF model
-                    if name.startswith('transformer.'):
-                        tf_name = name.replace('transformer.', 'transformer/')
-                    else:
-                        tf_name = name.replace('.', '/')
+            # Load weights on CPU first
+            with tf.device('/CPU:0'):
+                state_dict = load_file(weights_file)
+                
+                # Process weights in chunks to avoid OOM
+                for name, weight in state_dict.items():
+                    try:
+                        # Convert to numpy first to ensure CPU processing
+                        weight_np = weight.numpy()
                         
-                    # Get layer by name
-                    layer = model.get_layer(tf_name)
-                    if layer is not None:
-                        # Assign weights
-                        if 'weight' in name:
-                            layer.kernel.assign(weight)
-                        elif 'bias' in name:
-                            layer.bias.assign(weight)
-                except Exception as e:
-                    print(f"Warning: Could not load weight {name}: {str(e)}")
+                        # Process in chunks if tensor is large
+                        if weight_np.size > 1e6:  # Process in chunks if > 1M elements
+                            chunk_size = int(1e6)
+                            chunks = []
+                            
+                            for i in range(0, weight_np.size, chunk_size):
+                                end = min(i + chunk_size, weight_np.size)
+                                chunk = weight_np.flat[i:end]
+                                chunk_tensor = tf.convert_to_tensor(chunk, dtype=tf.float16)
+                                chunks.append(chunk_tensor)
+                            
+                            # Concatenate chunks and reshape back to original shape
+                            weight_tensor = tf.concat(chunks, axis=0)
+                            weight_tensor = tf.reshape(weight_tensor, weight_np.shape)
+                        else:
+                            # Small tensor - process directly
+                            weight_tensor = tf.convert_to_tensor(weight_np, dtype=tf.float16)
+                        
+                        # Find corresponding layer in TF model
+                        if name.startswith('transformer.'):
+                            tf_name = name.replace('transformer.', 'transformer/')
+                        else:
+                            tf_name = name.replace('.', '/')
+                            
+                        # Get layer by name
+                        layer = model.get_layer(tf_name)
+                        if layer is not None:
+                            # Assign weights
+                            if 'weight' in name:
+                                layer.kernel.assign(weight_tensor)
+                            elif 'bias' in name:
+                                layer.bias.assign(weight_tensor)
+                    except Exception as e:
+                        print(f"Warning: Could not load weight {name}: {str(e)}")
                     
             print("Weights loaded successfully!")
         else:
