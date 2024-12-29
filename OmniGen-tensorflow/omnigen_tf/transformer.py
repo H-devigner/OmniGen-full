@@ -190,6 +190,7 @@ class Phi3Transformer(layers.Layer):
         tf.print("Transformer input shapes:")
         tf.print("batch_size:", batch_size)
         tf.print("seq_length:", seq_length)
+        tf.print("inputs_embeds:", tf.shape(inputs_embeds))
         
         # Initialize hidden states and attention outputs
         hidden_states = inputs_embeds
@@ -226,8 +227,11 @@ class Phi3Transformer(layers.Layer):
                 training=training
             )
             
-            # Update hidden states
-            hidden_states = layer_outputs[0]
+            # Ensure hidden states maintain batch dimension
+            if len(tf.shape(layer_outputs[0])) == 2:
+                hidden_states = tf.expand_dims(layer_outputs[0], 0)
+            else:
+                hidden_states = layer_outputs[0]
             
             # Update attention outputs
             if output_attentions:
@@ -235,6 +239,8 @@ class Phi3Transformer(layers.Layer):
                 
         # Final layer norm
         hidden_states = tf.cast(self.ln_f(hidden_states), inputs_embeds.dtype)
+        
+        tf.print("Final hidden states shape:", tf.shape(hidden_states))
         
         # Add final hidden states
         if output_hidden_states:

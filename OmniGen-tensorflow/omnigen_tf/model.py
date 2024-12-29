@@ -391,6 +391,10 @@ class OmniGen(tf.keras.Model):
         
         # Process text input if provided
         if input_ids is not None:
+            # Add batch dimension if needed
+            if len(tf.shape(input_ids)) == 1:
+                input_ids = tf.expand_dims(input_ids, 0)
+                
             # Get text embeddings from transformer
             text_outputs = self.transformer(
                 input_ids=input_ids,
@@ -401,12 +405,21 @@ class OmniGen(tf.keras.Model):
             text_embeds = tf.cast(text_outputs.last_hidden_state, input_dtype)
             tf.print("text_embeds:", tf.shape(text_embeds))
             
+            # Ensure batch dimension is consistent
+            if len(tf.shape(text_embeds)) == 2:
+                text_embeds = tf.expand_dims(text_embeds, 0)
+            if tf.shape(text_embeds)[0] != batch_size:
+                text_embeds = tf.tile(text_embeds, [batch_size, 1, 1])
+                
             # Concatenate with image embeddings
             x = tf.concat([text_embeds, x], axis=1)
             tf.print("x after text concat:", tf.shape(x))
             
             # Update attention mask if needed
             if attention_mask is not None:
+                # Add batch dimension if needed
+                if len(tf.shape(attention_mask)) == 1:
+                    attention_mask = tf.expand_dims(attention_mask, 0)
                 # Create full attention mask
                 image_mask = tf.ones((batch_size, tf.shape(x)[1] - tf.shape(text_embeds)[1]))
                 attention_mask = tf.concat([attention_mask, image_mask], axis=1)
@@ -420,7 +433,13 @@ class OmniGen(tf.keras.Model):
                 position_ids=position_ids,
                 training=training
             )
+            # Ensure batch dimension is maintained
+            if len(tf.shape(hidden_states)) == 2:
+                hidden_states = tf.expand_dims(hidden_states, 0)
+                
         hidden_states = tf.cast(self.transformer.ln_f(hidden_states), input_dtype)
+        
+        tf.print("Final hidden states shape:", tf.shape(hidden_states))
         
         # Process output
         if input_ids is not None:
