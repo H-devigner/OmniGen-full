@@ -7,6 +7,7 @@ import tensorflow as tf
 from PIL import Image
 from typing import List, Optional, Union
 from huggingface_hub import snapshot_download
+import json
 
 from omnigen_tf.model import OmniGen
 from omnigen_tf.scheduler import OmniGenScheduler
@@ -50,30 +51,34 @@ class OmniGenPipeline:
         self.model_cpu_offload = False
             
     @classmethod
-    def from_pretrained(cls, model_name):
-        """Load pretrained model with proper error handling."""
-        try:
-            if not os.path.exists(model_name):
-                print(f"Model not found at {model_name}, downloading from HuggingFace...")
-                cache_folder = os.getenv('HF_HUB_CACHE', os.path.expanduser('~/.cache/huggingface/hub'))
-                model_name = snapshot_download(
-                    repo_id=model_name,
-                    cache_dir=cache_folder,
-                    allow_patterns=["*.json", "*.bin", "*.pt", "*.pth", "*.safetensors"]
-                )
-                
-            # Initialize components
-            processor = OmniGenProcessor.from_pretrained(model_name)
-            scheduler = OmniGenScheduler()
-            model = OmniGen.from_pretrained(model_name)
-            vae = model.get_vae()
+    def from_pretrained(cls, model_name, **kwargs):
+        """Load pipeline from pretrained model with optimized memory usage."""
+        if not os.path.exists(model_name):
+            cache_folder = os.getenv('HF_HUB_CACHE')
+            model_name = snapshot_download(
+                repo_id=model_name,
+                cache_dir=cache_folder,
+                local_files_only=True
+            )
             
-            return cls(vae, model, scheduler, processor)
+        # Load processor with optimized settings
+        processor = OmniGenProcessor.from_pretrained(model_name)
+        
+        # Load model config
+        config_file = os.path.join(model_name, "config.json")
+        with open(config_file, 'r') as f:
+            config = json.load(f)
+        
+        # Create model with optimized memory settings
+        model = OmniGen.from_pretrained(model_name, **kwargs)
+        
+        # Clear memory after loading
+        if tf.config.list_physical_devices('GPU'):
+            tf.keras.backend.clear_session()
+        gc.collect()
+        
+        return cls(processor=processor, model=model)
             
-        except Exception as e:
-            print(f"Error loading model: {str(e)}")
-            raise
-
     def enable_model_cpu_offload(self):
         """Enable model CPU offloading to save GPU memory."""
         self.model_cpu_offload = True

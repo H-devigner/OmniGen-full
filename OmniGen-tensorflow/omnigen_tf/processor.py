@@ -3,6 +3,7 @@
 import os
 import re
 import logging
+import gc
 from typing import Dict, List, Union, Optional, Tuple
 import json
 import random
@@ -78,16 +79,28 @@ class OmniGenProcessor:
         
     @classmethod
     def from_pretrained(cls, model_name):
-        """Load processor from pretrained model."""
+        """Load processor from pretrained model with optimized memory usage."""
         if not os.path.exists(model_name):
             cache_folder = os.getenv('HF_HUB_CACHE')
             model_name = snapshot_download(
                 repo_id=model_name,
                 cache_dir=cache_folder,
-                allow_patterns="*.json"
+                allow_patterns="*.json",
+                local_files_only=True  # Prevent unnecessary downloads
             )
             
-        text_tokenizer = AutoTokenizer.from_pretrained(model_name)
+        # Load tokenizer with optimized settings
+        text_tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            local_files_only=True,  # Prevent unnecessary downloads
+            use_fast=True  # Use faster tokenizer implementation
+        )
+        
+        # Clear any cached tensors
+        if tf.config.list_physical_devices('GPU'):
+            tf.keras.backend.clear_session()
+            gc.collect()
+            
         return cls(text_tokenizer)
     
     @tf.function(jit_compile=True)

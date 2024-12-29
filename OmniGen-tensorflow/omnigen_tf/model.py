@@ -324,118 +324,61 @@ class OmniGen(tf.keras.Model):
         return x
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs):
-        """Load pretrained model from HuggingFace Hub or local path."""
-        import os
-        import json
-        from huggingface_hub import snapshot_download
-        from safetensors.tensorflow import load_file
-        import gc
-        
-        # Get model path
-        model_path = pretrained_model_name_or_path
-        if not os.path.exists(model_path):
-            cache_folder = os.getenv('HF_HUB_CACHE', None)
-            model_path = snapshot_download(
-                repo_id=pretrained_model_name_or_path,
+    def from_pretrained(cls, model_name_or_path: str, **kwargs):
+        """Load model from pretrained weights with optimized memory usage."""
+        if not os.path.exists(model_name_or_path):
+            cache_folder = os.getenv('HF_HUB_CACHE')
+            model_name_or_path = snapshot_download(
+                repo_id=model_name_or_path,
                 cache_dir=cache_folder,
-                ignore_patterns=['flax_model.msgpack', 'rust_model.ot', 'tf_model.h5']
+                local_files_only=True
             )
-            
+
         # Load config
-        config_path = os.path.join(model_path, "config.json")
-        if os.path.exists(config_path):
-            with open(config_path, 'r') as f:
-                config_dict = json.load(f)
-        else:
-            config_dict = {}
-            
-        # Update config with kwargs
-        config_dict.update(kwargs)
-        
-        # Ensure required config values are present
-        default_config = {
-            "hidden_size": 3072,
-            "intermediate_size": 12288,
-            "num_attention_heads": 48,
-            "num_hidden_layers": 32,
-            "layer_norm_eps": 1e-5,
-            "hidden_act": "gelu",
-            "initializer_range": 0.02,
-            "attention_probs_dropout_prob": 0.0,
-            "hidden_dropout_prob": 0.0,
-            "max_position_embeddings": 2048,
-        }
-        
-        # Update config with defaults for missing values
-        for key, value in default_config.items():
-            if key not in config_dict:
-                config_dict[key] = value
-                print(f"Using default value for {key}: {value}")
-        
-        # Create model
-        model = cls(transformer_config=config_dict)
-        
-        # Load weights
-        weights_file = os.path.join(model_path, "model.safetensors")
+        config_file = os.path.join(model_name_or_path, "config.json")
+        with open(config_file, 'r') as f:
+            config = json.load(f)
+
+        # Initialize model
+        model = cls(
+            transformer_config=config,
+            **kwargs
+        )
+
+        # Load weights efficiently
+        weights_file = os.path.join(model_name_or_path, "model.safetensors")
         if os.path.exists(weights_file):
-            print("Loading weights from safetensors...")
-            
-            # Load weights on CPU first
-            with tf.device('/CPU:0'):
-                # Load all weights at once
-                state_dict = load_file(weights_file)
-                
-                # Group weights by layer
-                layer_groups = {}
-                for key in state_dict.keys():
-                    layer_name = key.split('.')[0]
-                    if layer_name not in layer_groups:
-                        layer_groups[layer_name] = []
-                    layer_groups[layer_name].append(key)
-                
-                # Load weights layer by layer
-                for layer_name, keys in layer_groups.items():
-                    print(f"Loading {layer_name} weights...")
-                    
-                    # Load weights for current layer
-                    for key in keys:
-                        try:
-                            # Get weight tensor
-                            weight = state_dict[key]
-                            
-                            # Convert to float16 for GPU memory efficiency
-                            weight = tf.cast(weight, tf.float16)
-                            
-                            # Find corresponding layer in TF model
-                            if key.startswith('transformer.'):
-                                tf_name = key.replace('transformer.', 'transformer/')
-                            else:
-                                tf_name = key.replace('.', '/')
-                                
-                            # Get layer by name
-                            layer = model.get_layer(tf_name)
-                            if layer is not None:
-                                # Assign weights
-                                if 'weight' in key:
-                                    layer.kernel.assign(weight)
-                                elif 'bias' in key:
-                                    layer.bias.assign(weight)
-                            
-                            # Clear memory
-                            del weight
-                            gc.collect()
-                            
-                        except Exception as e:
-                            print(f"Warning: Could not load weight {key}: {str(e)}")
-                    
-                    # Clear memory after each layer
+            # Load safetensors metadata first
+            with open(weights_file, 'rb') as f:
+                header = f.read(8)
+                header_size = int.from_bytes(header, 'little')
+                metadata = f.read(header_size).decode('utf-8')
+                metadata = json.loads(metadata)
+
+            # Load weights in chunks with memory cleanup
+            for tensor_name, tensor_info in metadata.items():
+                if hasattr(model, tensor_name):
+                    offset = tensor_info['data_offsets'][0]
+                    length = tensor_info['data_offsets'][1] - offset
+                    dtype = tensor_info['dtype']
+                    shape = tensor_info['shape']
+
+                    with open(weights_file, 'rb') as f:
+                        f.seek(8 + header_size + offset)
+                        tensor_bytes = f.read(length)
+                        tensor = np.frombuffer(tensor_bytes, dtype=dtype).reshape(shape)
+                        setattr(model, tensor_name, tf.convert_to_tensor(tensor))
+
+                    # Clear memory after each tensor
+                    del tensor_bytes
+                    del tensor
                     gc.collect()
-                
-            print("Weights loaded successfully!")
-        else:
-            print(f"No weights found at {weights_file}")
-            
+
+        # Final memory cleanup
+        if tf.config.list_physical_devices('GPU'):
+            tf.keras.backend.clear_session()
+        gc.collect()
+
         return model
 
 def get_2d_sincos_pos_embed(
