@@ -455,12 +455,18 @@ class MultiHeadAttention(layers.Layer):
             
         # Compute attention scores
         scale = tf.cast(tf.math.sqrt(tf.cast(self.head_size, tf.float32)), hidden_states.dtype)
-        attention_scores = tf.matmul(query, tf.transpose(key, [0, 1, 3, 2])) / scale
+        attention_scores = tf.matmul(query, key, transpose_b=True) / scale
         
         tf.print("attention_scores shape:", tf.shape(attention_scores))
         
         # Apply attention mask if provided
         if attention_mask is not None:
+            # Convert attention mask to same dtype as hidden states and expand dims
+            attention_mask = tf.cast(attention_mask, hidden_states.dtype)
+            attention_mask = tf.expand_dims(tf.expand_dims(attention_mask, 1), 2)
+            
+            # Create causal mask that matches attention scores shape
+            attention_mask = (1.0 - attention_mask) * tf.cast(-1e4, attention_scores.dtype)
             attention_scores = attention_scores + attention_mask
             
         # Apply softmax
@@ -781,12 +787,12 @@ class OmniGenAttention(layers.Layer):
         
         # Add attention mask if provided
         if attention_mask is not None:
-            # Expand attention_mask: [batch_size, seq_length] -> [batch_size, 1, 1, seq_length]
-            attention_mask = tf.expand_dims(tf.expand_dims(attention_mask, axis=1), axis=1)
-            attention_mask = tf.cast(attention_mask, attn_weights.dtype)
+            # Convert attention mask to same dtype as hidden states and expand dims
+            attention_mask = tf.cast(attention_mask, hidden_states.dtype)
+            attention_mask = tf.expand_dims(tf.expand_dims(attention_mask, 1), 2)
             
-            # Convert mask of 0s and 1s to mask of -inf and 0s
-            attention_mask = (1.0 - attention_mask) * tf.cast(-10000.0, attention_mask.dtype)
+            # Create causal mask that matches attention scores shape
+            attention_mask = (1.0 - attention_mask) * tf.cast(-1e4, attention_scores.dtype)
             attn_weights = attn_weights + attention_mask
             
         # Normalize attention weights
