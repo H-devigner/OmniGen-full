@@ -651,13 +651,6 @@ class OmniGenAttention(layers.Layer):
         self.attention_dropout = layers.Dropout(config.attention_dropout)
         self.resid_dropout = layers.Dropout(config.hidden_dropout)
         
-    def _shape(self, tensor: tf.Tensor, seq_len: int, bsz: int):
-        """Reshape tensor for attention computation."""
-        return tf.transpose(
-            tf.reshape(tensor, (bsz, seq_len, self.num_attention_heads, self.head_dim)),
-            (0, 2, 1, 3)
-        )
-        
     def call(
         self,
         hidden_states,
@@ -670,56 +663,38 @@ class OmniGenAttention(layers.Layer):
     ):
         """Forward pass."""
         batch_size, seq_length = tf.shape(hidden_states)[0], tf.shape(hidden_states)[1]
-        
+
         # Project input to query, key, value
         qkv = self.qkv_proj(hidden_states)
-        qkv = tf.reshape(qkv, (batch_size, seq_length, 3, self.num_attention_heads, self.head_dim))
-        qkv = tf.transpose(qkv, perm=[2, 0, 3, 1, 4])
-        q, k, v = tf.unstack(qkv, axis=0)
-        
-        # Reuse past key and value if provided
-        if past_key_value is not None:
-            past_key, past_value = past_key_value
-            k = tf.concat([past_key, k], axis=2)
-            v = tf.concat([past_value, v], axis=2)
-            
-        # Save current key and value if needed
-        present = (k, v) if use_cache else None
-            
+        qkv = tf.reshape(qkv, [batch_size, seq_length, 3, self.num_attention_heads, self.head_dim])
+        qkv = tf.transpose(qkv, [2, 0, 3, 1, 4])  # [3, batch_size, num_heads, seq_length, head_dim]
+        query, key, value = tf.unstack(qkv, axis=0)  # Each has shape [batch_size, num_heads, seq_length, head_dim]
+
         # Compute attention scores
-        scale = tf.cast(1.0 / tf.math.sqrt(tf.cast(self.head_dim, tf.float32)), hidden_states.dtype)
-        attn_weights = tf.matmul(q, k, transpose_b=True) * scale  # [batch_size, num_heads, seq_length, seq_length]
-        
-        # Add attention mask if provided
+        attention_scores = tf.matmul(query, key, transpose_b=True)
+        attention_scores = attention_scores / tf.math.sqrt(float(self.head_dim))
+
+        # Apply attention mask if provided
         if attention_mask is not None:
-            # Expand attention_mask: [batch_size, seq_length] -> [batch_size, 1, 1, seq_length]
-            attention_mask = tf.expand_dims(tf.expand_dims(attention_mask, axis=1), axis=1)
-            attention_mask = tf.cast(attention_mask, attn_weights.dtype)
-            
-            # Convert mask of 0s and 1s to mask of -inf and 0s
-            attention_mask = (1.0 - attention_mask) * tf.cast(-10000.0, attention_mask.dtype)
-            attn_weights = attn_weights + attention_mask
-            
-        # Normalize attention weights
-        attn_weights = tf.nn.softmax(attn_weights, axis=-1)
-        attn_weights = self.attention_dropout(attn_weights, training=training)
-        
-        # Compute attention output
-        attn_output = tf.matmul(attn_weights, v)
-        attn_output = tf.transpose(attn_output, perm=[0, 2, 1, 3])
-        attn_output = tf.reshape(attn_output, (batch_size, seq_length, self.hidden_size))
-        
+            attention_mask = tf.cast(attention_mask, attention_scores.dtype)
+            attention_scores = attention_scores + attention_mask
+
+        # Compute attention probabilities
+        attention_probs = tf.nn.softmax(attention_scores, axis=-1)
+        attention_probs = self.attention_dropout(attention_probs, training=training)
+
+        # Compute context
+        context = tf.matmul(attention_probs, value)  # [batch_size, num_heads, seq_length, head_dim]
+        context = tf.transpose(context, [0, 2, 1, 3])  # [batch_size, seq_length, num_heads, head_dim]
+        context = tf.reshape(context, [batch_size, seq_length, self.hidden_size])
+
         # Project output
-        attn_output = self.o_proj(attn_output)
-        attn_output = self.resid_dropout(attn_output, training=training)
-        
-        outputs = (attn_output,)
+        output = self.o_proj(context)
+        output = self.resid_dropout(output, training=training)
+
         if output_attentions:
-            outputs += (attn_weights,)
-        if use_cache:
-            outputs += (present,)
-            
-        return outputs
+            return output, attention_probs
+        return output
 
 
 class OmniGenMLP(layers.Layer):

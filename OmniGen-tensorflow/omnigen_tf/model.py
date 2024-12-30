@@ -156,6 +156,23 @@ def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
     return emb.T  # [H*W, 4]
 
 
+def get_1d_sincos_pos_embed_from_grid(embed_dim, grid):
+    """
+    grid: [num_tokens]
+    embed_dim: output dimension for each position
+    """
+    omega = np.arange(embed_dim // 2, dtype=np.float32)
+    omega = 1. / (10000 ** (omega / (embed_dim // 2)))
+    
+    grid = grid.reshape(-1)
+    grid = grid[:, np.newaxis] * omega[np.newaxis, :]
+    emb = np.concatenate([np.sin(grid), np.cos(grid)], axis=1)
+    
+    if embed_dim % 2 == 1:  # Handle odd dimensions
+        emb = np.concatenate([emb, np.zeros([grid.shape[0], 1])], axis=1)
+    return emb
+
+
 class OmniGen(Model):
     """Diffusion model with a Transformer backbone."""
     
