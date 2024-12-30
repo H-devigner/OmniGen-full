@@ -227,72 +227,66 @@ class OmniGenPipeline:
 
     def __call__(
         self,
-        prompt,
-        input_images=None,
-        height=512,
-        width=512,
-        num_inference_steps=20,
-        guidance_scale=7.5,
-        use_img_guidance=False,
-        img_guidance_scale=1.5,
-        max_input_image_size=768,
-        separate_cfg_infer=False,
-        offload_model=False,
-        use_kv_cache=False,
-        offload_kv_cache=False,
-        use_input_image_size_as_output=False,
-        seed=None,
-        output_type="pil"
+        prompt: Union[str, List[str]],
+        input_images: Optional[Union[List[str], List[List[str]]]] = None,
+        height: int = 1024,
+        width: int = 1024,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 3,
+        use_img_guidance: bool = True,
+        img_guidance_scale: float = 1.6,
+        max_input_image_size: int = 1024,
+        separate_cfg_infer: bool = True,
+        offload_model: bool = False,
+        use_kv_cache: bool = True,
+        offload_kv_cache: bool = True,
+        use_input_image_size_as_output: bool = False,
+        seed: Optional[int] = None,
+        output_type: str = "pil"
     ):
-        """Generate images with OmniGen."""
-        # Process input data
+        """Generate images with memory optimizations."""
+        # Input validation
+        if height % 16 != 0 or width % 16 != 0:
+            raise ValueError("Height and width must be multiples of 16")
+            
+        if input_images is None:
+            use_img_guidance = False
+            
         if isinstance(prompt, str):
             prompt = [prompt]
+            input_images = [input_images] if input_images is not None else None
             
-        input_data = self.processor.process_text(
-            prompt=prompt,
-            max_length=77,
-            return_tensors="tf"
-        )
+        # Process inputs
+        input_data = self.processor.process_text(prompt)
         
-        # Handle input images if provided
-        if input_images is not None:
-            image_data = self.processor.process_images(
-                images=input_images,
-                height=height,
-                width=width,
-                max_input_image_size=max_input_image_size,
-                use_input_image_size_as_output=use_input_image_size_as_output
-            )
-            input_data.update(image_data)
-        
-        # Set random seed if provided
         if seed is not None:
             tf.random.set_seed(seed)
             
-        # Get batch size
-        batch_size = len(input_data["input_ids"])
-        
-        # Create timesteps
-        scheduler = self.scheduler
-        timesteps = scheduler.timesteps
-        latents = tf.random.normal([batch_size, height // 8, width // 8, 4])
-        
-        # Scale the initial noise by the standard deviation required by the scheduler
-        latents = latents * tf.cast(scheduler.init_noise_sigma, latents.dtype)
-        
-        # Prepare extra step kwargs
-        extra_step_kwargs = {}
-        if "eta" in set(inspect.signature(scheduler.step).parameters.keys()):
-            extra_step_kwargs["eta"] = 0.0
+        # Setup model offloading if requested
+        if offload_model:
+            self.enable_model_cpu_offload()
+        else:
+            self.disable_model_cpu_offload()
             
+        # Generate initial latents
+        num_prompt = len(prompt)
         num_cfg = 2 if guidance_scale > 1.0 else 1
+        latent_size_h, latent_size_w = height // 8, width // 8
         
+        # Generate on device then move to CPU if needed
+        with tf.device(self.device):
+            latents = tf.random.normal(
+                [num_prompt, latent_size_h, latent_size_w, 4],
+                dtype=tf.float32
+            )
+            latents = latents * tf.cast(self.scheduler.init_noise_sigma, latents.dtype)
+            
         # Denoising loop
-        for i, t in enumerate(timesteps):
-            # Expand latents for classifier free guidance
+        timesteps = self.scheduler.timesteps
+        for t in timesteps:
+            # Expand for classifier free guidance
             latent_model_input = tf.repeat(latents, num_cfg, axis=0)
-            latent_model_input = scheduler.scale_model_input(latent_model_input, t)
+            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
             
             # Get model prediction
             if separate_cfg_infer:
@@ -303,7 +297,6 @@ class OmniGenPipeline:
                         chunk,
                         input_data['input_ids'],
                         input_data.get('attention_mask'),
-                        input_data.get('position_ids'),
                         guidance_scale=guidance_scale,
                         training=False
                     )
@@ -314,7 +307,6 @@ class OmniGenPipeline:
                     latent_model_input,
                     input_data['input_ids'],
                     input_data.get('attention_mask'),
-                    input_data.get('position_ids'),
                     guidance_scale=guidance_scale,
                     training=False
                 )
@@ -325,7 +317,7 @@ class OmniGenPipeline:
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
                 
             # Compute previous noisy sample x_t -> x_t-1
-            latents = scheduler.step(noise_pred, t, latents, **extra_step_kwargs)
+            latents = self.scheduler.step(noise_pred, t, latents)
             
         # Scale and decode the image latents with vae
         latents = 1 / 0.18215 * latents
