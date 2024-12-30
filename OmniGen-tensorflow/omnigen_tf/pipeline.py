@@ -275,11 +275,14 @@ class OmniGenPipeline:
         
         # Generate on device then move to CPU if needed
         with tf.device(self.device):
+            # Generate latents with proper dtype
             latents = tf.random.normal(
                 [num_prompt, latent_size_h, latent_size_w, 4],
-                dtype=tf.float32
+                dtype=self.model.dtype  # Use model's dtype
             )
-            latents = latents * tf.cast(self.scheduler.init_noise_sigma, latents.dtype)
+            # Cast scheduler init_noise_sigma to model dtype
+            init_noise_sigma = tf.cast(self.scheduler.init_noise_sigma, self.model.dtype)
+            latents = latents * init_noise_sigma
             
         # Prepare unconditional input
         if guidance_scale > 1.0:

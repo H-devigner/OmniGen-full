@@ -155,11 +155,17 @@ class OmniGenScheduler:
         
     def scale_model_input(self, sample, timestep):
         """Scale the model input according to the timestep."""
+        # Get step index and ensure proper dtype
         step_index = tf.where(self.timesteps == timestep)[0][0]
-        sigma = tf.math.sqrt(1.0 / self.alphas_cumprod[step_index] - 1.0)
         
-        # Scale input
-        sample = sample / ((sigma * sigma + 1) ** 0.5)
+        # Calculate sigma and ensure proper dtype
+        alpha_cumprod = tf.cast(self.alphas_cumprod[step_index], sample.dtype)
+        sigma = tf.cast(tf.sqrt(1.0 / alpha_cumprod - 1.0), sample.dtype)
+        
+        # Scale input with proper dtype
+        scale_factor = tf.cast(tf.sqrt(sigma * sigma + 1.0), sample.dtype)
+        sample = sample / scale_factor
+        
         return sample
         
     def step(self, model_output, timestep, sample):
