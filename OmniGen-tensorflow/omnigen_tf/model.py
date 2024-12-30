@@ -314,7 +314,17 @@ class OmniGen(Model):
                 ignore_patterns=['flax_model.msgpack', 'rust_model.ot', 'tf_model.h5']
             )
             
-        config = Phi3Config.from_pretrained(model_name)
+        # Load configuration
+        config_path = os.path.join(model_name, 'config.json')
+        with open(config_path, 'r') as f:
+            config_dict = json.load(f)
+
+        # Determine configuration type
+        if config_dict.get('model_type') == 'phi3':
+            config = Phi3Config.from_pretrained(model_name)
+        else:
+            raise ValueError(f"Unsupported model type: {config_dict.get('model_type')}")
+
         model = cls(config)
         
         # Load weights
