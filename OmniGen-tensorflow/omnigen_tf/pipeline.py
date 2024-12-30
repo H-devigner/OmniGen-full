@@ -281,22 +281,30 @@ class OmniGenPipeline:
             )
             latents = latents * tf.cast(self.scheduler.init_noise_sigma, latents.dtype)
             
+        # Prepare unconditional input
+        if guidance_scale > 1.0:
+            uncond_input = self.processor.process_text([""] * num_prompt)
+            input_data = {
+                "input_ids": tf.concat([uncond_input["input_ids"], input_data["input_ids"]], axis=0),
+                "attention_mask": tf.concat([uncond_input["attention_mask"], input_data["attention_mask"]], axis=0)
+            }
+            
         # Denoising loop
         timesteps = self.scheduler.timesteps
         for t in timesteps:
             # Expand for classifier free guidance
-            latent_model_input = tf.repeat(latents, num_cfg, axis=0)
+            latent_model_input = tf.repeat(latents, num_cfg, axis=0) if guidance_scale > 1.0 else latents
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
             
             # Get model prediction
             if separate_cfg_infer:
                 noise_pred = []
-                for i in range(0, len(latents), num_cfg):
-                    chunk = latents[i:i + num_cfg]
+                for i in range(0, len(latent_model_input), num_cfg):
+                    chunk = latent_model_input[i:i + num_cfg]
                     chunk_result = self.model(
                         chunk,
-                        input_data['input_ids'],
-                        input_data.get('attention_mask'),
+                        input_data['input_ids'][i:i + num_cfg],
+                        input_data.get('attention_mask')[i:i + num_cfg] if input_data.get('attention_mask') is not None else None,
                         guidance_scale=guidance_scale,
                         training=False
                     )
@@ -313,7 +321,7 @@ class OmniGenPipeline:
                 
             # Perform guidance
             if guidance_scale > 1.0:
-                noise_pred_uncond, noise_pred_text = tf.split(noise_pred, 2)
+                noise_pred_uncond, noise_pred_text = tf.split(noise_pred, num_or_size_splits=2, axis=0)
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
                 
             # Compute previous noisy sample x_t -> x_t-1
