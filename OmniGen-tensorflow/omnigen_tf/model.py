@@ -45,24 +45,35 @@ def modulate(x, shift, scale):
 class TimestepEmbedder(layers.Layer):
     """Timestep embedder layer."""
     
-    def __init__(self, hidden_size=2048, **kwargs):
+    def __init__(self, hidden_size=2048, frequency_embedding_size=256, **kwargs):
         """Initialize layer."""
         super().__init__(**kwargs)
+        
+        self.frequency_embedding_size = frequency_embedding_size
         self.hidden_size = hidden_size
         
         # Initialize MLP layers
         self.mlp = tf.keras.Sequential([
-            layers.Dense(hidden_size * 4, activation="gelu", name="mlp_1"),
+            layers.Dense(hidden_size * 2, activation="swish", name="mlp_1"),
             layers.Dense(hidden_size, name="mlp_2")
         ], name="mlp")
         
     def call(self, timesteps):
         """Forward pass."""
-        # Convert timesteps to float32
-        timesteps = tf.cast(timesteps, tf.float32)
+        # Make sure timesteps has shape [B, 1]
+        if len(tf.shape(timesteps)) == 1:
+            timesteps = tf.expand_dims(timesteps, axis=-1)
+            
+        # Get frequency embedding
+        half_dim = self.frequency_embedding_size // 2
+        freqs = tf.math.exp(
+            -tf.math.log(10000.0) * tf.range(0, half_dim, dtype=tf.float32) / half_dim
+        )
+        args = tf.cast(timesteps, dtype=tf.float32) * tf.expand_dims(freqs, 0)
+        embedding = tf.concat([tf.math.cos(args), tf.math.sin(args)], axis=-1)
         
         # Project timesteps through MLP
-        time_embed = self.mlp(timesteps)
+        time_embed = self.mlp(embedding)
         
         return time_embed
 
