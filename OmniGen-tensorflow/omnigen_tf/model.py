@@ -211,17 +211,17 @@ class OmniGen(Model):
 
     def initialize_weights(self):
         """Initialize model weights."""
+        # Ensure Xavier uniform initialization for Dense layers
         def _basic_init(layer):
             if isinstance(layer, layers.Dense):
-                # Xavier uniform initialization
                 limit = tf.sqrt(6 / float(layer.input_shape[-1] + layer.units))
                 layer.kernel.assign(tf.random.uniform(
-                    layer.kernel.shape, -limit, limit, dtype=layer.dtype
+                    shape=layer.kernel.shape, minval=-limit, maxval=limit, dtype=layer.dtype
                 ))
                 if layer.use_bias:
                     layer.bias.assign(tf.zeros_like(layer.bias))
 
-        # Initialize patch embedders
+        # Initialize patch embedders with Xavier uniform initialization
         for embedder in [self.x_embedder, self.input_x_embedder]:
             w = embedder.proj.kernel
             w_flat = tf.reshape(w, [w.shape[0] * w.shape[1] * w.shape[2], w.shape[3]])
@@ -230,7 +230,7 @@ class OmniGen(Model):
             embedder.proj.kernel.assign(tf.reshape(w_init, w.shape))
             embedder.proj.bias.assign(tf.zeros_like(embedder.proj.bias))
 
-        # Initialize timestep embedding MLPs
+        # Initialize timestep embedding MLPs with normal distribution
         for embedder in [self.t_embedder, self.time_token]:
             for layer in embedder.mlp.layers:
                 if isinstance(layer, layers.Dense):
