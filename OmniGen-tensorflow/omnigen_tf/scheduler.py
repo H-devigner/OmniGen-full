@@ -168,16 +168,21 @@ class OmniGenScheduler:
         step_index = tf.where(self.timesteps == timestep)[0][0]
         prev_timestep = self.timesteps[step_index + 1] if step_index < len(self.timesteps) - 1 else 0
         
-        # Get alpha values
-        alpha = self.alphas_cumprod[timestep]
-        alpha_prev = self.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else tf.ones_like(alpha)
+        # Get alpha values and ensure proper dtype
+        alpha = tf.cast(self.alphas_cumprod[timestep], model_output.dtype)
+        alpha_prev = tf.cast(self.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else tf.ones_like(alpha), model_output.dtype)
         
         # Get beta value
-        beta = 1 - alpha / alpha_prev
+        beta = tf.cast(1 - alpha / alpha_prev, model_output.dtype)
         
         # Compute predicted original sample
         if self.prediction_type == "epsilon":
-            pred_original_sample = (sample - beta ** (0.5) * model_output) / alpha ** (0.5)
+            # Cast all tensors to same dtype as model_output
+            sample = tf.cast(sample, model_output.dtype)
+            beta_sqrt = tf.cast(tf.sqrt(beta), model_output.dtype)
+            alpha_sqrt = tf.cast(tf.sqrt(alpha), model_output.dtype)
+            
+            pred_original_sample = (sample - beta_sqrt * model_output) / alpha_sqrt
         elif self.prediction_type == "sample":
             pred_original_sample = model_output
         else:
@@ -187,11 +192,12 @@ class OmniGenScheduler:
         if self.clip_sample:
             pred_original_sample = tf.clip_by_value(pred_original_sample, -1, 1)
             
-        # Compute coefficients
-        sigma = beta ** (0.5)
+        # Compute coefficients with proper dtype
+        alpha_prev_sqrt = tf.cast(tf.sqrt(alpha_prev), model_output.dtype)
+        one_minus_alpha_prev_sqrt = tf.cast(tf.sqrt(1 - alpha_prev), model_output.dtype)
         
         # Compute predicted previous sample
-        pred_prev_sample = alpha_prev ** (0.5) * pred_original_sample + (1 - alpha_prev) ** (0.5) * model_output
+        pred_prev_sample = alpha_prev_sqrt * pred_original_sample + one_minus_alpha_prev_sqrt * model_output
         
         return pred_prev_sample
 
