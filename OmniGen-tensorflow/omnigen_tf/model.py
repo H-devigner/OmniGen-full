@@ -204,10 +204,18 @@ class OmniGen(Model):
 
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
 
-        self.initialize_weights()
+        # Ensure the configuration is compatible with the model type
+        if transformer_config.model_type != 'phi3':
+            raise ValueError(f"Configuration model type {transformer_config.model_type} is incompatible with Phi3 model.")
+
+        # Ensure the positional embedding size matches the configuration
+        if self.pos_embed_max_size != transformer_config.pos_embed_max_size:
+            raise ValueError(f"Positional embedding max size {self.pos_embed_max_size} does not match configuration {transformer_config.pos_embed_max_size}.")
 
         self.llm = Phi3Transformer(config=transformer_config)
         self.llm.config.use_cache = False
+
+        self.initialize_weights()
 
     def initialize_weights(self):
         """Initialize model weights."""
