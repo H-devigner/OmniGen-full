@@ -573,6 +573,19 @@ class OmniGenLayer(layers.Layer):
         self.post_attention_layernorm = layers.LayerNormalization(epsilon=1e-5, name="post_attention_layernorm")
         self.mlp = OmniGenMLP(config.hidden_size, config.intermediate_size, name="mlp")
         
+    def _merge_heads(self, x):
+        """Merge heads to [batch_size, seq_length, hidden_size]."""
+        # x is [batch_size, num_heads, seq_length, head_dim]
+        batch_size = tf.shape(x)[0]
+        seq_length = tf.shape(x)[2]
+
+        # Transpose to [batch_size, seq_length, num_heads, head_dim]
+        x = tf.transpose(x, [0, 2, 1, 3])
+
+        # Reshape to [batch_size, seq_length, hidden_size]
+        x = tf.reshape(x, [batch_size, seq_length, self.hidden_size])
+        return x
+        
     def call(
         self,
         hidden_states,
@@ -685,8 +698,9 @@ class OmniGenAttention(layers.Layer):
 
         # Compute context
         context = tf.matmul(attention_probs, value)  # [batch_size, num_heads, seq_length, head_dim]
-        context = tf.transpose(context, [0, 2, 1, 3])  # [batch_size, seq_length, num_heads, head_dim]
-        context = tf.reshape(context, [batch_size, seq_length, self.hidden_size])
+        context = OmniGenLayer._merge_heads(context)  # [batch_size, seq_length, hidden_size]
+        # context = tf.transpose(context, [0, 2, 1, 3])  # [batch_size, seq_length, num_heads, head_dim]
+        # context = tf.reshape(context, [batch_size, seq_length, self.hidden_size])
 
         # Project output
         output = self.o_proj(context)
