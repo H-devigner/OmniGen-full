@@ -184,131 +184,48 @@ class OmniGen(tf.keras.Model):
 
     def call(
         self,
-        inputs,
-        timestep,
-        input_ids=None,
-        attention_mask=None,
-        position_ids=None,
-        guidance_scale=None,
-        training=False,
-        **kwargs
-    ):
-        """Forward pass with classifier-free guidance support."""
-        # Get batch size
-        batch_size = tf.shape(inputs)[0]
-        
-        # Handle classifier-free guidance
-        if guidance_scale is not None and guidance_scale > 1.0:
-            # Duplicate inputs for classifier-free guidance
-            inputs = tf.concat([inputs] * 2, axis=0)
-            
-            # Ensure timestep is 1D before duplicating
-            timestep = tf.reshape(timestep, [batch_size, -1])
-            timestep = tf.tile(timestep, [2, 1])
-            
-            # Duplicate other inputs if provided
-            if input_ids is not None:
-                input_ids = tf.concat([input_ids] * 2, axis=0)
-            if attention_mask is not None:
-                attention_mask = tf.concat([attention_mask] * 2, axis=0)
-            if position_ids is not None:
-                position_ids = tf.concat([position_ids] * 2, axis=0)
-        
-        # Regular forward pass
-        outputs = self.forward_pass(
-            inputs,
-            timestep,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            training=training
-        )
-        
-        # Apply classifier-free guidance
-        if guidance_scale is not None and guidance_scale > 1.0:
-            # Split unconditional and conditional outputs
-            uncond_output, cond_output = tf.split(outputs, num_or_size_splits=2, axis=0)
-            
-            # Apply classifier-free guidance formula
-            return uncond_output + guidance_scale * (cond_output - uncond_output)
-            
-        return outputs
-
-    def forward_pass(
-        self,
         latents,
         timestep,
         input_ids=None,
         attention_mask=None,
-        position_ids=None,
+        guidance_scale=1.0,
         training=False,
     ):
-        """Model forward pass."""
-        # Get batch size and dimensions
+        """Forward pass."""
+        # Get batch size and ensure proper shape
         batch_size = tf.shape(latents)[0]
-        h = tf.shape(latents)[1]
-        w = tf.shape(latents)[2]
         
-        # Debug prints
-        tf.print("Input shapes:")
-        tf.print("latents:", tf.shape(latents))
-        tf.print("timestep:", tf.shape(timestep))
+        # Process timestep embeddings
+        t_emb = self.t_embedder(timestep)  # [B, D]
+        time_token = self.time_token(timestep)  # [B, D]
         
-        # Get input dtype
-        input_dtype = latents.dtype
-        
-        # Embed timesteps
-        t_emb = tf.cast(self.t_embedder(timestep), input_dtype)
-        time_token = tf.cast(self.time_token(timestep), input_dtype)  # Shape: [batch_size, embed_dim]
-        
-        tf.print("After embedding:")
-        tf.print("t_emb:", tf.shape(t_emb))
-        tf.print("time_token:", tf.shape(time_token))
-        
-        # Patch and embed input latents
-        x = self.x_embedder(latents)  # Shape: [batch_size, num_patches, embed_dim]
-        tf.print("x after embedding:", tf.shape(x))
+        # Process latent embeddings
+        x = self.x_embedder(latents)  # [B, H*W/64, D]
         
         # Add positional embeddings
-        if position_ids is None:
-            # Use default positional embeddings
-            pos_embed = get_2d_sincos_pos_embed(
-                self.transformer.config.hidden_size,
-                h // self.patch_size,
-                w // self.patch_size,
-                cls_token=False
-            )
-            pos_embed = tf.expand_dims(tf.convert_to_tensor(pos_embed, dtype=input_dtype), 0)
-            pos_embed = tf.tile(pos_embed, [batch_size, 1, 1])
-        else:
-            # Use provided position IDs
-            pos_embed = tf.cast(tf.gather(self.pos_embed, position_ids), input_dtype)
-            
-        tf.print("pos_embed:", tf.shape(pos_embed))
+        pos_embed = get_2d_sincos_pos_embed(
+            self.transformer.config.hidden_size,
+            tf.shape(latents)[1] // self.patch_size,
+            tf.shape(latents)[2] // self.patch_size,
+            cls_token=False
+        )
+        pos_embed = tf.expand_dims(tf.convert_to_tensor(pos_embed, dtype=latents.dtype), 0)
+        pos_embed = tf.tile(pos_embed, [batch_size, 1, 1])
         x = x + pos_embed
         
-        # Add time token - reshape to match batch dimension
-        time_token = tf.reshape(time_token, [batch_size, 1, -1])  # Shape: [batch_size, 1, embed_dim]
-        tf.print("time_token reshaped:", tf.shape(time_token))
-        tf.print("x before concat:", tf.shape(x))
-        x = tf.concat([time_token, x], axis=1)
-        tf.print("x after concat:", tf.shape(x))
+        # Add time token
+        time_token = tf.expand_dims(time_token, axis=1)  # [B, 1, D]
+        x = tf.concat([time_token, x], axis=1)  # [B, H*W/64 + 1, D]
         
-        # Process text input if provided
+        # Process text if provided
         if input_ids is not None:
-            # Add batch dimension if needed
-            if len(tf.shape(input_ids)) == 1:
-                input_ids = tf.expand_dims(input_ids, 0)
-                
-            # Get text embeddings from transformer
+            # Process text embeddings
             text_outputs = self.transformer(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                position_ids=position_ids,
                 training=training
             )
-            text_embeds = tf.cast(text_outputs.last_hidden_state, input_dtype)
-            tf.print("text_embeds:", tf.shape(text_embeds))
+            text_embeds = tf.cast(text_outputs.last_hidden_state, latents.dtype)
             
             # Ensure batch dimension is consistent
             if len(tf.shape(text_embeds)) == 2:
@@ -316,51 +233,28 @@ class OmniGen(tf.keras.Model):
             if tf.shape(text_embeds)[0] != batch_size:
                 text_embeds = tf.tile(text_embeds, [batch_size, 1, 1])
                 
-            # Concatenate with image embeddings
-            x = tf.concat([text_embeds, x], axis=1)
-            tf.print("x after text concat:", tf.shape(x))
+            # Concatenate with latent embeddings
+            x = tf.concat([x, text_embeds], axis=1)  # [B, H*W/64 + 1 + L, D]
             
-            # Update attention mask if needed
-            if attention_mask is not None:
-                # Add batch dimension if needed
-                if len(tf.shape(attention_mask)) == 1:
-                    attention_mask = tf.expand_dims(attention_mask, 0)
-                # Create full attention mask
-                image_mask = tf.ones((batch_size, tf.shape(x)[1] - tf.shape(text_embeds)[1]))
-                attention_mask = tf.concat([attention_mask, image_mask], axis=1)
-        
-        # Pass through transformer blocks
-        hidden_states = x
+        # Apply transformer blocks
         for block in self.transformer.blocks:
-            hidden_states = block(
-                hidden_states,
+            x = block(
+                x,
                 attention_mask=attention_mask,
-                position_ids=position_ids,
                 training=training
             )
-            # Ensure batch dimension is maintained
-            if len(tf.shape(hidden_states)) == 2:
-                hidden_states = tf.expand_dims(hidden_states, 0)
-                
-        hidden_states = tf.cast(self.transformer.ln_f(hidden_states), input_dtype)
-        
-        tf.print("Final hidden states shape:", tf.shape(hidden_states))
-        
-        # Process output
-        if input_ids is not None:
-            # Remove text embeddings
-            hidden_states = hidden_states[:, tf.shape(text_embeds)[1]:]
             
-        # Remove time token
-        hidden_states = hidden_states[:, 1:]
+        # Project to latent space
+        x = self.final_layer(x, t_emb)  # [B, H*W/64 + 1 + L, D]
         
-        # Final layer
-        output = self.final_layer(hidden_states, t_emb)
+        # Extract latent output
+        latent_len = tf.shape(latents)[1] * tf.shape(latents)[2] // 64
+        x = x[:, :latent_len]  # [B, H*W/64, D]
         
-        # Reshape to image dimensions
-        output = tf.reshape(output, [batch_size, h, w, self.out_channels])
+        # Reshape to match input latents
+        x = tf.reshape(x, tf.shape(latents))  # [B, H, W, C]
         
-        return output
+        return x
 
     @classmethod
     def from_pretrained(cls, model_name_or_path: str, **kwargs):

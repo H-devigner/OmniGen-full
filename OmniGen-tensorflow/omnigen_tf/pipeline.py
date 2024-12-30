@@ -182,34 +182,42 @@ class OmniGenPipeline:
                     self.model.to_gpu()
             
             # Get model prediction
-            model_output = self.model(
-                latents,
-                t,
-                text_embeddings,
-                kv_cache=kv_cache,
-                training=False
-            )
-            
-            # Apply guidance
+            if separate_cfg_infer:
+                noise_pred = []
+                for i in range(0, len(latent_model_input), num_cfg):
+                    chunk = latent_model_input[i:i + num_cfg]
+                    chunk_input_ids = input_data['input_ids'][i:i + num_cfg]
+                    chunk_attention_mask = input_data.get('attention_mask')[i:i + num_cfg] if input_data.get('attention_mask') is not None else None
+                    
+                    # Get chunk prediction
+                    chunk_result = self.model(
+                        chunk,
+                        timesteps[i:i + num_cfg],
+                        input_ids=chunk_input_ids,
+                        attention_mask=chunk_attention_mask,
+                        guidance_scale=guidance_scale,
+                        training=False
+                    )
+                    noise_pred.append(chunk_result)
+                noise_pred = tf.concat(noise_pred, axis=0)
+            else:
+                # Single pass prediction
+                noise_pred = self.model(
+                    latent_model_input,
+                    timesteps,
+                    input_ids=input_data['input_ids'],
+                    attention_mask=input_data.get('attention_mask'),
+                    guidance_scale=guidance_scale,
+                    training=False
+                )
+                
+            # Perform guidance
             if guidance_scale > 1.0:
-                uncond_embeddings, cond_embeddings = text_embeddings
-                uncond_output = model_output[0]
-                cond_output = model_output[1]
+                noise_pred_uncond, noise_pred_text = tf.split(noise_pred, num_or_size_splits=2, axis=0)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
                 
-                # Classifier-free guidance
-                noise_pred = uncond_output + guidance_scale * (cond_output - uncond_output)
-                
-                # Image guidance if enabled
-                if use_img_guidance and img_guidance_scale > 0:
-                    img_output = model_output[2]
-                    noise_pred = noise_pred + img_guidance_scale * (img_output - uncond_output)
-            
-            # Scheduler step
-            latents = self.scheduler.step(
-                noise_pred,
-                t,
-                latents
-            )
+            # Compute previous noisy sample x_t -> x_t-1
+            latents = self.scheduler.step(noise_pred, timesteps, latents)
             
             # Offload KV cache if enabled
             if use_kv_cache and offload_kv_cache:
@@ -304,20 +312,27 @@ class OmniGenPipeline:
                 noise_pred = []
                 for i in range(0, len(latent_model_input), num_cfg):
                     chunk = latent_model_input[i:i + num_cfg]
+                    chunk_input_ids = input_data['input_ids'][i:i + num_cfg]
+                    chunk_attention_mask = input_data.get('attention_mask')[i:i + num_cfg] if input_data.get('attention_mask') is not None else None
+                    
+                    # Get chunk prediction
                     chunk_result = self.model(
                         chunk,
-                        input_data['input_ids'][i:i + num_cfg],
-                        input_data.get('attention_mask')[i:i + num_cfg] if input_data.get('attention_mask') is not None else None,
+                        timesteps[i:i + num_cfg],
+                        input_ids=chunk_input_ids,
+                        attention_mask=chunk_attention_mask,
                         guidance_scale=guidance_scale,
                         training=False
                     )
                     noise_pred.append(chunk_result)
                 noise_pred = tf.concat(noise_pred, axis=0)
             else:
+                # Single pass prediction
                 noise_pred = self.model(
                     latent_model_input,
-                    input_data['input_ids'],
-                    input_data.get('attention_mask'),
+                    timesteps,
+                    input_ids=input_data['input_ids'],
+                    attention_mask=input_data.get('attention_mask'),
                     guidance_scale=guidance_scale,
                     training=False
                 )
@@ -328,7 +343,7 @@ class OmniGenPipeline:
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
                 
             # Compute previous noisy sample x_t -> x_t-1
-            latents = self.scheduler.step(noise_pred, t, latents)
+            latents = self.scheduler.step(noise_pred, timesteps, latents)
             
         # Scale and decode the image latents with vae
         latents = 1 / 0.18215 * latents
