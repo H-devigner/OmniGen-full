@@ -168,28 +168,16 @@ class Phi3Transformer(TFPreTrainedModel):
     
     def prefetch_layer(self, layer_idx: int):
         """Starts prefetching the next layer cache."""
-        if not self._is_gpu_available:
-            return
-            
-        with tf.device('/GPU:0'):
-            layer = self.transformer.layers[layer_idx]
-            # Non-blocking transfer
-            for weight in layer.trainable_weights:
-                tf.identity(weight)
-    
+        # TensorFlow equivalent logic for prefetching
+        # Placeholder for potential prefetching logic
+        pass
+
     def evict_previous_layer(self, layer_idx: int):
         """Moves the previous layer cache to the CPU."""
-        if not self._is_gpu_available or layer_idx <= 0:
-            return
-            
-        with tf.device('/CPU:0'):
-            prev_layer = self.transformer.layers[layer_idx - 1]
-            for weight in prev_layer.trainable_weights:
-                tf.identity(weight)
-        
-        # Clear GPU memory
-        tf.keras.backend.clear_session()
-    
+        # TensorFlow equivalent logic for eviction
+        # Placeholder for potential eviction logic
+        pass
+
     def get_offload_layer(self, layer_idx: int):
         """Manages layer offloading for memory efficiency."""
         if not self._is_gpu_available:
@@ -266,121 +254,39 @@ class Phi3Transformer(TFPreTrainedModel):
         offload_model: Optional[bool] = False,
         training: bool = False,
     ) -> Union[Tuple[Any, ...], Dict[str, Any]]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both input_ids and inputs_embeds")
-            
         if input_ids is not None:
-            # Move embedding to CPU and cast to float16 for GPU operations
-            with tf.device('/CPU:0'):
-                inputs_embeds = tf.cast(self.wte(input_ids), tf.float16)
-            batch_size, seq_length = tf.shape(input_ids)[0], tf.shape(input_ids)[1]
-        elif inputs_embeds is not None:
-            # Cast inputs to float16 for GPU operations
-            inputs_embeds = tf.cast(inputs_embeds, tf.float16)
-            batch_size, seq_length = tf.shape(inputs_embeds)[0], tf.shape(inputs_embeds)[1]
-        else:
-            raise ValueError("You have to specify either input_ids or inputs_embeds")
+            inputs_embeds = self.wte(input_ids)
+        if inputs_embeds is None:
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-        # Generate position IDs on CPU
-        if position_ids is None:
-            with tf.device('/CPU:0'):
-                position_ids = tf.range(seq_length, dtype=tf.int32)[tf.newaxis, :]
-
-        # Handle cache conversion
-        return_legacy_cache = False
-        if use_cache and not isinstance(past_key_values, Cache):
-            return_legacy_cache = True
-            if past_key_values is None:
-                past_key_values = DynamicCache()
-            else:
-                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-
-        # Process attention mask with float16
-        if attention_mask is not None:
-            with tf.device('/CPU:0'):
-                attention_mask = tf.cast(attention_mask, tf.float16)
-                attention_mask = (1.0 - attention_mask) * tf.float16.min
-
-        # Initialize outputs
-        all_hidden_states = () if output_hidden_states else None
-        all_self_attns = () if output_attentions else None
-        next_decoder_cache = None
-
-        # Process on CPU first
-        with tf.device('/CPU:0'):
-            hidden_states = tf.cast(self.drop(inputs_embeds, training=training), tf.float16)
+        # Initialize cache if needed
+        if use_cache and past_key_values is None:
+            past_key_values = [None] * len(self.transformer.h)
 
         # Process through layers
-        for idx, layer in enumerate(self.transformer.layers):
-            if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states,)
+        for i, layer_module in enumerate(self.transformer.h):
+            past_key_value_layer = past_key_values[i] if past_key_values is not None else None
 
-            # Memory management
-            if offload_model and not training:
-                self.get_offload_layer(idx)
-
-            # Get layer cache
-            past_key_value = past_key_values[idx] if past_key_values is not None else None
-
-            # Process layer with float16
-            layer_outputs = layer(
-                hidden_states,
+            # Process layer
+            layer_outputs = layer_module(
+                inputs_embeds,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_value=past_key_value,
+                past_key_value=past_key_value_layer,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
-                training=training,
+                training=training
             )
 
-            if isinstance(layer_outputs, tuple):
-                hidden_states = layer_outputs[0]
-                self_attn = layer_outputs[1] if len(layer_outputs) > 1 else None
-                present_key_value = layer_outputs[2] if len(layer_outputs) > 2 else None
-            else:
-                hidden_states = layer_outputs
-                self_attn = None
-                present_key_value = None
-                
+            inputs_embeds = layer_outputs[0]
+
             if use_cache:
-                next_decoder_cache = next_decoder_cache + (present_key_value,) if next_decoder_cache is not None else (present_key_value,)
+                past_key_values[i] = layer_outputs[-1]
 
-            if output_attentions:
-                all_self_attns = all_self_attns + (self_attn,)
+        # Final layer norm
+        hidden_states = self.ln_f(inputs_embeds)
 
-            # Clear intermediate tensors
-            if tf.config.list_physical_devices('GPU'):
-                tf.keras.backend.clear_session()
-
-        # Final layer norm with float16
-        hidden_states = tf.cast(self.ln_f(hidden_states), tf.float16)
-
-        # Add final hidden state
-        if output_hidden_states:
-            all_hidden_states = all_hidden_states + (hidden_states,)
-
-        # Handle cache
-        if use_cache and return_legacy_cache and next_decoder_cache is not None:
-            next_decoder_cache = next_decoder_cache.to_legacy_cache()
-
-        # Clear any remaining GPU memory
-        if tf.config.list_physical_devices('GPU'):
-            tf.keras.backend.clear_session()
-
-        if not return_dict:
-            return tuple(v for v in [hidden_states, next_decoder_cache, all_hidden_states, all_self_attns] if v is not None)
-
-        return {
-            "last_hidden_state": hidden_states,
-            "past_key_values": next_decoder_cache,
-            "hidden_states": all_hidden_states,
-            "attentions": all_self_attns,
-        }
+        return hidden_states
         
     def get_config(self):
         """Get model configuration."""
