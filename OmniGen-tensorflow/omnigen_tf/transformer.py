@@ -365,7 +365,6 @@ class MultiHeadAttention(layers.Layer):
         
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
-        self.dropout = dropout
         self.head_size = hidden_size // num_attention_heads
         
         # Initialize query, key, value projections
@@ -374,10 +373,11 @@ class MultiHeadAttention(layers.Layer):
         self.v_proj = layers.Dense(hidden_size, use_bias=False, name="v_proj")
         
         # Initialize output projection
-        self.o_proj = layers.Dense(hidden_size, use_bias=False, name="o_proj")
+        self.out_proj = layers.Dense(hidden_size, use_bias=False, name="out_proj")
         
         # Initialize dropout
-        self.dropout = layers.Dropout(dropout)
+        self.attn_dropout = layers.Dropout(dropout)
+        self.resid_dropout = layers.Dropout(dropout)
         
     def _split_heads(self, x):
         """Split heads."""
@@ -393,9 +393,9 @@ class MultiHeadAttention(layers.Layer):
     def _merge_heads(self, x):
         """Merge heads."""
         batch_size = tf.shape(x)[0]
-        seq_length = tf.shape(x)[2]
+        seq_length = tf.shape(x)[2]  # Note: dimension 2 is seq_length after transpose
         
-        # Transpose back to [batch_size, seq_length, num_heads, head_size]
+        # Transpose from [batch_size, num_heads, seq_length, head_size] to [batch_size, seq_length, num_heads, head_size]
         x = tf.transpose(x, [0, 2, 1, 3])
         
         # Reshape to [batch_size, seq_length, hidden_size]
@@ -412,24 +412,12 @@ class MultiHeadAttention(layers.Layer):
         training=False,
     ):
         """Forward pass."""
-        # Add batch dimension if needed
-        if len(tf.shape(hidden_states)) == 2:
-            hidden_states = tf.expand_dims(hidden_states, 0)
-            
-        batch_size = tf.shape(hidden_states)[0]
-        seq_length = tf.shape(hidden_states)[1]
+        batch_size, seq_length = tf.shape(hidden_states)[0], tf.shape(hidden_states)[1]
         
-        tf.print("MultiHeadAttention input shape:", tf.shape(hidden_states))
-        
-        # Project query, key, value
+        # Project input for query, key, value
         query = self.q_proj(hidden_states)
         key = self.k_proj(hidden_states)
         value = self.v_proj(hidden_states)
-        
-        tf.print("After projection shapes:")
-        tf.print("query:", tf.shape(query))
-        tf.print("key:", tf.shape(key))
-        tf.print("value:", tf.shape(value))
         
         # Split heads
         query = self._split_heads(query)
@@ -441,41 +429,24 @@ class MultiHeadAttention(layers.Layer):
         tf.print("key:", tf.shape(key))
         tf.print("value:", tf.shape(value))
         
-        # Use past key value if provided
-        if past_key_value is not None:
-            past_key, past_value = past_key_value
-            key = tf.concat([past_key, key], axis=2)
-            value = tf.concat([past_value, value], axis=2)
-            
-        # Save current key, value if using cache
-        if use_cache:
-            present_key_value = (key, value)
-        else:
-            present_key_value = None
-            
         # Compute attention scores
-        scale = tf.cast(tf.math.sqrt(tf.cast(self.head_size, tf.float32)), hidden_states.dtype)
-        attention_scores = tf.matmul(query, key, transpose_b=True) / scale
-        
-        tf.print("attention_scores shape:", tf.shape(attention_scores))
+        attention_scores = tf.matmul(query, key, transpose_b=True)
+        attention_scores = attention_scores * tf.cast(1.0 / tf.math.sqrt(tf.cast(self.head_size, tf.float32)), attention_scores.dtype)
         
         # Apply attention mask if provided
         if attention_mask is not None:
-            # Convert attention mask to same dtype as hidden states and expand dims
             attention_mask = tf.cast(attention_mask, hidden_states.dtype)
             attention_mask = tf.expand_dims(tf.expand_dims(attention_mask, 1), 2)
-            
-            # Create causal mask that matches attention scores shape
             attention_mask = (1.0 - attention_mask) * tf.cast(-1e4, attention_scores.dtype)
             attention_scores = attention_scores + attention_mask
-            
+        
         # Apply softmax
         attention_probs = tf.nn.softmax(attention_scores, axis=-1)
         
         # Apply dropout
-        attention_probs = self.dropout(attention_probs, training=training)
+        attention_probs = self.attn_dropout(attention_probs, training=training)
         
-        # Apply attention to values
+        # Compute context
         context = tf.matmul(attention_probs, value)
         
         tf.print("context shape before merge:", tf.shape(context))
@@ -483,20 +454,11 @@ class MultiHeadAttention(layers.Layer):
         # Merge heads
         context = self._merge_heads(context)
         
-        tf.print("context shape after merge:", tf.shape(context))
+        # Project output
+        output = self.out_proj(context)
+        output = self.resid_dropout(output, training=training)
         
-        # Apply output projection
-        output = self.o_proj(context)
-        
-        tf.print("output shape:", tf.shape(output))
-        
-        outputs = (output,)
-        if output_attentions:
-            outputs += (attention_probs,)
-        if use_cache:
-            outputs += (present_key_value,)
-            
-        return outputs[0] if len(outputs) == 1 else outputs
+        return output
 
 
 class OmniGenTransformer(layers.Layer):
