@@ -31,60 +31,67 @@ class ProcessorConfig:
         self.memory_growth = True
 
 class OmniGenProcessor:
-    """TensorFlow processor for OmniGen model with PyTorch equivalence."""
+    """Processor for OmniGen model."""
     
-    def __init__(self, text_tokenizer, max_image_size: int = 1024):
-        """Initialize processor with memory optimization.
+    def __init__(self, tokenizer=None):
+        """Initialize processor."""
+        self.tokenizer = tokenizer or AutoTokenizer.from_pretrained("microsoft/phi-2")
         
-        Args:
-            text_tokenizer: Tokenizer for text processing
-            max_image_size: Maximum image size
-        """
-        self.text_tokenizer = text_tokenizer
-        self.max_image_size = max_image_size
-        
-        # Setup optimized image processing
-        self._setup_image_transform()
-        
-        # Initialize collators
-        self.collator = OmniGenCollator()
-        self.separate_collator = OmniGenSeparateCollator()
-        
-    def _setup_image_transform(self):
-        """Setup image transformation pipeline to match PyTorch exactly."""
-        def normalize(x):
-            """Normalize exactly like PyTorch."""
-            x = tf.cast(x, tf.float32)
-            mean = tf.constant([0.5, 0.5, 0.5], dtype=tf.float32)
-            std = tf.constant([0.5, 0.5, 0.5], dtype=tf.float32)
-            x = (x - mean) / std
-            return x
+    def process_text(self, prompt, max_length=77, return_tensors="tf"):
+        """Process text input."""
+        # Ensure prompt is a list
+        if isinstance(prompt, str):
+            prompt = [prompt]
             
-        self.image_transform = tf.keras.Sequential([
-            tf.keras.layers.Lambda(lambda x: crop_arr(x, self.max_image_size)),
-            tf.keras.layers.Lambda(lambda x: tf.cast(x, tf.float32) / 255.0),
-            tf.keras.layers.Lambda(normalize)
-        ])
+        # Tokenize text
+        text_inputs = self.tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=max_length,
+            truncation=True,
+            return_tensors=return_tensors
+        )
         
-    @classmethod
-    def from_pretrained(cls, model_name):
-        """Load processor from pretrained model with optimized memory usage."""
-        if not os.path.exists(model_name):
-            print(f"Downloading tokenizer {model_name}...")
-            cache_folder = os.getenv('HF_HUB_CACHE')
-            try:
-                model_name = snapshot_download(
-                    repo_id=model_name,
-                    cache_dir=cache_folder,
-                    allow_patterns="*.json"
-                )
-            except Exception as e:
-                print(f"Error downloading tokenizer: {str(e)}")
-                raise
+        return text_inputs
+        
+    def process_images(self, images, height=512, width=512, max_input_image_size=768, use_input_image_size_as_output=False):
+        """Process image input."""
+        if not isinstance(images, list):
+            images = [images]
+            
+        processed_images = []
+        for image in images:
+            # Load image if path is provided
+            if isinstance(image, str):
+                image = Image.open(image).convert('RGB')
                 
-        text_tokenizer = AutoTokenizer.from_pretrained(model_name)
-        return cls(text_tokenizer)
-
+            # Resize image
+            if use_input_image_size_as_output:
+                w, h = image.size
+                height = h
+                width = w
+            else:
+                # Scale down if larger than max size
+                if max(height, width) > max_input_image_size:
+                    scale = max_input_image_size / max(height, width)
+                    height = int(height * scale)
+                    width = int(width * scale)
+                    
+            # Resize and convert to tensor
+            image = image.resize((width, height), Image.LANCZOS)
+            image = np.array(image)
+            image = (image / 127.5) - 1.0
+            processed_images.append(image)
+            
+        # Stack images and convert to tensor
+        image_tensor = tf.stack(processed_images)
+        
+        return {
+            "pixel_values": image_tensor,
+            "height": height,
+            "width": width
+        }
+        
     def add_prefix_instruction(self, prompt: str) -> str:
         """Add instruction prefix exactly like PyTorch."""
         user_prompt = '''
@@ -92,27 +99,6 @@ class OmniGenProcessor:
 '''
         return user_prompt + prompt
 
-    def process_image(self, image) -> tf.Tensor:
-        """Process image with XLA optimization.
-        
-        Args:
-            image: PIL Image, file path, or tensor
-            
-        Returns:
-            Processed image tensor
-        """
-        if isinstance(image, str):
-            image = tf.io.read_file(image)
-            image = tf.image.decode_image(image, channels=3)
-        elif isinstance(image, Image.Image):
-            image = tf.convert_to_tensor(np.array(image))
-            
-        # Process with memory optimization
-        with tf.device("/GPU:0" if tf.config.list_physical_devices('GPU') else "/CPU:0"):
-            image = self.image_transform(image)
-            
-        return image
-    
     def process_multi_modal_prompt(
         self, 
         text: str,
@@ -124,7 +110,7 @@ class OmniGenProcessor:
         
         # Handle text-only case
         if not input_images:
-            model_inputs = self.text_tokenizer(text)
+            model_inputs = self.process_text(text)
             return {
                 "input_ids": model_inputs["input_ids"],
                 "pixel_values": None,
@@ -135,7 +121,7 @@ class OmniGenProcessor:
         pattern = r"<\|image_\d+\|>"
         chunks = re.split(pattern, text)
         prompt_chunks = [
-            self.text_tokenizer(chunk)["input_ids"] for chunk in chunks
+            self.process_text(chunk)["input_ids"] for chunk in chunks
         ]
         
         # Remove BOS token from non-first chunks
@@ -163,7 +149,7 @@ class OmniGenProcessor:
         processed_images = []
         for idx in image_ids:
             img = input_images[idx - 1]
-            processed_images.append(self.process_image(img))
+            processed_images.append(self.process_images(img)["pixel_values"])
             
         # Build combined sequence
         all_input_ids = []
@@ -183,29 +169,27 @@ class OmniGenProcessor:
             "image_sizes": img_positions
         }
     
-    def process_text(self, prompt, max_length=77):
-        """Process text input with PyTorch equivalence."""
-        # Handle single prompt
-        if isinstance(prompt, str):
-            prompt = [prompt]
-            
-        # Add instruction prefix
-        prompt = [self.add_prefix_instruction(p) for p in prompt]
-            
-        # Tokenize exactly like PyTorch
-        text_inputs = self.text_tokenizer(
-            prompt,
-            padding="max_length",
-            max_length=max_length,
-            truncation=True,
-            return_tensors="tf"
-        )
+    def process_image(self, image) -> tf.Tensor:
+        """Process image with XLA optimization.
         
-        return {
-            "input_ids": text_inputs.input_ids,
-            "attention_mask": text_inputs.attention_mask
-        }
-
+        Args:
+            image: PIL Image, file path, or tensor
+            
+        Returns:
+            Processed image tensor
+        """
+        if isinstance(image, str):
+            image = tf.io.read_file(image)
+            image = tf.image.decode_image(image, channels=3)
+        elif isinstance(image, Image.Image):
+            image = tf.convert_to_tensor(np.array(image))
+            
+        # Process with memory optimization
+        with tf.device("/GPU:0" if tf.config.list_physical_devices('GPU') else "/CPU:0"):
+            image = self.process_images(image)["pixel_values"]
+            
+        return image
+    
 class OmniGenCollator:
     """TensorFlow collator with exact PyTorch equivalence."""
     

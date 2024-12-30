@@ -246,14 +246,25 @@ class OmniGenPipeline:
     ):
         """Generate images with OmniGen."""
         # Process input data
-        input_data = self.processor(
+        if isinstance(prompt, str):
+            prompt = [prompt]
+            
+        input_data = self.processor.process_text(
             prompt=prompt,
-            input_images=input_images,
-            height=height,
-            width=width,
-            max_input_image_size=max_input_image_size,
-            use_input_image_size_as_output=use_input_image_size_as_output
+            max_length=77,
+            return_tensors="tf"
         )
+        
+        # Handle input images if provided
+        if input_images is not None:
+            image_data = self.processor.process_images(
+                images=input_images,
+                height=height,
+                width=width,
+                max_input_image_size=max_input_image_size,
+                use_input_image_size_as_output=use_input_image_size_as_output
+            )
+            input_data.update(image_data)
         
         # Set random seed if provided
         if seed is not None:
