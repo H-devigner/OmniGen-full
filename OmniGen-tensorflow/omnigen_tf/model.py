@@ -42,30 +42,6 @@ def modulate(x, shift, scale):
     return x * (1 + tf.expand_dims(scale, 1)) + tf.expand_dims(shift, 1)
 
 
-class TimeToken(layers.Layer):
-    """Time token layer."""
-    
-    def __init__(self, hidden_size=2048, **kwargs):
-        """Initialize layer."""
-        super().__init__(**kwargs)
-        self.hidden_size = hidden_size
-        
-        # Initialize embedding layer
-        self.time_embed = layers.Dense(hidden_size, name="time_embed")
-        
-    def call(self, timesteps):
-        """Forward pass."""
-        # Convert timesteps to float32
-        timesteps = tf.cast(timesteps, tf.float32)
-        
-        # Project timesteps to embedding space
-        time_embed = self.time_embed(timesteps)
-        
-        tf.print("TimeToken output shape:", tf.shape(time_embed))
-        
-        return time_embed
-
-
 class TimestepEmbedder(layers.Layer):
     """Timestep embedder layer."""
     
@@ -181,7 +157,7 @@ class OmniGen(tf.keras.Model):
             hidden_size=transformer_config.hidden_size,
             name="t_embedder"
         )
-        self.time_token = TimeToken(
+        self.time_token = TimestepEmbedder(
             hidden_size=transformer_config.hidden_size,
             name="time_token"
         )
