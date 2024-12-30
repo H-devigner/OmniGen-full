@@ -8,6 +8,7 @@ from PIL import Image
 from typing import List, Optional, Union
 from huggingface_hub import snapshot_download
 import json
+import torch
 
 from omnigen_tf.model import OmniGen
 from omnigen_tf.scheduler import OmniGenScheduler
@@ -225,148 +226,125 @@ class OmniGenPipeline:
         return latents
 
     def __call__(
-            self,
-            prompt: Union[str, List[str]],
-            input_images: Optional[Union[List[str], List[List[str]]]] = None,
-            height: int = 1024,
-            width: int = 1024,
-            num_inference_steps: int = 50,
-            guidance_scale: float = 3,
-            use_img_guidance: bool = True,
-            img_guidance_scale: float = 1.6,
-            max_input_image_size: int = 1024,
-            separate_cfg_infer: bool = True,
-            offload_model: bool = False,
-            use_kv_cache: bool = True,
-            offload_kv_cache: bool = True,
-            use_input_image_size_as_output: bool = False,
-            seed: Optional[int] = None,
-            output_type: str = "pil"
+        self,
+        prompt,
+        input_images=None,
+        height=512,
+        width=512,
+        num_inference_steps=20,
+        guidance_scale=7.5,
+        use_img_guidance=False,
+        img_guidance_scale=1.5,
+        max_input_image_size=768,
+        separate_cfg_infer=False,
+        offload_model=False,
+        use_kv_cache=False,
+        offload_kv_cache=False,
+        use_input_image_size_as_output=False,
+        seed=None,
+        output_type="pil"
     ):
-        """Generate images with memory optimizations."""
-        # Input validation
-        if height % 16 != 0 or width % 16 != 0:
-            raise ValueError("Height and width must be multiples of 16")
-            
-        if input_images is None:
-            use_img_guidance = False
-            
-        if isinstance(prompt, str):
-            prompt = [prompt]
-            input_images = [input_images] if input_images is not None else None
-            
-        # Process inputs
-        input_data = self.processor.process_text(prompt)
+        """Generate images with OmniGen."""
+        # Process input data
+        input_data = self.processor(
+            prompt=prompt,
+            input_images=input_images,
+            height=height,
+            width=width,
+            max_input_image_size=max_input_image_size,
+            use_input_image_size_as_output=use_input_image_size_as_output
+        )
         
-        # Setup model offloading if requested
-        if offload_model:
-            self.enable_model_cpu_offload()
-        else:
-            self.disable_model_cpu_offload()
-            
-        # Generate initial latents
-        num_prompt = len(prompt)
-        num_cfg = 2 if use_img_guidance else 1
-        latent_size_h, latent_size_w = height // 8, width // 8
-        
+        # Set random seed if provided
         if seed is not None:
             tf.random.set_seed(seed)
             
-        # Generate on device then move to CPU if needed
-        with tf.device(self.device):
-            latents = tf.random.normal(
-                [num_prompt, latent_size_h, latent_size_w, 4],
-                dtype=tf.float16
-            )
-            latents = tf.repeat(latents, 1 + num_cfg, axis=0)
+        # Get batch size
+        batch_size = len(input_data["input_ids"])
+        
+        # Create timesteps
+        scheduler = self.scheduler
+        timesteps = scheduler.timesteps
+        latents = tf.random.normal([batch_size, height // 8, width // 8, 4])
+        
+        # Scale the initial noise by the standard deviation required by the scheduler
+        latents = latents * tf.cast(scheduler.init_noise_sigma, latents.dtype)
+        
+        # Prepare extra step kwargs
+        extra_step_kwargs = {}
+        if "eta" in set(inspect.signature(scheduler.step).parameters.keys()):
+            extra_step_kwargs["eta"] = 0.0
             
-        # Process input images with memory optimization
-        if input_images is not None:
-            input_img_latents = []
+        num_cfg = 2 if guidance_scale > 1.0 else 1
+        
+        # Denoising loop
+        for i, t in enumerate(timesteps):
+            # Expand latents for classifier free guidance
+            latent_model_input = tf.repeat(latents, num_cfg, axis=0)
+            latent_model_input = scheduler.scale_model_input(latent_model_input, t)
             
-            # Move VAE to device temporarily
-            if self.model_cpu_offload:
-                with tf.device(self.device):
-                    for img_batch in input_images:
-                        img_latents = []
-                        for img in (img_batch if isinstance(img_batch, list) else [img_batch]):
-                            # Process image
-                            if isinstance(img, str):
-                                img = Image.open(img).convert('RGB')
-                            img_tensor = tf.convert_to_tensor(np.array(img))
-                            img_tensor = tf.cast(img_tensor, tf.float32) / 127.5 - 1.0
-                            
-                            # Encode with VAE
-                            img_latent = self.vae_encode(img_tensor)
-                            img_latents.append(img_latent)
-                            
-                        input_img_latents.append(img_latents)
-                
-                # Clear GPU memory
-                tf.keras.backend.clear_session()
-                gc.collect()
-                
-        # Generate images with memory-optimized inference
-        with tf.device(self.device):
-            # Run inference in chunks if separate_cfg_infer is True
+            # Get model prediction
             if separate_cfg_infer:
-                samples = []
+                noise_pred = []
                 for i in range(0, len(latents), num_cfg):
                     chunk = latents[i:i + num_cfg]
                     chunk_result = self.model(
                         chunk,
                         input_data['input_ids'],
-                        input_data['attention_mask'],
+                        input_data.get('attention_mask'),
+                        input_data.get('position_ids'),
                         guidance_scale=guidance_scale,
-                        img_guidance_scale=img_guidance_scale if use_img_guidance else None,
-                        use_kv_cache=use_kv_cache
+                        training=False
                     )
-                    samples.append(chunk_result)
-                    
-                    # Clear memory after each chunk
-                    if offload_kv_cache:
-                        tf.keras.backend.clear_session()
-                        gc.collect()
-                        
-                samples = tf.concat(samples, axis=0)
+                    noise_pred.append(chunk_result)
+                noise_pred = tf.concat(noise_pred, axis=0)
             else:
-                samples = self.model(
-                    latents,
+                noise_pred = self.model(
+                    latent_model_input,
                     input_data['input_ids'],
-                    input_data['attention_mask'],
+                    input_data.get('attention_mask'),
+                    input_data.get('position_ids'),
                     guidance_scale=guidance_scale,
-                    img_guidance_scale=img_guidance_scale if use_img_guidance else None,
-                    use_kv_cache=use_kv_cache
+                    training=False
                 )
-            
-            # Post-process samples
-            samples = tf.cast(samples, tf.float32)
-            samples = samples / self.vae.config.scaling_factor
-            
-            if hasattr(self.vae.config, 'shift_factor') and self.vae.config.shift_factor is not None:
-                samples = samples + self.vae.config.shift_factor
                 
-            # Decode with VAE
-            if self.model_cpu_offload:
-                with tf.device(self.device):
-                    samples = self.vae.decode(samples)
-            else:
-                samples = self.vae.decode(samples)
+            # Perform guidance
+            if guidance_scale > 1.0:
+                noise_pred_uncond, noise_pred_text = tf.split(noise_pred, 2)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
                 
-            # Final processing
-            samples = tf.clip_by_value(samples * 0.5 + 0.5, 0, 1)
+            # Compute previous noisy sample x_t -> x_t-1
+            latents = scheduler.step(noise_pred, t, latents, **extra_step_kwargs)
             
-        # Clear GPU memory
-        tf.keras.backend.clear_session()
-        gc.collect()
+        # Scale and decode the image latents with vae
+        latents = 1 / 0.18215 * latents
         
-        # Return results in requested format
-        if output_type == "tf":
-            return samples
+        # Convert TensorFlow tensor to PyTorch tensor
+        latents_np = latents.numpy()
+        latents_torch = torch.from_numpy(latents_np).to(self.vae.device)
+        
+        # Decode with VAE
+        if separate_cfg_infer:
+            samples = []
+            for i in range(0, len(latents_torch), num_cfg):
+                chunk = latents_torch[i:i + num_cfg]
+                chunk_result = self.vae.decode(chunk).sample
+                samples.append(chunk_result)
+            samples = torch.cat(samples)
         else:
-            samples = tf.cast(samples * 255, tf.uint8)
-            samples = samples.numpy()
-            return [Image.fromarray(img) for img in samples]
+            samples = self.vae.decode(latents_torch).sample
+            
+        # Convert back to numpy/tensorflow if needed
+        samples = samples.cpu().numpy()
+        samples = np.transpose(samples, (0, 2, 3, 1))
+        
+        # Convert to output format
+        if output_type == "pil":
+            # Denormalize and convert to PIL
+            samples = (samples * 255).round().astype("uint8")
+            samples = [Image.fromarray(sample) for sample in samples]
+            
+        return samples
         
     def decode_latents(self, latents):
         """Decode the latents into images."""
@@ -374,11 +352,19 @@ class OmniGenPipeline:
             # Scale and decode the image latents with vae
             latents = 1 / 0.18215 * latents
             
+            # Convert TensorFlow tensor to PyTorch tensor
+            latents_np = latents.numpy()
+            latents_torch = torch.from_numpy(latents_np).to(self.vae.device)
+            
             # Decode with VAE
-            images = self.vae.decode(latents)
+            samples = self.vae.decode(latents_torch).sample
+            
+            # Convert back to numpy/tensorflow if needed
+            samples = samples.cpu().numpy()
+            samples = np.transpose(samples, (0, 2, 3, 1))
             
             # Postprocess images
-            images = (images / 2 + 0.5)
+            images = (samples / 2 + 0.5)
             images = tf.clip_by_value(images, 0.0, 1.0)
             images = tf.cast(images * 255, tf.uint8)
             
