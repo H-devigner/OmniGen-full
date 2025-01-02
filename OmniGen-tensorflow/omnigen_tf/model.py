@@ -127,50 +127,83 @@ def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=
     grid_size: int of the grid height and width return: pos_embed: [grid_size*grid_size, embed_dim] or
     [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
     """
+    # Convert all inputs to float32 numpy arrays
+    interpolation_scale = np.float32(interpolation_scale)
+    base_size = np.float32(base_size)
+    
     if isinstance(grid_size, int):
         grid_size = (grid_size, grid_size)
-
-    grid_h = np.arange(grid_size[0], dtype=np.float32) / (grid_size[0] / base_size) / interpolation_scale
-    grid_w = np.arange(grid_size[1], dtype=np.float32) / (grid_size[1] / base_size) / interpolation_scale
-    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
+    
+    # Convert grid sizes to float32
+    grid_h_size = np.float32(grid_size[0])
+    grid_w_size = np.float32(grid_size[1])
+    
+    # Create grid arrays
+    grid_h = np.arange(grid_size[0], dtype=np.float32)
+    grid_w = np.arange(grid_size[1], dtype=np.float32)
+    
+    # Perform divisions with float32 values
+    grid_h = grid_h / (grid_h_size / base_size) / interpolation_scale
+    grid_w = grid_w / (grid_w_size / base_size) / interpolation_scale
+    
+    grid = np.meshgrid(grid_w, grid_h)
     grid = np.stack(grid, axis=0)
-
     grid = grid.reshape([2, 1, grid_size[1], grid_size[0]])
+    
     pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
     if cls_token and extra_tokens > 0:
-        pos_embed = np.concatenate([np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0)
+        pos_embed = np.concatenate([np.zeros([extra_tokens, embed_dim], dtype=np.float32), pos_embed], axis=0)
     return pos_embed
 
 
 def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
-    assert len(grid.shape) == 4, "Grid must be 4D"
-    pos_dim = grid.shape[0]
-    assert pos_dim == 2, "Grid must have 2 dimensions"
+    """Create 2D positional embeddings from a grid.
     
-    omega = np.arange(embed_dim // pos_dim, dtype=np.float32)
-    omega = 1. / (10000 ** (omega / (embed_dim // pos_dim)))
-    
-    grid = grid.reshape([pos_dim, -1])  # [2, H*W]
-    grid = np.einsum('pd,d->pd', grid, omega)  # [2, H*W] * [D/2] -> [2, H*W]
-    emb = np.concatenate([np.sin(grid), np.cos(grid)], axis=0)  # [2, H*W] -> [4, H*W]
-    return emb.T  # [H*W, 4]
-
-
-def get_1d_sincos_pos_embed_from_grid(embed_dim, grid):
+    Args:
+        embed_dim: Embedding dimension (must be even)
+        grid: 2D grid of positions
+        
+    Returns:
+        Array of shape [H*W, D] containing positional embeddings
     """
-    grid: [num_tokens]
-    embed_dim: output dimension for each position
-    """
-    omega = np.arange(embed_dim // 2, dtype=np.float32)
-    omega = 1. / (10000 ** (omega / (embed_dim // 2)))
-    
-    grid = grid.reshape(-1)
-    grid = grid[:, np.newaxis] * omega[np.newaxis, :]
-    emb = np.concatenate([np.sin(grid), np.cos(grid)], axis=1)
-    
-    if embed_dim % 2 == 1:  # Handle odd dimensions
-        emb = np.concatenate([emb, np.zeros([grid.shape[0], 1])], axis=1)
+    assert embed_dim % 2 == 0
+
+    # Create embeddings for height and width dimensions
+    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
+    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
+
+    # Combine height and width embeddings
+    emb = np.concatenate([emb_h, emb_w], axis=1)  # (H*W, D)
     return emb
+
+
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+    """Create 1D sinusoidal positional embeddings.
+    
+    This function generates sinusoidal embeddings for a 1D position array,
+    using alternating sine and cosine functions at different frequencies.
+    
+    Args:
+        embed_dim: Output dimension for each position (must be even)
+        pos: Array of positions to encode, shape (M,)
+        
+    Returns:
+        Array of shape (M, D) containing positional embeddings
+    """
+    assert embed_dim % 2 == 0
+    omega = np.arange(embed_dim // 2, dtype=np.float32)
+    omega /= embed_dim / 2.
+    omega = 1. / 10000**omega  # (D/2,)
+
+    pos = pos.reshape(-1)  # (M,)
+    out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
+
+    emb_sin = np.sin(out)  # (M, D/2)
+    emb_cos = np.cos(out)  # (M, D/2)
+
+    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
+    return emb
+
 
 
 class OmniGen(Model):
