@@ -44,6 +44,7 @@ class Phi3Config(PretrainedConfig):
         cls_token_id=None,
         mask_token_id=None,
         unk_token_id=None,
+        pos_embed_max_size=192,
         **kwargs
     ):
         """Initialize config."""
@@ -82,6 +83,8 @@ class Phi3Config(PretrainedConfig):
             **kwargs
         )
         
+        self.pos_embed_max_size = pos_embed_max_size
+        
     def to_dict(self):
         """Convert config to dictionary."""
         output = {
@@ -106,6 +109,7 @@ class Phi3Config(PretrainedConfig):
             'cls_token_id': self.cls_token_id,
             'mask_token_id': self.mask_token_id,
             'unk_token_id': self.unk_token_id,
+            'pos_embed_max_size': self.pos_embed_max_size,
         }
         return output
 
