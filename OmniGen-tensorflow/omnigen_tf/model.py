@@ -17,8 +17,28 @@ from diffusers.loaders import PeftAdapterMixin
 import json
 from dataclasses import fields
 import gc
+import torch
+import torch.nn as nn
 
 from omnigen_tf.transformer import Phi3Config, Phi3Transformer
+from OmniGen.model import OmniGen as OmniGenPyTorch
+
+# Conversion functions
+def tf_to_torch(tensor):
+    """Convert TensorFlow tensor to PyTorch tensor."""
+    if isinstance(tensor, (list, tuple)):
+        return [tf_to_torch(t) for t in tensor]
+    if tensor is None:
+        return None
+    return torch.from_numpy(tensor.numpy())
+
+def torch_to_tf(tensor):
+    """Convert PyTorch tensor to TensorFlow tensor."""
+    if isinstance(tensor, (list, tuple)):
+        return [torch_to_tf(t) for t in tensor]
+    if tensor is None:
+        return None
+    return tf.convert_to_tensor(tensor.detach().cpu().numpy())
 
 
 @tf.function(jit_compile=True)
@@ -157,11 +177,18 @@ class OmniGen(Model):
         # Enable mixed precision
         tf.keras.mixed_precision.set_global_policy('mixed_float16')
         
-        # Initialize transformer with config
+        # Initialize transformer config
         if not isinstance(transformer_config, Phi3Config):
             transformer_config = Phi3Config(**transformer_config)
             
-        self.transformer = Phi3Transformer(transformer_config)
+        # Initialize PyTorch transformer
+        self.transformer = OmniGenPyTorch(
+            transformer_config=transformer_config,
+            patch_size=patch_size,
+            in_channels=in_channels,
+            pe_interpolation=pe_interpolation,
+            pos_embed_max_size=pos_embed_max_size
+        )
         self.transformer_config = transformer_config
         
         # Save configuration
@@ -267,150 +294,51 @@ class OmniGen(Model):
         imgs = tf.transpose(imgs, [0, 2, 3, 1])  # NCHW -> NHWC
         return imgs
 
-    @tf.function(jit_compile=True)
     def _forward(self, latents, timestep, input_ids, input_img_latents=None, input_image_sizes=None, attention_mask=None, position_ids=None, padding_latent=None, past_key_values=None, return_past_key_values=True, training=False):
-        """Memory-efficient forward pass."""
+        """Memory-efficient forward pass using PyTorch transformer."""
         # Clear memory before forward pass
         tf.keras.backend.clear_session()
         gc.collect()
         
-        # Process inputs efficiently using gradient checkpointing
-        def _process_inputs():
-            # Cast to float16 for mixed precision
-            latents = tf.cast(latents, tf.float16)
-            x = self.x_embedder(latents)
-            
-            # Process timestep efficiently
-            time_token = self.time_token(timestep)
-            time_token = tf.expand_dims(time_token, 1)
-            
-            # Clear intermediate tensors
-            del latents
-            tf.keras.backend.clear_session()
-            
-            return x, time_token
-            
-        if training and self.enable_checkpointing:
-            x, time_token = tf.recompute_grad(_process_inputs)()
-        else:
-            x, time_token = _process_inputs()
-            
-        # Process input images if provided
-        if input_img_latents is not None:
-            def _process_img_inputs():
-                # Cast to float16 for mixed precision
-                input_img_latents = tf.cast(input_img_latents, tf.float16)
-                input_latents = self.patch_multiple_resolutions(
-                    input_img_latents,
-                    is_input_images=True
-                )
-                
-                # Clear intermediate tensors
-                del input_img_latents
-                tf.keras.backend.clear_session()
-                
-                return input_latents
-                
-            if training and self.enable_checkpointing:
-                input_latents = tf.recompute_grad(_process_img_inputs)()
-            else:
-                input_latents = _process_img_inputs()
-                
-        # Get text embeddings efficiently
-        if input_ids is not None:
-            def _process_text():
-                # Cast to float16 for mixed precision
-                text_embeds = tf.cast(
-                    self.transformer.wte(input_ids),
-                    tf.float16
-                )
-                
-                if input_img_latents is not None:
-                    # Replace embeddings efficiently
-                    input_img_idx = 0
-                    for b_idx in input_image_sizes:
-                        for start_idx, end_idx in input_image_sizes[b_idx]:
-                            text_embeds = tf.tensor_scatter_nd_update(
-                                text_embeds,
-                                [[b_idx, i] for i in range(start_idx, end_idx)],
-                                input_latents[input_img_idx]
-                            )
-                            input_img_idx += 1
-                            
-                # Clear intermediate tensors
-                if input_img_latents is not None:
-                    del input_latents
-                tf.keras.backend.clear_session()
-                
-                return text_embeds
-                
-            if training and self.enable_checkpointing:
-                text_embeds = tf.recompute_grad(_process_text)()
-            else:
-                text_embeds = _process_text()
-                
-            input_emb = tf.concat([text_embeds, time_token, x], axis=1)
-            
-            # Clear intermediate tensors
-            del text_embeds
-        else:
-            input_emb = tf.concat([time_token, x], axis=1)
-            
-        # Clear intermediate tensors
-        del x
-        del time_token
-        tf.keras.backend.clear_session()
+        # Convert inputs to PyTorch
+        latents_torch = tf_to_torch(latents)
+        timestep_torch = tf_to_torch(timestep)
+        input_ids_torch = tf_to_torch(input_ids)
+        input_img_latents_torch = tf_to_torch(input_img_latents)
+        attention_mask_torch = tf_to_torch(attention_mask)
+        position_ids_torch = tf_to_torch(position_ids)
+        past_key_values_torch = tf_to_torch(past_key_values)
         
-        # Run transformer with memory optimization
-        def _run_transformer():
-            return self.transformer.transformer(
-                input_emb,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                training=training
+        # Process through PyTorch transformer
+        with torch.no_grad():
+            output_torch, past_key_values_torch = self.transformer(
+                latents_torch,
+                timestep_torch,
+                input_ids_torch,
+                input_img_latents_torch,
+                input_image_sizes,
+                attention_mask_torch,
+                position_ids_torch,
+                padding_latent=None,
+                past_key_values=past_key_values_torch,
+                return_past_key_values=return_past_key_values,
+                offload_model=False
             )
             
-        if training and self.enable_checkpointing:
-            output = tf.recompute_grad(_run_transformer)()
-        else:
-            output = _run_transformer()
-            
-        if isinstance(output, tuple):
-            output = output[0]
-            
-        # Process output efficiently
-        def _process_output():
-            # Process timestep efficiently
-            time_emb = self.t_embedder(timestep)
-            
-            # Get output tokens
-            output_tokens = output[:, -tf.shape(input_emb)[1]:]
-            
-            # Process through final layer
-            x = self.final_layer(output_tokens, time_emb)
-            
-            # Clear intermediate tensors
-            del output_tokens
-            del time_emb
-            tf.keras.backend.clear_session()
-            
-            return x
-            
-        if training and self.enable_checkpointing:
-            x = tf.recompute_grad(_process_output)()
-        else:
-            x = _process_output()
-            
-        # Clear intermediate tensors
-        del output
-        del input_emb
+        # Convert outputs back to TensorFlow
+        output = torch_to_tf(output_torch)
+        past_key_values = torch_to_tf(past_key_values_torch)
+        
+        # Clear PyTorch cache
+        torch.cuda.empty_cache()
+        
+        # Clear memory
         tf.keras.backend.clear_session()
         gc.collect()
         
         if return_past_key_values:
-            return x, past_key_values
-        return x
+            return output, past_key_values
+        return output
 
     def call(self, latents, timestep, input_ids, input_img_latents=None, input_image_sizes=None, attention_mask=None, position_ids=None, padding_latent=None, past_key_values=None, return_past_key_values=True, training=False):
         """Main call method with memory optimization."""
@@ -481,178 +409,97 @@ class OmniGen(Model):
             
     @tf.function(jit_compile=True)
     def forward_with_cfg(self, x, timestep, input_ids, input_img_latents, input_image_sizes, attention_mask, position_ids, cfg_scale, use_img_cfg, img_cfg_scale, past_key_values, use_kv_cache, offload_model=False):
-        """Memory-efficient forward pass with classifier-free guidance."""
+        """Memory-efficient forward pass with classifier-free guidance using PyTorch transformer."""
         # Clear memory
         tf.keras.backend.clear_session()
         gc.collect()
         
-        # Run model with memory optimization
-        def run_model():
-            # Process unconditional path
-            uncond_ids = tf.zeros_like(input_ids)
-            uncond_past_key_values = past_key_values if use_kv_cache else None
-            
-            # Run unconditional path efficiently
-            uncond_out, uncond_past_key_values = self._forward(
-                x,
-                timestep,
-                uncond_ids,
-                None,
-                None,
-                attention_mask,
-                position_ids,
-                past_key_values=uncond_past_key_values,
-                return_past_key_values=use_kv_cache,
-                training=False
-            )
-            
-            # Process conditional path
-            cond_past_key_values = past_key_values if use_kv_cache else None
-            
-            # Run conditional path efficiently
-            cond_out, cond_past_key_values = self._forward(
-                x,
-                timestep,
-                input_ids,
-                input_img_latents,
+        # Convert inputs to PyTorch
+        x_torch = tf_to_torch(x)
+        timestep_torch = tf_to_torch(timestep)
+        input_ids_torch = tf_to_torch(input_ids)
+        input_img_latents_torch = tf_to_torch(input_img_latents)
+        attention_mask_torch = tf_to_torch(attention_mask)
+        position_ids_torch = tf_to_torch(position_ids)
+        past_key_values_torch = tf_to_torch(past_key_values)
+        
+        # Process through PyTorch transformer
+        with torch.no_grad():
+            output_torch, past_key_values_torch = self.transformer.forward_with_cfg(
+                x_torch,
+                timestep_torch,
+                input_ids_torch,
+                input_img_latents_torch,
                 input_image_sizes,
-                attention_mask,
-                position_ids,
-                past_key_values=cond_past_key_values,
-                return_past_key_values=use_kv_cache,
-                training=False
+                attention_mask_torch,
+                position_ids_torch,
+                cfg_scale,
+                use_img_cfg,
+                img_cfg_scale,
+                past_key_values_torch,
+                use_kv_cache,
+                offload_model
             )
             
-            # Compute weighted output efficiently
-            noise_pred = uncond_out + cfg_scale * (cond_out - uncond_out)
-            
-            # Clear intermediate tensors
-            del uncond_out
-            del cond_out
-            tf.keras.backend.clear_session()
-            
-            if use_kv_cache:
-                return noise_pred, (uncond_past_key_values, cond_past_key_values)
-            return noise_pred
-            
-        # Run with gradient checkpointing if training
-        if self.enable_checkpointing:
-            outputs = tf.recompute_grad(run_model)()
-        else:
-            outputs = run_model()
-            
-        # Clear memory again
+        # Convert outputs back to TensorFlow
+        output = torch_to_tf(output_torch)
+        past_key_values = torch_to_tf(past_key_values_torch)
+        
+        # Clear PyTorch cache
+        torch.cuda.empty_cache()
+        
+        # Clear memory
         tf.keras.backend.clear_session()
         gc.collect()
         
-        return outputs
+        return output, past_key_values
 
     @tf.function(jit_compile=True)
     def forward_with_separate_cfg(self, x, timestep, input_ids, input_img_latents, input_image_sizes, attention_mask, position_ids, cfg_scale, use_img_cfg, img_cfg_scale, past_key_values, use_kv_cache, offload_model=False):
-        """Memory-efficient forward pass with separate classifier-free guidance."""
+        """Memory-efficient forward pass with separate classifier-free guidance using PyTorch transformer."""
         # Clear memory
         tf.keras.backend.clear_session()
         gc.collect()
         
-        # Run model with memory optimization
-        def run_model():
-            # Process unconditional path
-            uncond_ids = tf.zeros_like(input_ids)
-            uncond_past_key_values = past_key_values[0] if use_kv_cache else None
-            
-            # Run unconditional path efficiently
-            uncond_out, uncond_past_key_values = self._forward(
-                x,
-                timestep,
-                uncond_ids,
-                None,
-                None,
-                attention_mask,
-                position_ids,
-                past_key_values=uncond_past_key_values,
-                return_past_key_values=use_kv_cache,
-                training=False
+        # Convert inputs to PyTorch
+        x_torch = tf_to_torch(x)
+        timestep_torch = tf_to_torch(timestep)
+        input_ids_torch = tf_to_torch(input_ids)
+        input_img_latents_torch = tf_to_torch(input_img_latents)
+        attention_mask_torch = tf_to_torch(attention_mask)
+        position_ids_torch = tf_to_torch(position_ids)
+        past_key_values_torch = tf_to_torch(past_key_values)
+        
+        # Process through PyTorch transformer
+        with torch.no_grad():
+            output_torch, past_key_values_torch = self.transformer.forward_with_separate_cfg(
+                x_torch,
+                timestep_torch,
+                input_ids_torch,
+                input_img_latents_torch,
+                input_image_sizes,
+                attention_mask_torch,
+                position_ids_torch,
+                cfg_scale,
+                use_img_cfg,
+                img_cfg_scale,
+                past_key_values_torch,
+                use_kv_cache,
+                offload_model
             )
             
-            # Process text conditional path
-            text_cond_past_key_values = past_key_values[1] if use_kv_cache else None
-            
-            # Run text conditional path efficiently
-            text_cond_out, text_cond_past_key_values = self._forward(
-                x,
-                timestep,
-                input_ids,
-                None,
-                None,
-                attention_mask,
-                position_ids,
-                past_key_values=text_cond_past_key_values,
-                return_past_key_values=use_kv_cache,
-                training=False
-            )
-            
-            # Process image conditional path if needed
-            if use_img_cfg:
-                img_cond_past_key_values = past_key_values[2] if use_kv_cache else None
-                
-                # Run image conditional path efficiently
-                img_cond_out, img_cond_past_key_values = self._forward(
-                    x,
-                    timestep,
-                    input_ids,
-                    input_img_latents,
-                    input_image_sizes,
-                    attention_mask,
-                    position_ids,
-                    past_key_values=img_cond_past_key_values,
-                    return_past_key_values=use_kv_cache,
-                    training=False
-                )
-                
-                # Compute weighted output efficiently
-                noise_pred = uncond_out + \
-                    cfg_scale * (text_cond_out - uncond_out) + \
-                    img_cfg_scale * (img_cond_out - uncond_out)
-                    
-                # Clear intermediate tensors
-                del img_cond_out
-                
-                if use_kv_cache:
-                    past_key_values = (
-                        uncond_past_key_values,
-                        text_cond_past_key_values,
-                        img_cond_past_key_values
-                    )
-            else:
-                # Compute weighted output efficiently without image guidance
-                noise_pred = uncond_out + cfg_scale * (text_cond_out - uncond_out)
-                
-                if use_kv_cache:
-                    past_key_values = (
-                        uncond_past_key_values,
-                        text_cond_past_key_values
-                    )
-                    
-            # Clear intermediate tensors
-            del uncond_out
-            del text_cond_out
-            tf.keras.backend.clear_session()
-            
-            if use_kv_cache:
-                return noise_pred, past_key_values
-            return noise_pred
-            
-        # Run with gradient checkpointing if training
-        if self.enable_checkpointing:
-            outputs = tf.recompute_grad(run_model)()
-        else:
-            outputs = run_model()
-            
-        # Clear memory again
+        # Convert outputs back to TensorFlow
+        output = torch_to_tf(output_torch)
+        past_key_values = torch_to_tf(past_key_values_torch)
+        
+        # Clear PyTorch cache
+        torch.cuda.empty_cache()
+        
+        # Clear memory
         tf.keras.backend.clear_session()
         gc.collect()
         
-        return outputs
+        return output, past_key_values
 
     def decode(self, latents):
         """Decode latents to image."""
