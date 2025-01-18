@@ -114,42 +114,6 @@ class PatchEmbed(layers.Layer):
         return (h // self.patch_size) * (w // self.patch_size)
 
 
-class TimeToken(tf.keras.layers.Layer):
-    """Time token embedding layer."""
-    
-    def __init__(self, embed_dim=2048, **kwargs):
-        """Initialize layer."""
-        super().__init__(**kwargs)
-        self.embed_dim = embed_dim
-        
-        # Create MLP for time embedding
-        self.mlp = tf.keras.Sequential([
-            tf.keras.layers.Dense(embed_dim, activation='gelu'),
-            tf.keras.layers.Dense(embed_dim)
-        ])
-        
-    def call(self, t):
-        """Forward pass."""
-        # Reshape timestep to [batch_size, 1]
-        if len(tf.shape(t)) == 0:
-            t = tf.expand_dims(t, 0)  # Add batch dimension
-        if len(tf.shape(t)) == 1:
-            t = tf.expand_dims(t, 1)  # Add feature dimension
-            
-        # Convert to float32
-        t = tf.cast(t, tf.float32)
-        
-        return self.mlp(t)
-        
-    def get_config(self):
-        """Get layer configuration."""
-        config = super().get_config()
-        config.update({
-            'embed_dim': self.embed_dim
-        })
-        return config
-
-
 class FinalLayer(layers.Layer):
     """Final layer for image generation."""
     
@@ -214,8 +178,9 @@ class OmniGen(Model):
             embed_dim=transformer_config.hidden_size
         )
         
-        self.time_token = TimeToken(
-            embed_dim=transformer_config.hidden_size
+        # Replace TimeToken with TimestepEmbedder
+        self.timestep_embedder = TimestepEmbedder(
+            hidden_size=transformer_config.hidden_size
         )
         
         self.final_layer = FinalLayer(
@@ -274,14 +239,14 @@ class OmniGen(Model):
             }
             self.weights_map.update(layer_map)
             
-        # Other components mappings
+        # Update component mappings for TimestepEmbedder
         self.weights_map.update({
             "x_embedder/proj/kernel": "x_embedder.proj.weight",
             "x_embedder/proj/bias": "x_embedder.proj.bias",
-            "time_token/mlp_0/kernel": "time_token.mlp.0.weight",
-            "time_token/mlp_0/bias": "time_token.mlp.0.bias",
-            "time_token/mlp_2/kernel": "time_token.mlp.2.weight",
-            "time_token/mlp_2/bias": "time_token.mlp.2.bias",
+            "timestep_embedder/mlp/0/kernel": "timestep_embedder.mlp.0.weight",
+            "timestep_embedder/mlp/0/bias": "timestep_embedder.mlp.0.bias",
+            "timestep_embedder/mlp/2/kernel": "timestep_embedder.mlp.2.weight",
+            "timestep_embedder/mlp/2/bias": "timestep_embedder.mlp.2.bias",
             "final_layer/proj/kernel": "final_layer.proj.weight",
             "final_layer/proj/bias": "final_layer.proj.bias",
         })
@@ -341,7 +306,7 @@ class OmniGen(Model):
 
         # Initialize timestep embedding MLP with normal distribution
         std = 0.02
-        for embedder in [self.time_token]:
+        for embedder in [self.timestep_embedder]:
             for layer in embedder.mlp.layers:
                 if isinstance(layer, layers.Dense):
                     layer.kernel.assign(tf.random.normal(
@@ -503,10 +468,9 @@ class OmniGen(Model):
         h, w = tf.cast(shapes[1], tf.int32), tf.cast(shapes[2], tf.int32)
         pos_embed = self.get_pos_embed(h, w)
         
-        # Add time embedding
-        # Expand timestep to match batch size
+        # Add time embedding using TimestepEmbedder
         t = tf.fill([batch_size], timestep)
-        time_embed = self.time_token(t)
+        time_embed = self.timestep_embedder(t)
         
         # Combine embeddings with time embedding
         x = x + tf.expand_dims(time_embed, axis=1)  # Add time embedding to each position
@@ -520,11 +484,8 @@ class OmniGen(Model):
         
         # Create combined attention mask if needed
         if attention_mask is not None:
-            # Expand attention mask to match batch size
             attention_mask = tf.repeat(attention_mask, batch_size, axis=0)
-            # Create attention mask for image tokens (all 1s)
             image_attention = tf.ones((batch_size, tf.shape(x)[1]), dtype=attention_mask.dtype)
-            # Combine text and image attention masks
             combined_attention = tf.concat([attention_mask, image_attention], axis=1)
         else:
             combined_attention = None
