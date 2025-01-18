@@ -27,7 +27,7 @@ def modulate(x, shift, scale):
     return x * (1 + tf.expand_dims(scale, 1)) + tf.expand_dims(shift, 1)
 
 
-class TimestepEmbedder(Model):
+class TimestepEmbedder(layers.Layer):
     """Embeds scalar timesteps into vector representations."""
     
     def __init__(self, hidden_size, frequency_embedding_size=256):
@@ -39,21 +39,30 @@ class TimestepEmbedder(Model):
         ])
         self.frequency_embedding_size = frequency_embedding_size
 
-    @staticmethod
-    @tf.function(jit_compile=True)
-    def timestep_embedding(t, dim, max_period=10000):
-        """Create sinusoidal timestep embeddings."""
+    def timestep_embedding(self, t, dim, max_period=10000):
+        """Create sinusoidal timestep embeddings.
+        
+        Args:
+            t: 1-D Tensor of timesteps.
+            dim: Desired embedding dimension
+            max_period: Controls the minimum frequency of the embeddings.
+        
+        Returns:
+            Tensor: timestep embeddings.
+        """
+        t = tf.cast(t, tf.float32)
         half = dim // 2
-        freqs = tf.exp(
-            -math.log(max_period) * tf.range(half, dtype=t.dtype) / half
-        )
-        args = tf.cast(t[:, None], dtype=freqs.dtype) * freqs[None]
+        freqs = tf.cast(tf.range(half, dtype=tf.float32), tf.float32)
+        freqs = tf.exp(-math.log(float(max_period)) * freqs / (half - 1))
+        args = tf.expand_dims(t, -1) * freqs[None]
         embedding = tf.concat([tf.cos(args), tf.sin(args)], axis=-1)
         if dim % 2:
-            embedding = tf.concat([embedding, tf.zeros_like(embedding[:, :1])], axis=-1)
+            embedding = tf.pad(embedding, [[0, 0], [0, 1]])
         return embedding
 
     def call(self, t):
+        if len(tf.shape(t)) == 0:
+            t = tf.expand_dims(t, 0)
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         t_emb = self.mlp(t_freq)
         return t_emb
