@@ -266,94 +266,127 @@ class OmniGen(Model):
         imgs = tf.transpose(imgs, [0, 2, 3, 1])  # NCHW -> NHWC
         return imgs
 
-    @tf.function(reduce_retracing=True)
-    def _forward(self, latents, timestep, input_ids, attention_mask=None, training=False):
+    def _forward(self, latents, timestep, input_ids, input_img_latents=None, input_image_sizes=None, attention_mask=None, position_ids=None, padding_latent=None, past_key_values=None, return_past_key_values=True, training=False):
         """Memory-efficient forward pass."""
-        batch_size = tf.shape(latents)[0]
-        h, w = tf.shape(latents)[1], tf.shape(latents)[2]
+        input_is_list = isinstance(latents, list)
         
-        # Process inputs efficiently
-        x = self.x_embedder(latents)
+        # Process input latents efficiently
+        x, num_tokens, shapes = self.patch_multiple_resolutions(latents, padding_latent)
+        time_token = self.time_token(timestep)
+        time_token = tf.cast(time_token, x.dtype)
+        time_token = tf.expand_dims(time_token, 1)
         
-        # Get time embeddings
-        t = tf.fill([batch_size], timestep)
-        time_token = self.time_token(t)
-        time_emb = self.t_embedder(t)
+        # Process input images if provided
+        if input_img_latents is not None:
+            input_latents, _, _ = self.patch_multiple_resolutions(input_img_latents, is_input_images=True)
+            
+        # Get text embeddings
+        if input_ids is not None:
+            condition_embeds = self.transformer.wte(input_ids)
+            condition_embeds = tf.cast(condition_embeds, x.dtype)
+            
+            # Replace embeddings with input image latents if provided
+            if input_img_latents is not None:
+                input_img_idx = 0
+                for b_idx in input_image_sizes:
+                    for start_idx, end_idx in input_image_sizes[b_idx]:
+                        condition_embeds = tf.tensor_scatter_nd_update(
+                            condition_embeds,
+                            [[b_idx, i] for i in range(start_idx, end_idx)],
+                            input_latents[input_img_idx]
+                        )
+                        input_img_idx += 1
+                        
+                if input_img_idx != len(input_latents):
+                    raise ValueError("Mismatch in input image indices")
+            
+            # Combine embeddings
+            input_emb = tf.concat([condition_embeds, time_token, x], axis=1)
+        else:
+            input_emb = tf.concat([time_token, x], axis=1)
         
-        # Get text embeddings efficiently
-        text_embeds = self.transformer.wte(input_ids)
-        text_embeds = tf.cast(text_embeds, self.dtype)
-        text_embeds = tf.repeat(text_embeds, batch_size, axis=0)
-        
-        # Combine embeddings efficiently
-        hidden_states = tf.concat([
-            text_embeds,
-            tf.expand_dims(time_token, 1),
-            x
-        ], axis=1)
-        
-        # Handle attention mask efficiently
-        if attention_mask is not None:
-            attention_mask = tf.repeat(attention_mask, batch_size, axis=0)
-            image_attention = tf.ones((batch_size, tf.shape(x)[1]), dtype=attention_mask.dtype)
-            combined_attention = tf.concat([attention_mask, image_attention], axis=1)
-        
-        # Run transformer efficiently
+        # Run through transformer
         output = self.transformer.transformer(
-            hidden_states,
-            attention_mask=combined_attention,
+            input_emb,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
             training=training
         )
         
         if isinstance(output, tuple):
             output = output[0]
-        
-        # Process final layer efficiently
-        num_tokens = tf.shape(x)[1]
-        image_embedding = output[:, -num_tokens:]
-        x = self.final_layer(image_embedding, time_emb)
-        
-        # Unpatchify efficiently
-        return self.unpatchify(x, h, w)
-
-    def _chunked_forward(self, latents, timestep, input_ids, attention_mask=None, training=False):
-        """Forward pass with chunking for memory efficiency."""
-        # Process in chunks
-        chunk_size = self.chunk_size
-        chunks = tf.shape(latents)[1] // chunk_size + (1 if tf.shape(latents)[1] % chunk_size != 0 else 0)
-        
-        outputs = []
-        for i in range(chunks):
-            start_idx = i * chunk_size
-            end_idx = min(start_idx + chunk_size, tf.shape(latents)[1])
-            chunk = latents[:, start_idx:end_idx]
             
-            # Process chunk
-            chunk_output = self._forward(chunk, timestep, input_ids, attention_mask, training)
-            outputs.append(chunk_output)
-            
-        # Combine chunks
-        return tf.concat(outputs, axis=1)
-        
-    def call(
-        self,
-        latents,
-        timestep,
-        input_ids=None,
-        attention_mask=None,
-        training=False,
-    ):
-        """Model forward pass."""
         # Handle list inputs
-        if isinstance(latents, list):
-            latents = tf.concat(latents, axis=0)
+        if input_is_list:
+            image_embedding = output[:, -tf.reduce_max(num_tokens):]
+            time_emb = self.t_embedder(timestep)
+            time_emb = tf.cast(time_emb, x.dtype)
+            x = self.final_layer(image_embedding, time_emb)
             
-        # Use chunked forward if needed
-        if tf.shape(latents)[1] > self.chunk_size:
-            return self._chunked_forward(latents, timestep, input_ids, attention_mask, training)
+            # Process each latent separately
+            latents = []
+            for i in range(tf.shape(x)[0]):
+                latent = x[i:i+1, :num_tokens[i]]
+                latent = self.unpatchify(latent, shapes[i][0], shapes[i][1])
+                latents.append(latent)
         else:
-            return self._forward(latents, timestep, input_ids, attention_mask, training)
+            image_embedding = output[:, -num_tokens:]
+            time_emb = self.t_embedder(timestep)
+            time_emb = tf.cast(time_emb, x.dtype)
+            x = self.final_layer(image_embedding, time_emb)
+            latents = self.unpatchify(x, shapes[0], shapes[1])
             
+        if return_past_key_values:
+            return latents, past_key_values
+        return latents
+        
+    def call(self, latents, timestep, input_ids, input_img_latents=None, input_image_sizes=None, attention_mask=None, position_ids=None, padding_latent=None, past_key_values=None, return_past_key_values=True, training=False):
+        """Main call method with memory optimization."""
+        return self._forward(
+            latents=latents,
+            timestep=timestep,
+            input_ids=input_ids,
+            input_img_latents=input_img_latents,
+            input_image_sizes=input_image_sizes,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            padding_latent=padding_latent,
+            past_key_values=past_key_values,
+            return_past_key_values=return_past_key_values,
+            training=training
+        )
+        
+    @tf.function(jit_compile=True)
+    def forward_with_cfg(self, x, timestep, input_ids, input_img_latents, input_image_sizes, attention_mask, position_ids, cfg_scale, use_img_cfg, img_cfg_scale, past_key_values, use_kv_cache, offload_model=False):
+        """Memory-efficient forward pass with classifier-free guidance."""
+        # Run model forward
+        model_out, past_key_values = self._forward(
+            x, timestep, input_ids, input_img_latents, input_image_sizes,
+            attention_mask, position_ids, past_key_values=past_key_values,
+            return_past_key_values=True
+        )
+        
+        # Apply classifier-free guidance
+        if use_img_cfg:
+            # Split into conditional, unconditional, and image conditional
+            split_size = tf.shape(model_out)[0] // 3
+            cond, uncond, img_cond = tf.split(model_out, 3, axis=0)
+            
+            # Apply guidance formula
+            cond = uncond + img_cfg_scale * (img_cond - uncond) + cfg_scale * (cond - img_cond)
+            model_out = tf.concat([cond, cond, cond], axis=0)
+        else:
+            # Split into conditional and unconditional
+            split_size = tf.shape(model_out)[0] // 2
+            cond, uncond = tf.split(model_out, 2, axis=0)
+            
+            # Apply guidance formula
+            cond = uncond + cfg_scale * (cond - uncond)
+            model_out = tf.concat([cond, cond], axis=0)
+            
+        return model_out, past_key_values
+
     def decode(self, latents):
         """Decode latents to image."""
         # Add decoding logic here
