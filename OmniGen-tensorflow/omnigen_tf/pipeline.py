@@ -206,3 +206,11 @@ class OmniGenPipeline:
         model.enable_memory_efficient_inference()
         
         return cls(model, scheduler, processor)
+pipeline = OmniGenPipeline.from_pretrained("Shitao/omnigen-v1")
+image = pipeline(
+    prompt="your prompt here",
+    height=512,
+    width=512,
+    num_inference_steps=50,
+    guidance_scale=7.5
+)
