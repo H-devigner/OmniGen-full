@@ -370,34 +370,142 @@ class OmniGen(Model):
         )
         
     @tf.function(jit_compile=True)
+    def patch_multiple_resolutions(self, latents, padding_latent=None, is_input_images=False):
+        """Efficiently patch multiple resolutions."""
+        if isinstance(latents, list):
+            # Handle list of tensors efficiently
+            num_tokens = []
+            shapes = []
+            patched_latents = []
+            
+            for latent in latents:
+                height, width = tf.shape(latent)[-2], tf.shape(latent)[-1]
+                if is_input_images:
+                    x = self.input_x_embedder(latent)
+                else:
+                    x = self.x_embedder(latent)
+                    
+                pos_embed = self.cropped_pos_embed(height, width)
+                x = x + pos_embed
+                num_tokens.append(tf.shape(x)[1])
+                shapes.append([height, width])
+                patched_latents.append(x)
+                
+            # Pad sequences efficiently
+            max_tokens = tf.reduce_max(num_tokens)
+            if padding_latent is not None:
+                padding_embed = self.x_embedder(padding_latent)
+                
+            padded_latents = []
+            for i, latent in enumerate(patched_latents):
+                if tf.shape(latent)[1] < max_tokens:
+                    padding_length = max_tokens - tf.shape(latent)[1]
+                    if padding_latent is not None:
+                        padding = tf.tile(padding_embed, [tf.shape(latent)[0], padding_length, 1])
+                    else:
+                        padding = tf.zeros([tf.shape(latent)[0], padding_length, tf.shape(latent)[-1]], dtype=latent.dtype)
+                    latent = tf.concat([latent, padding], axis=1)
+                padded_latents.append(latent)
+                
+            return tf.concat(padded_latents, axis=0), num_tokens, shapes
+        else:
+            # Handle single tensor efficiently
+            height, width = tf.shape(latents)[-2], tf.shape(latents)[-1]
+            if is_input_images:
+                x = self.input_x_embedder(latents)
+            else:
+                x = self.x_embedder(latents)
+                
+            pos_embed = self.cropped_pos_embed(height, width)
+            x = x + pos_embed
+            return x, tf.shape(x)[1], [height, width]
+            
+    @tf.function(jit_compile=True)
     def forward_with_cfg(self, x, timestep, input_ids, input_img_latents, input_image_sizes, attention_mask, position_ids, cfg_scale, use_img_cfg, img_cfg_scale, past_key_values, use_kv_cache, offload_model=False):
         """Memory-efficient forward pass with classifier-free guidance."""
-        # Run model forward
-        model_out, past_key_values = self._forward(
-            x, timestep, input_ids, input_img_latents, input_image_sizes,
-            attention_mask, position_ids, past_key_values=past_key_values,
-            return_past_key_values=True
-        )
+        # Disable gradients for inference
+        tf.keras.backend.clear_session()
         
-        # Apply classifier-free guidance
+        # Run model forward efficiently
+        def run_model():
+            return self._forward(
+                x, timestep, input_ids, input_img_latents, input_image_sizes,
+                attention_mask, position_ids, past_key_values=past_key_values,
+                return_past_key_values=True, training=False
+            )
+            
+        # Use tf.stop_gradient for no_grad equivalent
+        model_out, past_key_values = tf.stop_gradient(run_model())
+        
+        # Apply classifier-free guidance efficiently
         if use_img_cfg:
             # Split into conditional, unconditional, and image conditional
-            split_size = tf.shape(model_out)[0] // 3
+            batch_size = tf.shape(model_out)[0] // 3
             cond, uncond, img_cond = tf.split(model_out, 3, axis=0)
             
-            # Apply guidance formula
+            # Apply guidance formula efficiently
             cond = uncond + img_cfg_scale * (img_cond - uncond) + cfg_scale * (cond - img_cond)
-            model_out = tf.concat([cond, cond, cond], axis=0)
+            model_out = tf.concat([cond] * 3, axis=0)
         else:
             # Split into conditional and unconditional
-            split_size = tf.shape(model_out)[0] // 2
+            batch_size = tf.shape(model_out)[0] // 2
             cond, uncond = tf.split(model_out, 2, axis=0)
             
-            # Apply guidance formula
+            # Apply guidance formula efficiently
             cond = uncond + cfg_scale * (cond - uncond)
-            model_out = tf.concat([cond, cond], axis=0)
+            model_out = tf.concat([cond] * 2, axis=0)
             
         return model_out, past_key_values
+        
+    @tf.function(jit_compile=True)
+    def forward_with_separate_cfg(self, x, timestep, input_ids, input_img_latents, input_image_sizes, attention_mask, position_ids, cfg_scale, use_img_cfg, img_cfg_scale, past_key_values, use_kv_cache, offload_model=False):
+        """Memory-efficient forward pass with separate classifier-free guidance."""
+        # Disable gradients for inference
+        tf.keras.backend.clear_session()
+        
+        if past_key_values is None:
+            past_key_values = [None] * len(attention_mask)
+            
+        # Split inputs efficiently
+        batch_size = tf.shape(x)[0]
+        split_size = batch_size // len(attention_mask)
+        x = tf.split(x, len(attention_mask), axis=0)
+        timestep = tf.cast(timestep, x[0].dtype)
+        timestep = tf.split(timestep, len(input_ids), axis=0)
+        
+        # Process each batch separately
+        model_out = []
+        past_key_values_out = []
+        
+        for i in range(len(input_ids)):
+            # Run model efficiently
+            def run_model():
+                return self._forward(
+                    x[i], timestep[i], input_ids[i], 
+                    None if input_img_latents is None else input_img_latents[i],
+                    None if input_image_sizes is None else input_image_sizes[i],
+                    attention_mask[i], position_ids[i],
+                    past_key_values=past_key_values[i],
+                    return_past_key_values=True,
+                    training=False
+                )
+                
+            # Use tf.stop_gradient for no_grad equivalent
+            temp_out, temp_past_key_values = tf.stop_gradient(run_model())
+            model_out.append(temp_out)
+            past_key_values_out.append(temp_past_key_values)
+            
+        # Apply classifier-free guidance efficiently
+        if len(model_out) == 3:
+            cond, uncond, img_cond = model_out
+            cond = uncond + img_cfg_scale * (img_cond - uncond) + cfg_scale * (cond - img_cond)
+            model_out = [cond] * 3
+        else:
+            cond, uncond = model_out
+            cond = uncond + cfg_scale * (cond - uncond)
+            model_out = [cond] * 2
+            
+        return tf.concat(model_out, axis=0), past_key_values_out
 
     def decode(self, latents):
         """Decode latents to image."""
