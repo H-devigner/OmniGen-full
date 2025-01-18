@@ -139,24 +139,23 @@ class OmniGen(Model):
     """OmniGen model implementation."""
     
     def __init__(
-        self,
-        transformer_config,
-        patch_size=16,
-        in_channels=4,
-        pe_interpolation='bicubic',
-        pos_embed_max_size=1024,
-        chunk_size=128,
-        enable_checkpointing=False,
-        **kwargs
-    ):
+            self,
+            transformer_config,
+            patch_size=16,
+            in_channels=4,
+            pe_interpolation='bicubic',
+            pos_embed_max_size=1024,
+            chunk_size=128,
+            enable_checkpointing=False,
+            **kwargs
+        ):
         """Initialize model."""
         # Set compute dtype to float16 for mixed precision
         kwargs['dtype'] = tf.float16
         super().__init__(**kwargs)
         
-        # Set default chunk size if not provided
-        self.chunk_size = chunk_size
-        self.enable_checkpointing = enable_checkpointing
+        # Enable mixed precision
+        tf.keras.mixed_precision.set_global_policy('mixed_float16')
         
         # Initialize transformer with config
         if not isinstance(transformer_config, Phi3Config):
@@ -171,37 +170,32 @@ class OmniGen(Model):
         self.pe_interpolation = pe_interpolation
         self.pos_embed_max_size = pos_embed_max_size
         
-        # Initialize components with float16
+        # Initialize components with mixed precision
         self.x_embedder = PatchEmbed(
             patch_size=patch_size,
             in_channels=in_channels,
-            embed_dim=transformer_config.hidden_size,
-            dtype=tf.float16
+            embed_dim=transformer_config.hidden_size
         )
         
         self.input_x_embedder = PatchEmbed(
             patch_size=patch_size,
             in_channels=in_channels,
-            embed_dim=transformer_config.hidden_size,
-            dtype=tf.float16
+            embed_dim=transformer_config.hidden_size
         )
         
         # Initialize timestep embedders
         self.time_token = TimestepEmbedder(
-            hidden_size=transformer_config.hidden_size,
-            dtype=tf.float16
+            hidden_size=transformer_config.hidden_size
         )
         
         self.t_embedder = TimestepEmbedder(
-            hidden_size=transformer_config.hidden_size,
-            dtype=tf.float16
+            hidden_size=transformer_config.hidden_size
         )
         
         self.final_layer = FinalLayer(
             patch_size=patch_size,
             in_channels=in_channels,
-            embed_dim=transformer_config.hidden_size,
-            dtype=tf.float16
+            embed_dim=transformer_config.hidden_size
         )
         
         # Initialize positional embeddings efficiently
@@ -211,14 +205,21 @@ class OmniGen(Model):
             interpolation_scale=1.0,
             base_size=64
         )
-        self.pos_embed = tf.Variable(
-            initial_value=tf.expand_dims(tf.cast(pos_embed, tf.float16), 0),
-            trainable=False,
-            name="pos_embed"
+        # Store as constant instead of variable
+        self.pos_embed = tf.constant(
+            tf.expand_dims(tf.cast(pos_embed, tf.float16), 0),
+            dtype=tf.float16
         )
         
         # Initialize weights
         self._initialize_weights()
+        
+        # Enable memory growth for GPU
+        for device in tf.config.list_physical_devices('GPU'):
+            try:
+                tf.config.experimental.set_memory_growth(device, True)
+            except:
+                pass
 
     def _initialize_weights(self):
         """Initialize weights efficiently."""
@@ -268,79 +269,90 @@ class OmniGen(Model):
 
     def _forward(self, latents, timestep, input_ids, input_img_latents=None, input_image_sizes=None, attention_mask=None, position_ids=None, padding_latent=None, past_key_values=None, return_past_key_values=True, training=False):
         """Memory-efficient forward pass."""
-        input_is_list = isinstance(latents, list)
+        # Clear memory before forward pass
+        tf.keras.backend.clear_session()
         
-        # Process input latents efficiently
-        x, num_tokens, shapes = self.patch_multiple_resolutions(latents, padding_latent)
-        time_token = self.time_token(timestep)
-        time_token = tf.cast(time_token, x.dtype)
-        time_token = tf.expand_dims(time_token, 1)
+        # Process inputs efficiently using gradient checkpointing
+        def _process_inputs():
+            x = self.x_embedder(latents)
+            time_token = self.time_token(timestep)
+            time_token = tf.expand_dims(time_token, 1)
+            return x, time_token
+            
+        if training and self.enable_checkpointing:
+            x, time_token = tf.recompute_grad(_process_inputs)()
+        else:
+            x, time_token = _process_inputs()
         
         # Process input images if provided
         if input_img_latents is not None:
-            input_latents, _, _ = self.patch_multiple_resolutions(input_img_latents, is_input_images=True)
-            
-        # Get text embeddings
+            def _process_img_inputs():
+                return self.patch_multiple_resolutions(input_img_latents, is_input_images=True)
+            if training and self.enable_checkpointing:
+                input_latents, _, _ = tf.recompute_grad(_process_img_inputs)()
+            else:
+                input_latents, _, _ = _process_img_inputs()
+                
+        # Get text embeddings efficiently
         if input_ids is not None:
-            condition_embeds = self.transformer.wte(input_ids)
-            condition_embeds = tf.cast(condition_embeds, x.dtype)
-            
-            # Replace embeddings with input image latents if provided
-            if input_img_latents is not None:
-                input_img_idx = 0
-                for b_idx in input_image_sizes:
-                    for start_idx, end_idx in input_image_sizes[b_idx]:
-                        condition_embeds = tf.tensor_scatter_nd_update(
-                            condition_embeds,
-                            [[b_idx, i] for i in range(start_idx, end_idx)],
-                            input_latents[input_img_idx]
-                        )
-                        input_img_idx += 1
-                        
-                if input_img_idx != len(input_latents):
-                    raise ValueError("Mismatch in input image indices")
-            
-            # Combine embeddings
-            input_emb = tf.concat([condition_embeds, time_token, x], axis=1)
+            def _process_text():
+                text_embeds = self.transformer.wte(input_ids)
+                if input_img_latents is not None:
+                    # Replace embeddings efficiently
+                    input_img_idx = 0
+                    for b_idx in input_image_sizes:
+                        for start_idx, end_idx in input_image_sizes[b_idx]:
+                            text_embeds = tf.tensor_scatter_nd_update(
+                                text_embeds,
+                                [[b_idx, i] for i in range(start_idx, end_idx)],
+                                input_latents[input_img_idx]
+                            )
+                            input_img_idx += 1
+                return text_embeds
+                
+            if training and self.enable_checkpointing:
+                text_embeds = tf.recompute_grad(_process_text)()
+            else:
+                text_embeds = _process_text()
+                
+            input_emb = tf.concat([text_embeds, time_token, x], axis=1)
         else:
             input_emb = tf.concat([time_token, x], axis=1)
-        
-        # Run through transformer
-        output = self.transformer.transformer(
-            input_emb,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            training=training
-        )
-        
+            
+        # Run transformer with memory optimization
+        def _run_transformer():
+            return self.transformer.transformer(
+                input_emb,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                training=training
+            )
+            
+        if training and self.enable_checkpointing:
+            output = tf.recompute_grad(_run_transformer)()
+        else:
+            output = _run_transformer()
+            
         if isinstance(output, tuple):
             output = output[0]
             
-        # Handle list inputs
-        if input_is_list:
-            image_embedding = output[:, -tf.reduce_max(num_tokens):]
+        # Process output efficiently
+        def _process_output():
             time_emb = self.t_embedder(timestep)
-            time_emb = tf.cast(time_emb, x.dtype)
-            x = self.final_layer(image_embedding, time_emb)
+            x = self.final_layer(output[:, -tf.shape(x)[1]:], time_emb)
+            return x
             
-            # Process each latent separately
-            latents = []
-            for i in range(tf.shape(x)[0]):
-                latent = x[i:i+1, :num_tokens[i]]
-                latent = self.unpatchify(latent, shapes[i][0], shapes[i][1])
-                latents.append(latent)
+        if training and self.enable_checkpointing:
+            x = tf.recompute_grad(_process_output)()
         else:
-            image_embedding = output[:, -num_tokens:]
-            time_emb = self.t_embedder(timestep)
-            time_emb = tf.cast(time_emb, x.dtype)
-            x = self.final_layer(image_embedding, time_emb)
-            latents = self.unpatchify(x, shapes[0], shapes[1])
+            x = _process_output()
             
-        if return_past_key_values:
-            return latents, past_key_values
-        return latents
+        # Clear unnecessary tensors
+        tf.keras.backend.clear_session()
         
+        return x, past_key_values if return_past_key_values else x
+
     def call(self, latents, timestep, input_ids, input_img_latents=None, input_image_sizes=None, attention_mask=None, position_ids=None, padding_latent=None, past_key_values=None, return_past_key_values=True, training=False):
         """Main call method with memory optimization."""
         return self._forward(
