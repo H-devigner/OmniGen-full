@@ -156,6 +156,9 @@ class OmniGen(Model):
         self.transformer = Phi3Transformer(transformer_config)
         self.transformer_config = transformer_config
         
+        # Set model dtype to float16 for mixed precision
+        self.dtype = tf.float16
+        
         # Save configuration
         self.patch_size = patch_size
         self.in_channels = in_channels
@@ -463,16 +466,17 @@ class OmniGen(Model):
         t = tf.fill([batch_size], timestep)
         time_embed = self.timestep_embedder(t)
         
-        # Cast all tensors to same dtype as transformer
-        x = tf.cast(x, self.transformer.dtype)
-        pos_embed = tf.cast(pos_embed, self.transformer.dtype)
-        time_embed = tf.cast(time_embed, self.transformer.dtype)
+        # Cast all tensors to float16
+        x = tf.cast(x, tf.float16)
+        pos_embed = tf.cast(pos_embed, tf.float16)
+        time_embed = tf.cast(time_embed, tf.float16)
         
         # Combine embeddings with time embedding
         x = x + tf.expand_dims(time_embed, axis=1)  # Add time embedding to each position
         
         # Get text embeddings from input_ids and expand to match batch size
         text_embeds = self.transformer.wte(input_ids)  # Shape: [1, seq_len, hidden_size]
+        text_embeds = tf.cast(text_embeds, tf.float16)  # Cast text embeddings to float16
         text_embeds = tf.repeat(text_embeds, batch_size, axis=0)  # Shape: [batch_size, seq_len, hidden_size]
         
         # Combine image and text embeddings
