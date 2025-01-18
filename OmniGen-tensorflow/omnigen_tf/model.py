@@ -32,37 +32,30 @@ class TimestepEmbedder(layers.Layer):
     
     def __init__(self, hidden_size, frequency_embedding_size=256, dtype=tf.float32):
         super().__init__()
-        self.mlp = tf.keras.Sequential([
-            layers.Dense(hidden_size, use_bias=True, dtype=dtype, name="mlp_0"),
-            layers.Activation('silu'),
-            layers.Dense(hidden_size, use_bias=True, dtype=dtype, name="mlp_2")
-        ])
         self.frequency_embedding_size = frequency_embedding_size
+        self.mlp = tf.keras.Sequential([
+            layers.Dense(hidden_size, use_bias=True, dtype=dtype),
+            layers.Activation('silu'),
+            layers.Dense(hidden_size, use_bias=True, dtype=dtype)
+        ])
 
+    @tf.function(reduce_retracing=True)
     def timestep_embedding(self, t, dim, max_period=10000):
-        """Create sinusoidal timestep embeddings.
-        
-        Args:
-            t: 1-D Tensor of timesteps.
-            dim: Desired embedding dimension
-            max_period: Controls the minimum frequency of the embeddings.
-        
-        Returns:
-            Tensor: timestep embeddings.
-        """
-        t = tf.cast(t, tf.float32)
+        """Create sinusoidal timestep embeddings efficiently."""
         half = dim // 2
-        freqs = tf.cast(tf.range(half, dtype=tf.float32), tf.float32)
-        freqs = tf.exp(-math.log(float(max_period)) * freqs / (half - 1))
-        args = tf.expand_dims(t, -1) * freqs[None]
+        freqs = tf.exp(
+            -math.log(max_period) * tf.range(0, half, dtype=tf.float32) / half
+        )
+        args = tf.cast(t[:, None], tf.float32) * freqs[None]
         embedding = tf.concat([tf.cos(args), tf.sin(args)], axis=-1)
         if dim % 2:
             embedding = tf.pad(embedding, [[0, 0], [0, 1]])
-        return tf.cast(embedding, self.dtype)  # Cast to float16 before MLP
+        return tf.cast(embedding, self.dtype)
 
+    @tf.function(reduce_retracing=True)
     def call(self, t):
         if len(tf.shape(t)) == 0:
-            t = tf.expand_dims(t, 0)
+            t = t[None]
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         t_emb = self.mlp(t_freq)
         return t_emb
@@ -114,16 +107,26 @@ class FinalLayer(layers.Layer):
         self.in_channels = in_channels
         self.embed_dim = embed_dim
         
-        # Initialize layers
-        self.norm_final = layers.LayerNormalization(epsilon=1e-6, center=False, scale=False, dtype=dtype)
-        self.proj = layers.Dense(patch_size * patch_size * in_channels, dtype=dtype, name="proj")
+        # Initialize layers with proper dtype
+        self.norm_final = layers.LayerNormalization(
+            epsilon=1e-6, 
+            center=False, 
+            scale=False, 
+            dtype=dtype
+        )
+        self.proj = layers.Dense(
+            patch_size * patch_size * in_channels,
+            dtype=dtype,
+            name="proj"
+        )
         self.adaLN_modulation = tf.keras.Sequential([
             layers.Activation('silu'),
             layers.Dense(2 * embed_dim, dtype=dtype)
         ])
         
+    @tf.function(reduce_retracing=True)
     def call(self, x, time_emb):
-        """Forward pass."""
+        """Forward pass with efficient memory usage."""
         # Apply AdaLN modulation
         shift, scale = tf.split(self.adaLN_modulation(time_emb), 2, axis=-1)
         x = self.norm_final(x)
@@ -183,7 +186,7 @@ class OmniGen(Model):
             dtype=tf.float16
         )
         
-        # Initialize both timestep embedders
+        # Initialize timestep embedders
         self.time_token = TimestepEmbedder(
             hidden_size=transformer_config.hidden_size,
             dtype=tf.float16
@@ -201,7 +204,7 @@ class OmniGen(Model):
             dtype=tf.float16
         )
         
-        # Initialize positional embeddings
+        # Initialize positional embeddings efficiently
         pos_embed = get_2d_sincos_pos_embed(
             transformer_config.hidden_size,
             pos_embed_max_size,
@@ -215,25 +218,23 @@ class OmniGen(Model):
         )
         
         # Initialize weights
-        self.initialize_weights()
-        
-    def initialize_weights(self):
-        """Initialize model weights."""
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """Initialize weights efficiently."""
         # Initialize patch embedders
-        w = self.x_embedder.proj.kernel
-        tf.keras.initializers.GlorotUniform()(w.shape).assign(w)
-        tf.keras.initializers.Zeros()(self.x_embedder.proj.bias.shape).assign(self.x_embedder.proj.bias)
-        
-        w = self.input_x_embedder.proj.kernel
-        tf.keras.initializers.GlorotUniform()(w.shape).assign(w)
-        tf.keras.initializers.Zeros()(self.input_x_embedder.proj.bias.shape).assign(self.input_x_embedder.proj.bias)
+        for embedder in [self.x_embedder, self.input_x_embedder]:
+            w = embedder.proj.kernel
+            tf.keras.initializers.GlorotUniform()(w.shape).assign(w)
+            tf.keras.initializers.Zeros()(embedder.proj.bias.shape).assign(embedder.proj.bias)
         
         # Initialize timestep embedders
-        for layer in self.time_token.mlp.layers + self.t_embedder.mlp.layers:
-            if isinstance(layer, layers.Dense):
-                tf.keras.initializers.RandomNormal(stddev=0.02)(layer.kernel.shape).assign(layer.kernel)
+        for embedder in [self.time_token, self.t_embedder]:
+            for layer in embedder.mlp.layers:
+                if isinstance(layer, layers.Dense):
+                    tf.keras.initializers.RandomNormal(stddev=0.02)(layer.kernel.shape).assign(layer.kernel)
         
-        # Zero-out final layer
+        # Zero-out final layer efficiently
         for layer in self.final_layer.adaLN_modulation.layers:
             if isinstance(layer, layers.Dense):
                 tf.keras.initializers.Zeros()(layer.kernel.shape).assign(layer.kernel)
@@ -243,184 +244,13 @@ class OmniGen(Model):
         tf.keras.initializers.Zeros()(self.final_layer.proj.kernel.shape).assign(self.final_layer.proj.kernel)
         tf.keras.initializers.Zeros()(self.final_layer.proj.bias.shape).assign(self.final_layer.proj.bias)
 
-    def enable_memory_efficient_inference(self, chunk_size=None):
-        """Enable memory efficient inference."""
-        if chunk_size is not None:
-            self.chunk_size = chunk_size
-        self.memory_efficient = True
-        self.gradient_checkpointing = True
-        self.transformer.enable_gradient_checkpointing()
-        
-    def disable_memory_efficient_inference(self):
-        """Disable memory efficient inference mode."""
-        self.memory_efficient = False
-        self.gradient_checkpointing = False
-        self.transformer.disable_gradient_checkpointing()
-        
-    def _create_weights_mapping(self):
-        """Create mapping between PyTorch and TensorFlow weight names."""
-        self.weights_map = {}
-        
-        # Transformer mappings
-        self.weights_map.update({
-            "transformer/wte/embeddings": "transformer.wte.weight",
-            "transformer/norm/gamma": "transformer.norm.weight",
-            "transformer/norm/beta": "transformer.norm.bias",
-        })
-        
-        # Layer mappings
-        for i in range(self.transformer_config.num_hidden_layers):
-            layer_map = {
-                f"transformer/layer_{i}/input_layernorm/gamma": f"transformer.layers.{i}.input_layernorm.weight",
-                f"transformer/layer_{i}/input_layernorm/beta": f"transformer.layers.{i}.input_layernorm.bias",
-                f"transformer/layer_{i}/self_attn/qkv_proj/kernel": f"transformer.layers.{i}.self_attn.qkv_proj.weight",
-                f"transformer/layer_{i}/self_attn/qkv_proj/bias": f"transformer.layers.{i}.self_attn.qkv_proj.bias",
-                f"transformer/layer_{i}/self_attn/o_proj/kernel": f"transformer.layers.{i}.self_attn.o_proj.weight",
-                f"transformer/layer_{i}/self_attn/o_proj/bias": f"transformer.layers.{i}.self_attn.o_proj.bias",
-                f"transformer/layer_{i}/post_attention_layernorm/gamma": f"transformer.layers.{i}.post_attention_layernorm.weight",
-                f"transformer/layer_{i}/post_attention_layernorm/beta": f"transformer.layers.{i}.post_attention_layernorm.bias",
-                f"transformer/layer_{i}/mlp/gate_up_proj/kernel": f"transformer.layers.{i}.mlp.gate_up_proj.weight",
-                f"transformer/layer_{i}/mlp/gate_up_proj/bias": f"transformer.layers.{i}.mlp.gate_up_proj.bias",
-                f"transformer/layer_{i}/mlp/down_proj/kernel": f"transformer.layers.{i}.mlp.down_proj.weight",
-                f"transformer/layer_{i}/mlp/down_proj/bias": f"transformer.layers.{i}.mlp.down_proj.bias",
-            }
-            self.weights_map.update(layer_map)
-            
-        # Update component mappings for TimestepEmbedder
-        self.weights_map.update({
-            "x_embedder/proj/kernel": "x_embedder.proj.weight",
-            "x_embedder/proj/bias": "x_embedder.proj.bias",
-            "timestep_embedder/mlp/0/kernel": "timestep_embedder.mlp.0.weight",
-            "timestep_embedder/mlp/0/bias": "timestep_embedder.mlp.0.bias",
-            "timestep_embedder/mlp/2/kernel": "timestep_embedder.mlp.2.weight",
-            "timestep_embedder/mlp/2/bias": "timestep_embedder.mlp.2.bias",
-            "final_layer/proj/kernel": "final_layer.proj.weight",
-            "final_layer/proj/bias": "final_layer.proj.bias",
-        })
-
-    def load_weights_from_safetensors(self, weights_file):
-        """Load weights from safetensors file."""
-        print("Loading safetensors weights...")
-        from safetensors.torch import load_file
-        
-        # Load state dict
-        state_dict = load_file(weights_file)
-        
-        # Convert weights to TensorFlow format
-        tf_weights = {}
-        for pt_name, param in state_dict.items():
-            # Get corresponding TF name
-            tf_name = self.weights_map.get(pt_name)
-            if tf_name is not None:
-                # Convert tensor to numpy array
-                param_np = param.numpy()
-                tf_weights[tf_name] = param_np
-                
-        # Load weights into model
-        for w in self.trainable_weights:
-            if w.name in tf_weights:
-                w.assign(tf_weights[w.name])
-                
-        print("Weights loaded successfully!")
-
-    def patch_multiple_resolutions(self, latents, padding_latent=None, is_input_images=False):
-        """Process input latents with multiple resolutions."""
-        if isinstance(latents, list):
-            # Handle list of latents
-            all_latents = []
-            all_num_tokens = []
-            all_shapes = []
-            
-            for x in latents:
-                height = tf.shape(x)[1]
-                width = tf.shape(x)[2]
-                
-                # Store original shape for position embeddings
-                orig_h, orig_w = height, width
-                
-                # Apply embedding (keeping NHWC format)
-                if is_input_images:
-                    x = self.input_x_embedder(x)  # Returns [B, N, C]
-                else:
-                    x = self.x_embedder(x)  # Returns [B, N, C]
-                
-                # Calculate number of patches
-                num_patches = (height // self.patch_size) * (width // self.patch_size)
-                
-                # Add position embeddings
-                pos_embed = self.get_pos_embed(orig_h, orig_w)
-                pos_embed = tf.reshape(pos_embed, [1, -1, self.transformer.config.hidden_size])
-                pos_embed = pos_embed[:, :num_patches, :]  # Only use as many position embeddings as patches
-                x = x + pos_embed
-                
-                all_latents.append(x)
-                all_num_tokens.append(tf.shape(x)[1])
-                all_shapes.append((orig_h, orig_w))
-                
-            # Pad and concatenate
-            max_tokens = tf.reduce_max(all_num_tokens)
-            padded_latents = []
-            
-            for x, num_tokens in zip(all_latents, all_num_tokens):
-                if num_tokens < max_tokens:
-                    padding = tf.zeros((tf.shape(x)[0], max_tokens - num_tokens, tf.shape(x)[-1]))
-                    x = tf.concat([x, padding], axis=1)
-                padded_latents.append(x)
-                
-            latents = tf.concat(padded_latents, axis=0)
-            return latents, all_num_tokens, all_shapes
-            
-        else:
-            # Handle single latent
-            height = tf.shape(latents)[1]
-            width = tf.shape(latents)[2]
-            
-            # Store original shape for position embeddings
-            orig_h, orig_w = height, width
-            
-            # Apply embedding (keeping NHWC format)
-            if is_input_images:
-                latents = self.input_x_embedder(latents)  # Returns [B, N, C]
-            else:
-                latents = self.x_embedder(latents)  # Returns [B, N, C]
-            
-            # Calculate number of patches
-            num_patches = (height // self.patch_size) * (width // self.patch_size)
-            
-            # Add position embeddings
-            pos_embed = self.get_pos_embed(orig_h, orig_w)
-            pos_embed = tf.reshape(pos_embed, [1, -1, self.transformer.config.hidden_size])
-            pos_embed = pos_embed[:, :num_patches, :]  # Only use as many position embeddings as patches
-            latents = latents + pos_embed
-            
-            num_tokens = tf.shape(latents)[1]
-            return latents, num_tokens, [(orig_h, orig_w)]
-            
-    def get_pos_embed(self, height, width):
-        """Get position embeddings."""
-        # Convert to patches
-        height = height // self.patch_size
-        width = width // self.patch_size
-        
-        # Get base position embeddings
-        pos_embed = get_2d_sincos_pos_embed(
-            self.transformer.config.hidden_size,
-            height,
-            width
-        )
-        pos_embed = tf.convert_to_tensor(pos_embed, dtype=tf.float32)
-        return pos_embed
-
-    @tf.function(jit_compile=True)
+    @tf.function(jit_compile=True, reduce_retracing=True)
     def unpatchify(self, x, h, w):
-        """
-        x: (N, T, patch_size**2 * C)
-        imgs: (N, H, W, C)
-        """
+        """Efficient unpatchify operation."""
         c = self.in_channels
         batch_size = tf.shape(x)[0]
         
-        # Reshape to match PyTorch's dimensions
+        # Reshape efficiently
         x = tf.reshape(x, [
             batch_size,
             h // self.patch_size,
@@ -430,74 +260,61 @@ class OmniGen(Model):
             c
         ])
         
-        # Equivalent to PyTorch's einsum('nhwpqc->nchpwq')
+        # Use efficient transpose
         x = tf.transpose(x, [0, 5, 1, 3, 2, 4])
-        
-        # Final reshape to get output shape
         imgs = tf.reshape(x, [batch_size, c, h, w])
-        
-        # Convert from NCHW to NHWC
-        imgs = tf.transpose(imgs, [0, 2, 3, 1])
+        imgs = tf.transpose(imgs, [0, 2, 3, 1])  # NCHW -> NHWC
         return imgs
 
+    @tf.function(reduce_retracing=True)
     def _forward(self, latents, timestep, input_ids, attention_mask=None, training=False):
-        """Forward pass without chunking."""
+        """Memory-efficient forward pass."""
         batch_size = tf.shape(latents)[0]
+        h, w = tf.shape(latents)[1], tf.shape(latents)[2]
         
-        # Get input shape
-        shapes = tf.shape(latents)
-        h, w = shapes[1], shapes[2]
-        
-        # Process inputs with patch embedding and positional embeddings
-        x, num_tokens, shapes = self.patch_multiple_resolutions(latents)
+        # Process inputs efficiently
+        x = self.x_embedder(latents)
         
         # Get time embeddings
         t = tf.fill([batch_size], timestep)
-        time_token = self.time_token(t)  # For concatenation with input embeddings
-        time_emb = self.t_embedder(t)    # For final layer modulation
+        time_token = self.time_token(t)
+        time_emb = self.t_embedder(t)
         
-        # Cast all tensors to model's dtype
-        x = tf.cast(x, self.dtype)
-        time_token = tf.cast(time_token, self.dtype)
-        time_emb = tf.cast(time_emb, self.dtype)
+        # Get text embeddings efficiently
+        text_embeds = self.transformer.wte(input_ids)
+        text_embeds = tf.cast(text_embeds, self.dtype)
+        text_embeds = tf.repeat(text_embeds, batch_size, axis=0)
         
-        # Get text embeddings from input_ids and expand to match batch size
-        text_embeds = self.transformer.wte(input_ids)  # Shape: [1, seq_len, hidden_size]
-        text_embeds = tf.cast(text_embeds, self.dtype)  # Cast text embeddings to model's dtype
-        text_embeds = tf.repeat(text_embeds, batch_size, axis=0)  # Shape: [batch_size, seq_len, hidden_size]
+        # Combine embeddings efficiently
+        hidden_states = tf.concat([
+            text_embeds,
+            tf.expand_dims(time_token, 1),
+            x
+        ], axis=1)
         
-        # Combine all embeddings
-        hidden_states = tf.concat([text_embeds, tf.expand_dims(time_token, 1), x], axis=1)
-        
-        # Create combined attention mask if needed
+        # Handle attention mask efficiently
         if attention_mask is not None:
             attention_mask = tf.repeat(attention_mask, batch_size, axis=0)
             image_attention = tf.ones((batch_size, tf.shape(x)[1]), dtype=attention_mask.dtype)
             combined_attention = tf.concat([attention_mask, image_attention], axis=1)
-        else:
-            combined_attention = None
         
-        # Run through transformer
+        # Run transformer efficiently
         output = self.transformer.transformer(
             hidden_states,
             attention_mask=combined_attention,
-            position_ids=None,
-            past_key_value=None,
-            output_attentions=False,
-            use_cache=False,
             training=training
         )
         
         if isinstance(output, tuple):
             output = output[0]
         
-        # Extract image embeddings and apply final layer with time modulation
+        # Process final layer efficiently
+        num_tokens = tf.shape(x)[1]
         image_embedding = output[:, -num_tokens:]
         x = self.final_layer(image_embedding, time_emb)
         
-        # Unpatchify to get final image
-        latents = self.unpatchify(x, h, w)
-        return latents
+        # Unpatchify efficiently
+        return self.unpatchify(x, h, w)
 
     def _chunked_forward(self, latents, timestep, input_ids, attention_mask=None, training=False):
         """Forward pass with chunking for memory efficiency."""
