@@ -33,9 +33,9 @@ class TimestepEmbedder(layers.Layer):
     def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
         self.mlp = tf.keras.Sequential([
-            layers.Dense(hidden_size, use_bias=True, name="mlp_0"),
+            layers.Dense(hidden_size, use_bias=True, dtype=tf.float16, name="mlp_0"),
             layers.Activation('silu'),
-            layers.Dense(hidden_size, use_bias=True, name="mlp_2")
+            layers.Dense(hidden_size, use_bias=True, dtype=tf.float16, name="mlp_2")
         ])
         self.frequency_embedding_size = frequency_embedding_size
 
@@ -58,7 +58,7 @@ class TimestepEmbedder(layers.Layer):
         embedding = tf.concat([tf.cos(args), tf.sin(args)], axis=-1)
         if dim % 2:
             embedding = tf.pad(embedding, [[0, 0], [0, 1]])
-        return embedding
+        return tf.cast(embedding, tf.float16)  # Cast to float16 before MLP
 
     def call(self, t):
         if len(tf.shape(t)) == 0:
@@ -84,42 +84,24 @@ class PatchEmbed(layers.Layer):
             kernel_size=patch_size,
             strides=patch_size,
             padding='valid',
+            dtype=tf.float16,
             name='proj'
         )
         
     def call(self, x):
         """Forward pass."""
-        # Rearrange input to NCHW format
-        if x.shape[-1] == self.in_channels:  # NHWC format
-            x = tf.transpose(x, [0, 3, 1, 2])
-            
-        B, C, H, W = x.shape
+        # Handle NHWC format
+        x = tf.cast(x, tf.float16)  # Cast input to float16
+        x = self.proj(x)  # Shape: [B, H', W', C]
         
-        # Ensure input dimensions are compatible with patch size
-        if H % self.patch_size != 0 or W % self.patch_size != 0:
-            raise ValueError(
-                f"Input image dimensions ({H}, {W}) must be divisible by "
-                f"patch size ({self.patch_size})"
-            )
-            
-        # Convert back to NHWC for Conv2D
-        x = tf.transpose(x, [0, 2, 3, 1])
-        
-        # Apply patch embedding
-        x = self.proj(x)
-        
-        # Reshape to (B, N, C)
-        x = tf.reshape(x, [B, -1, self.embed_dim])
+        # Reshape to [B, H*W, C]
+        batch_size = tf.shape(x)[0]
+        x = tf.reshape(x, [batch_size, -1, self.embed_dim])
         
         return x
         
     def get_num_patches(self, h, w):
         """Get number of patches for given input dimensions."""
-        if h % self.patch_size != 0 or w % self.patch_size != 0:
-            raise ValueError(
-                f"Input image dimensions ({h}, {w}) must be divisible by "
-                f"patch size ({self.patch_size})"
-            )
         return (h // self.patch_size) * (w // self.patch_size)
 
 
@@ -480,6 +462,11 @@ class OmniGen(Model):
         # Add time embedding using TimestepEmbedder
         t = tf.fill([batch_size], timestep)
         time_embed = self.timestep_embedder(t)
+        
+        # Cast all tensors to same dtype as transformer
+        x = tf.cast(x, self.transformer.dtype)
+        pos_embed = tf.cast(pos_embed, self.transformer.dtype)
+        time_embed = tf.cast(time_embed, self.transformer.dtype)
         
         # Combine embeddings with time embedding
         x = x + tf.expand_dims(time_embed, axis=1)  # Add time embedding to each position
