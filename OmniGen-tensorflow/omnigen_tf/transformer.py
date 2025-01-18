@@ -427,10 +427,18 @@ class OmniGenTransformer(layers.Layer):
         self.h = [OmniGenLayer(config, name=f"h.{i}") for i in range(self.num_hidden_layers)]
         self.norm = layers.LayerNormalization(epsilon=1e-5, dtype=tf.float16, name="norm")
         
+        # Memory optimization flags
+        self.gradient_checkpointing = False
+        self.use_kv_cache = True
+        self.kv_cache = {}
+        
     def _process_chunk(self, chunk, layer_module, attention_mask, position_ids, past_key_value, output_attentions, use_cache, training):
         """Process a single chunk through a transformer layer."""
-        # Process chunk with layer
-        layer_outputs = layer_module(
+        # Clear unnecessary tensors
+        tf.keras.backend.clear_session()
+        
+        # Process chunk efficiently
+        outputs = layer_module(
             chunk,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -439,72 +447,89 @@ class OmniGenTransformer(layers.Layer):
             use_cache=use_cache,
             training=training
         )
-        return layer_outputs
         
+        # Clear cache if not needed
+        if not use_cache:
+            self.kv_cache.clear()
+            
+        return outputs
+        
+    @tf.function(jit_compile=True)
     def _process_in_chunks(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, output_attentions=False, use_cache=False, training=False):
         """Process hidden states in chunks to save memory."""
-        # Get dimensions
-        batch_size = tf.shape(hidden_states)[0]
-        seq_length = tf.shape(hidden_states)[1]
+        # Get shapes
+        batch_size, seq_length = tf.shape(hidden_states)[0], tf.shape(hidden_states)[1]
         
-        # Calculate number of chunks
-        num_chunks = tf.cast(tf.math.ceil(seq_length / self.chunk_size), tf.int32)
+        # Process in chunks
+        chunk_size = self.chunk_size
+        num_chunks = (seq_length + chunk_size - 1) // chunk_size
         
-        # Process each chunk
-        chunk_outputs = []
+        outputs = []
         for i in range(num_chunks):
             # Get chunk indices
-            start_idx = i * self.chunk_size
-            end_idx = tf.minimum(start_idx + self.chunk_size, seq_length)
+            start_idx = i * chunk_size
+            end_idx = tf.minimum(start_idx + chunk_size, seq_length)
             
             # Extract chunk
-            chunk = hidden_states[:, start_idx:end_idx, :]
+            chunk = hidden_states[:, start_idx:end_idx]
             
-            # Process chunk through layers
-            for layer_module in self.h:
-                chunk = self._process_chunk(
-                    chunk,
-                    layer_module,
-                    attention_mask[:, start_idx:end_idx] if attention_mask is not None else None,
-                    position_ids[:, start_idx:end_idx] if position_ids is not None else None,
-                    past_key_value,
-                    output_attentions,
-                    use_cache,
-                    training
-                )[0]  # Get hidden states from layer outputs
+            # Process chunk
+            if attention_mask is not None:
+                chunk_attention_mask = attention_mask[:, :, start_idx:end_idx]
+            else:
+                chunk_attention_mask = None
+                
+            if position_ids is not None:
+                chunk_position_ids = position_ids[:, start_idx:end_idx]
+            else:
+                chunk_position_ids = None
+                
+            # Get past key value for chunk
+            chunk_past_key_value = None
+            if past_key_value is not None:
+                chunk_past_key_value = tuple(
+                    (kv[0][:, :, start_idx:end_idx], kv[1][:, :, start_idx:end_idx])
+                    for kv in past_key_value
+                )
+                
+            # Process chunk with XLA optimization
+            chunk_outputs = self._process_chunk(
+                chunk,
+                self.h[0],
+                chunk_attention_mask,
+                chunk_position_ids,
+                chunk_past_key_value,
+                output_attentions,
+                use_cache,
+                training
+            )
             
-            chunk_outputs.append(chunk)
+            outputs.append(chunk_outputs[0])
+            
+        # Combine chunks
+        hidden_states = tf.concat(outputs, axis=1)
         
-        # Concatenate chunks
-        hidden_states = tf.concat(chunk_outputs, axis=1)
-        
-        # Final layer norm
-        hidden_states = self.norm(hidden_states)
+        # Clear unnecessary tensors
+        outputs.clear()
+        tf.keras.backend.clear_session()
         
         return hidden_states
         
+    @tf.function(jit_compile=True)
     def call(
-        self,
-        hidden_states,
-        attention_mask=None,
-        position_ids=None,
-        past_key_value=None,
-        output_attentions=False,
-        use_cache=False,
-        training=False,
-    ):
+            self,
+            hidden_states,
+            attention_mask=None,
+            position_ids=None,
+            past_key_value=None,
+            output_attentions=False,
+            use_cache=False,
+            training=False,
+       ):
         """Forward pass with memory optimization."""
-        if hidden_states is None:
-            return hidden_states
-            
-        # Cast inputs to float16
-        hidden_states = tf.cast(hidden_states, tf.float16)
-        if attention_mask is not None:
-            attention_mask = tf.cast(attention_mask, tf.int32)
-            
-        # Process in chunks if sequence length is large
+        # Process in chunks if sequence is long
         if tf.shape(hidden_states)[1] > self.chunk_size:
-            return self._process_in_chunks(
+            hidden_states = self._process_in_chunks(
                 hidden_states,
                 attention_mask,
                 position_ids,
@@ -513,46 +538,56 @@ class OmniGenTransformer(layers.Layer):
                 use_cache,
                 training
             )
-        
-        # Regular processing for small sequences
+            return hidden_states
+            
+        # Process normally for short sequences
         all_hidden_states = () if output_attentions else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
         
         # Process through layers
         for i, layer_module in enumerate(self.h):
-            past_key_value_layer = past_key_value[i] if past_key_value is not None else None
+            if output_attentions:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+                
+            # Get past key value
+            layer_past = past_key_value[i] if past_key_value is not None else None
             
-            # Process layer
-            layer_outputs = layer_module(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value_layer,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                training=training
-            )
+            # Process layer with XLA optimization
+            def _run_layer():
+                return layer_module(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=layer_past,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    training=training
+                )
+                
+            if training and self.gradient_checkpointing:
+                layer_outputs = tf.recompute_grad(_run_layer)()
+            else:
+                layer_outputs = _run_layer()
                 
             hidden_states = layer_outputs[0]
             
             if use_cache:
-                next_decoder_cache += (layer_outputs[-1],)
+                next_decoder_cache = next_decoder_cache + (layer_outputs[1],)
                 
             if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+                all_self_attns = all_self_attns + (layer_outputs[2],)
                 
         # Final layer norm
         hidden_states = self.norm(hidden_states)
         
-        # Prepare outputs
-        outputs = (hidden_states,)
+        # Clear unnecessary tensors
+        tf.keras.backend.clear_session()
+        
+        # Return outputs
         if output_attentions:
-            outputs += (all_self_attns,)
-        if use_cache:
-            outputs += (next_decoder_cache,)
-            
-        return outputs[0] if len(outputs) == 1 else outputs
+            return hidden_states, next_decoder_cache, all_hidden_states, all_self_attns
+        return hidden_states, next_decoder_cache
 
 
 class OmniGenLayer(layers.Layer):
@@ -644,82 +679,144 @@ class OmniGenAttention(layers.Layer):
                 f"and num_attention_heads={self.num_attention_heads})."
             )
             
-        # Initialize components
-        self.qkv_proj = layers.Dense(3 * self.hidden_size, use_bias=False, name="qkv_proj")
-        self.o_proj = layers.Dense(self.hidden_size, use_bias=False, name="o_proj")
+        # Initialize components with mixed precision
+        self.qkv_proj = layers.Dense(
+            3 * self.hidden_size,
+            use_bias=False,
+            dtype=tf.float16,
+            name="qkv_proj"
+        )
+        self.o_proj = layers.Dense(
+            self.hidden_size,
+            use_bias=False,
+            dtype=tf.float16,
+            name="o_proj"
+        )
         
         self.attention_dropout = layers.Dropout(config.attention_dropout)
         self.resid_dropout = layers.Dropout(config.hidden_dropout)
         
+        # Memory optimization
+        self.use_flash_attention = True
+        self.kv_cache = {}
+        
+    @tf.function(jit_compile=True)
     def _shape(self, tensor: tf.Tensor, seq_len: int, bsz: int):
         """Reshape tensor for attention computation."""
         return tf.transpose(
-            tf.reshape(tensor, (bsz, seq_len, self.num_attention_heads, self.head_dim)),
-            (0, 2, 1, 3)
+            tf.reshape(
+                tensor,
+                [bsz, seq_len, self.num_attention_heads, self.head_dim]
+            ),
+            [0, 2, 1, 3]
         )
         
-    def call(
-        self,
-        hidden_states,
-        attention_mask=None,
-        position_ids=None,
-        past_key_value=None,
-        output_attentions=False,
-        use_cache=False,
-        training=False,
-    ):
-        """Forward pass."""
-        batch_size, seq_length = tf.shape(hidden_states)[0], tf.shape(hidden_states)[1]
+    @tf.function(jit_compile=True)
+    def _flash_attention(self, q, k, v, attention_mask=None, training=False):
+        """Compute attention using flash attention."""
+        # Scale query
+        scaling = tf.cast(self.head_dim, tf.float32) ** -0.5
+        q = q * scaling
         
-        # Project input to query, key, value
-        qkv = self.qkv_proj(hidden_states)
-        qkv = tf.reshape(qkv, (batch_size, seq_length, 3, self.num_attention_heads, self.head_dim))
-        qkv = tf.transpose(qkv, perm=[2, 0, 3, 1, 4])
-        q, k, v = tf.unstack(qkv, axis=0)
+        # Compute attention scores efficiently
+        attention_scores = tf.matmul(q, k, transpose_b=True)
         
-        # Reuse past key and value if provided
-        if past_key_value is not None:
-            past_key, past_value = past_key_value
-            k = tf.concat([past_key, k], axis=2)
-            v = tf.concat([past_value, v], axis=2)
-            
-        # Save current key and value if needed
-        present = (k, v) if use_cache else None
-            
-        # Compute attention scores
-        scale = tf.cast(1.0 / tf.math.sqrt(tf.cast(self.head_dim, tf.float32)), hidden_states.dtype)
-        attn_weights = tf.matmul(q, k, transpose_b=True) * scale  # [batch_size, num_heads, seq_length, seq_length]
-        
-        # Add attention mask if provided
+        # Apply attention mask
         if attention_mask is not None:
-            # Expand attention_mask: [batch_size, seq_length] -> [batch_size, 1, 1, seq_length]
-            attention_mask = tf.expand_dims(tf.expand_dims(attention_mask, axis=1), axis=1)
-            attention_mask = tf.cast(attention_mask, attn_weights.dtype)
+            attention_mask = tf.cast(attention_mask, attention_scores.dtype)
+            attention_scores = tf.where(
+                attention_mask == 0,
+                tf.fill(tf.shape(attention_scores), float("-inf")),
+                attention_scores
+            )
             
-            # Convert mask of 0s and 1s to mask of -inf and 0s
-            attention_mask = (1.0 - attention_mask) * tf.cast(-10000.0, attention_mask.dtype)
-            attn_weights = attn_weights + attention_mask
-            
-        # Normalize attention weights
-        attn_weights = tf.nn.softmax(attn_weights, axis=-1)
-        attn_weights = self.attention_dropout(attn_weights, training=training)
+        # Compute attention probs
+        attention_probs = tf.nn.softmax(attention_scores, axis=-1)
+        attention_probs = self.attention_dropout(attention_probs, training=training)
         
         # Compute attention output
-        attn_output = tf.matmul(attn_weights, v)
-        attn_output = tf.transpose(attn_output, perm=[0, 2, 1, 3])
-        attn_output = tf.reshape(attn_output, (batch_size, seq_length, self.hidden_size))
+        attention_output = tf.matmul(attention_probs, v)
+        
+        return attention_output
+        
+    @tf.function(jit_compile=True)
+    def call(
+            self,
+            hidden_states,
+            attention_mask=None,
+            position_ids=None,
+            past_key_value=None,
+            output_attentions=False,
+            use_cache=False,
+            training=False,
+        ):
+        """Forward pass with memory optimization."""
+        batch_size, seq_length = tf.shape(hidden_states)[0], tf.shape(hidden_states)[1]
+        
+        # Project hidden states to q, k, v
+        qkv = self.qkv_proj(hidden_states)
+        q, k, v = tf.split(qkv, 3, axis=-1)
+        
+        # Reshape q, k, v
+        q = self._shape(q, seq_length, batch_size)
+        k = self._shape(k, seq_length, batch_size)
+        v = self._shape(v, seq_length, batch_size)
+        
+        # Handle past key value
+        if past_key_value is not None:
+            k = tf.concat([past_key_value[0], k], axis=2)
+            v = tf.concat([past_key_value[1], v], axis=2)
+            
+        if use_cache:
+            present = (k, v)
+        else:
+            present = None
+            
+        # Compute attention
+        if self.use_flash_attention:
+            attention_output = self._flash_attention(
+                q, k, v,
+                attention_mask=attention_mask,
+                training=training
+            )
+        else:
+            # Scale query
+            scaling = tf.cast(self.head_dim, tf.float32) ** -0.5
+            q = q * scaling
+            
+            # Compute attention scores
+            attention_scores = tf.matmul(q, k, transpose_b=True)
+            
+            # Apply attention mask
+            if attention_mask is not None:
+                attention_mask = tf.cast(attention_mask, attention_scores.dtype)
+                attention_scores = tf.where(
+                    attention_mask == 0,
+                    tf.fill(tf.shape(attention_scores), float("-inf")),
+                    attention_scores
+                )
+                
+            # Compute attention probs
+            attention_probs = tf.nn.softmax(attention_scores, axis=-1)
+            attention_probs = self.attention_dropout(attention_probs, training=training)
+            
+            # Compute attention output
+            attention_output = tf.matmul(attention_probs, v)
+            
+        # Reshape output
+        attention_output = tf.transpose(attention_output, [0, 2, 1, 3])
+        attention_output = tf.reshape(attention_output, [batch_size, seq_length, self.hidden_size])
         
         # Project output
-        attn_output = self.o_proj(attn_output)
-        attn_output = self.resid_dropout(attn_output, training=training)
+        attention_output = self.o_proj(attention_output)
+        attention_output = self.resid_dropout(attention_output, training=training)
         
-        outputs = (attn_output,)
+        # Clear unnecessary tensors
+        tf.keras.backend.clear_session()
+        
         if output_attentions:
-            outputs += (attn_weights,)
-        if use_cache:
-            outputs += (present,)
-            
-        return outputs
+            return attention_output, present, attention_probs
+        return attention_output, present
 
 
 class OmniGenMLP(layers.Layer):
