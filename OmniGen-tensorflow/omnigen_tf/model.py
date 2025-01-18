@@ -267,36 +267,64 @@ class OmniGen(Model):
         imgs = tf.transpose(imgs, [0, 2, 3, 1])  # NCHW -> NHWC
         return imgs
 
+    @tf.function(jit_compile=True)
     def _forward(self, latents, timestep, input_ids, input_img_latents=None, input_image_sizes=None, attention_mask=None, position_ids=None, padding_latent=None, past_key_values=None, return_past_key_values=True, training=False):
         """Memory-efficient forward pass."""
         # Clear memory before forward pass
         tf.keras.backend.clear_session()
+        gc.collect()
         
         # Process inputs efficiently using gradient checkpointing
         def _process_inputs():
+            # Cast to float16 for mixed precision
+            latents = tf.cast(latents, tf.float16)
             x = self.x_embedder(latents)
+            
+            # Process timestep efficiently
             time_token = self.time_token(timestep)
             time_token = tf.expand_dims(time_token, 1)
+            
+            # Clear intermediate tensors
+            del latents
+            tf.keras.backend.clear_session()
+            
             return x, time_token
             
         if training and self.enable_checkpointing:
             x, time_token = tf.recompute_grad(_process_inputs)()
         else:
             x, time_token = _process_inputs()
-        
+            
         # Process input images if provided
         if input_img_latents is not None:
             def _process_img_inputs():
-                return self.patch_multiple_resolutions(input_img_latents, is_input_images=True)
+                # Cast to float16 for mixed precision
+                input_img_latents = tf.cast(input_img_latents, tf.float16)
+                input_latents = self.patch_multiple_resolutions(
+                    input_img_latents,
+                    is_input_images=True
+                )
+                
+                # Clear intermediate tensors
+                del input_img_latents
+                tf.keras.backend.clear_session()
+                
+                return input_latents
+                
             if training and self.enable_checkpointing:
-                input_latents, _, _ = tf.recompute_grad(_process_img_inputs)()
+                input_latents = tf.recompute_grad(_process_img_inputs)()
             else:
-                input_latents, _, _ = _process_img_inputs()
+                input_latents = _process_img_inputs()
                 
         # Get text embeddings efficiently
         if input_ids is not None:
             def _process_text():
-                text_embeds = self.transformer.wte(input_ids)
+                # Cast to float16 for mixed precision
+                text_embeds = tf.cast(
+                    self.transformer.wte(input_ids),
+                    tf.float16
+                )
+                
                 if input_img_latents is not None:
                     # Replace embeddings efficiently
                     input_img_idx = 0
@@ -308,6 +336,12 @@ class OmniGen(Model):
                                 input_latents[input_img_idx]
                             )
                             input_img_idx += 1
+                            
+                # Clear intermediate tensors
+                if input_img_latents is not None:
+                    del input_latents
+                tf.keras.backend.clear_session()
+                
                 return text_embeds
                 
             if training and self.enable_checkpointing:
@@ -316,9 +350,17 @@ class OmniGen(Model):
                 text_embeds = _process_text()
                 
             input_emb = tf.concat([text_embeds, time_token, x], axis=1)
+            
+            # Clear intermediate tensors
+            del text_embeds
         else:
             input_emb = tf.concat([time_token, x], axis=1)
             
+        # Clear intermediate tensors
+        del x
+        del time_token
+        tf.keras.backend.clear_session()
+        
         # Run transformer with memory optimization
         def _run_transformer():
             return self.transformer.transformer(
@@ -339,8 +381,20 @@ class OmniGen(Model):
             
         # Process output efficiently
         def _process_output():
+            # Process timestep efficiently
             time_emb = self.t_embedder(timestep)
-            x = self.final_layer(output[:, -tf.shape(x)[1]:], time_emb)
+            
+            # Get output tokens
+            output_tokens = output[:, -tf.shape(input_emb)[1]:]
+            
+            # Process through final layer
+            x = self.final_layer(output_tokens, time_emb)
+            
+            # Clear intermediate tensors
+            del output_tokens
+            del time_emb
+            tf.keras.backend.clear_session()
+            
             return x
             
         if training and self.enable_checkpointing:
@@ -348,10 +402,15 @@ class OmniGen(Model):
         else:
             x = _process_output()
             
-        # Clear unnecessary tensors
+        # Clear intermediate tensors
+        del output
+        del input_emb
         tf.keras.backend.clear_session()
+        gc.collect()
         
-        return x, past_key_values if return_past_key_values else x
+        if return_past_key_values:
+            return x, past_key_values
+        return x
 
     def call(self, latents, timestep, input_ids, input_img_latents=None, input_image_sizes=None, attention_mask=None, position_ids=None, padding_latent=None, past_key_values=None, return_past_key_values=True, training=False):
         """Main call method with memory optimization."""
@@ -423,89 +482,177 @@ class OmniGen(Model):
     @tf.function(jit_compile=True)
     def forward_with_cfg(self, x, timestep, input_ids, input_img_latents, input_image_sizes, attention_mask, position_ids, cfg_scale, use_img_cfg, img_cfg_scale, past_key_values, use_kv_cache, offload_model=False):
         """Memory-efficient forward pass with classifier-free guidance."""
-        # Disable gradients for inference
+        # Clear memory
         tf.keras.backend.clear_session()
+        gc.collect()
         
-        # Run model forward efficiently
+        # Run model with memory optimization
         def run_model():
-            return self._forward(
-                x, timestep, input_ids, input_img_latents, input_image_sizes,
-                attention_mask, position_ids, past_key_values=past_key_values,
-                return_past_key_values=True, training=False
+            # Process unconditional path
+            uncond_ids = tf.zeros_like(input_ids)
+            uncond_past_key_values = past_key_values if use_kv_cache else None
+            
+            # Run unconditional path efficiently
+            uncond_out, uncond_past_key_values = self._forward(
+                x,
+                timestep,
+                uncond_ids,
+                None,
+                None,
+                attention_mask,
+                position_ids,
+                past_key_values=uncond_past_key_values,
+                return_past_key_values=use_kv_cache,
+                training=False
             )
             
-        # Use tf.stop_gradient for no_grad equivalent
-        model_out, past_key_values = tf.stop_gradient(run_model())
-        
-        # Apply classifier-free guidance efficiently
-        if use_img_cfg:
-            # Split into conditional, unconditional, and image conditional
-            batch_size = tf.shape(model_out)[0] // 3
-            cond, uncond, img_cond = tf.split(model_out, 3, axis=0)
+            # Process conditional path
+            cond_past_key_values = past_key_values if use_kv_cache else None
             
-            # Apply guidance formula efficiently
-            cond = uncond + img_cfg_scale * (img_cond - uncond) + cfg_scale * (cond - img_cond)
-            model_out = tf.concat([cond] * 3, axis=0)
+            # Run conditional path efficiently
+            cond_out, cond_past_key_values = self._forward(
+                x,
+                timestep,
+                input_ids,
+                input_img_latents,
+                input_image_sizes,
+                attention_mask,
+                position_ids,
+                past_key_values=cond_past_key_values,
+                return_past_key_values=use_kv_cache,
+                training=False
+            )
+            
+            # Compute weighted output efficiently
+            noise_pred = uncond_out + cfg_scale * (cond_out - uncond_out)
+            
+            # Clear intermediate tensors
+            del uncond_out
+            del cond_out
+            tf.keras.backend.clear_session()
+            
+            if use_kv_cache:
+                return noise_pred, (uncond_past_key_values, cond_past_key_values)
+            return noise_pred
+            
+        # Run with gradient checkpointing if training
+        if self.enable_checkpointing:
+            outputs = tf.recompute_grad(run_model)()
         else:
-            # Split into conditional and unconditional
-            batch_size = tf.shape(model_out)[0] // 2
-            cond, uncond = tf.split(model_out, 2, axis=0)
+            outputs = run_model()
             
-            # Apply guidance formula efficiently
-            cond = uncond + cfg_scale * (cond - uncond)
-            model_out = tf.concat([cond] * 2, axis=0)
-            
-        return model_out, past_key_values
+        # Clear memory again
+        tf.keras.backend.clear_session()
+        gc.collect()
         
+        return outputs
+
     @tf.function(jit_compile=True)
     def forward_with_separate_cfg(self, x, timestep, input_ids, input_img_latents, input_image_sizes, attention_mask, position_ids, cfg_scale, use_img_cfg, img_cfg_scale, past_key_values, use_kv_cache, offload_model=False):
         """Memory-efficient forward pass with separate classifier-free guidance."""
-        # Disable gradients for inference
+        # Clear memory
         tf.keras.backend.clear_session()
+        gc.collect()
         
-        if past_key_values is None:
-            past_key_values = [None] * len(attention_mask)
+        # Run model with memory optimization
+        def run_model():
+            # Process unconditional path
+            uncond_ids = tf.zeros_like(input_ids)
+            uncond_past_key_values = past_key_values[0] if use_kv_cache else None
             
-        # Split inputs efficiently
-        batch_size = tf.shape(x)[0]
-        split_size = batch_size // len(attention_mask)
-        x = tf.split(x, len(attention_mask), axis=0)
-        timestep = tf.cast(timestep, x[0].dtype)
-        timestep = tf.split(timestep, len(input_ids), axis=0)
-        
-        # Process each batch separately
-        model_out = []
-        past_key_values_out = []
-        
-        for i in range(len(input_ids)):
-            # Run model efficiently
-            def run_model():
-                return self._forward(
-                    x[i], timestep[i], input_ids[i], 
-                    None if input_img_latents is None else input_img_latents[i],
-                    None if input_image_sizes is None else input_image_sizes[i],
-                    attention_mask[i], position_ids[i],
-                    past_key_values=past_key_values[i],
-                    return_past_key_values=True,
+            # Run unconditional path efficiently
+            uncond_out, uncond_past_key_values = self._forward(
+                x,
+                timestep,
+                uncond_ids,
+                None,
+                None,
+                attention_mask,
+                position_ids,
+                past_key_values=uncond_past_key_values,
+                return_past_key_values=use_kv_cache,
+                training=False
+            )
+            
+            # Process text conditional path
+            text_cond_past_key_values = past_key_values[1] if use_kv_cache else None
+            
+            # Run text conditional path efficiently
+            text_cond_out, text_cond_past_key_values = self._forward(
+                x,
+                timestep,
+                input_ids,
+                None,
+                None,
+                attention_mask,
+                position_ids,
+                past_key_values=text_cond_past_key_values,
+                return_past_key_values=use_kv_cache,
+                training=False
+            )
+            
+            # Process image conditional path if needed
+            if use_img_cfg:
+                img_cond_past_key_values = past_key_values[2] if use_kv_cache else None
+                
+                # Run image conditional path efficiently
+                img_cond_out, img_cond_past_key_values = self._forward(
+                    x,
+                    timestep,
+                    input_ids,
+                    input_img_latents,
+                    input_image_sizes,
+                    attention_mask,
+                    position_ids,
+                    past_key_values=img_cond_past_key_values,
+                    return_past_key_values=use_kv_cache,
                     training=False
                 )
                 
-            # Use tf.stop_gradient for no_grad equivalent
-            temp_out, temp_past_key_values = tf.stop_gradient(run_model())
-            model_out.append(temp_out)
-            past_key_values_out.append(temp_past_key_values)
+                # Compute weighted output efficiently
+                noise_pred = uncond_out + \
+                    cfg_scale * (text_cond_out - uncond_out) + \
+                    img_cfg_scale * (img_cond_out - uncond_out)
+                    
+                # Clear intermediate tensors
+                del img_cond_out
+                
+                if use_kv_cache:
+                    past_key_values = (
+                        uncond_past_key_values,
+                        text_cond_past_key_values,
+                        img_cond_past_key_values
+                    )
+            else:
+                # Compute weighted output efficiently without image guidance
+                noise_pred = uncond_out + cfg_scale * (text_cond_out - uncond_out)
+                
+                if use_kv_cache:
+                    past_key_values = (
+                        uncond_past_key_values,
+                        text_cond_past_key_values
+                    )
+                    
+            # Clear intermediate tensors
+            del uncond_out
+            del text_cond_out
+            tf.keras.backend.clear_session()
             
-        # Apply classifier-free guidance efficiently
-        if len(model_out) == 3:
-            cond, uncond, img_cond = model_out
-            cond = uncond + img_cfg_scale * (img_cond - uncond) + cfg_scale * (cond - img_cond)
-            model_out = [cond] * 3
+            if use_kv_cache:
+                return noise_pred, past_key_values
+            return noise_pred
+            
+        # Run with gradient checkpointing if training
+        if self.enable_checkpointing:
+            outputs = tf.recompute_grad(run_model)()
         else:
-            cond, uncond = model_out
-            cond = uncond + cfg_scale * (cond - uncond)
-            model_out = [cond] * 2
+            outputs = run_model()
             
-        return tf.concat(model_out, axis=0), past_key_values_out
+        # Clear memory again
+        tf.keras.backend.clear_session()
+        gc.collect()
+        
+        return outputs
 
     def decode(self, latents):
         """Decode latents to image."""
