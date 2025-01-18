@@ -30,12 +30,12 @@ def modulate(x, shift, scale):
 class TimestepEmbedder(layers.Layer):
     """Embeds scalar timesteps into vector representations."""
     
-    def __init__(self, hidden_size, frequency_embedding_size=256):
+    def __init__(self, hidden_size, frequency_embedding_size=256, dtype=tf.float32):
         super().__init__()
         self.mlp = tf.keras.Sequential([
-            layers.Dense(hidden_size, use_bias=True, dtype=tf.float16, name="mlp_0"),
+            layers.Dense(hidden_size, use_bias=True, dtype=dtype, name="mlp_0"),
             layers.Activation('silu'),
-            layers.Dense(hidden_size, use_bias=True, dtype=tf.float16, name="mlp_2")
+            layers.Dense(hidden_size, use_bias=True, dtype=dtype, name="mlp_2")
         ])
         self.frequency_embedding_size = frequency_embedding_size
 
@@ -58,7 +58,7 @@ class TimestepEmbedder(layers.Layer):
         embedding = tf.concat([tf.cos(args), tf.sin(args)], axis=-1)
         if dim % 2:
             embedding = tf.pad(embedding, [[0, 0], [0, 1]])
-        return tf.cast(embedding, tf.float16)  # Cast to float16 before MLP
+        return tf.cast(embedding, self.dtype)  # Cast to float16 before MLP
 
     def call(self, t):
         if len(tf.shape(t)) == 0:
@@ -71,7 +71,7 @@ class TimestepEmbedder(layers.Layer):
 class PatchEmbed(layers.Layer):
     """2D Image to Patch Embedding."""
     
-    def __init__(self, embed_dim=768, patch_size=16, in_channels=3, **kwargs):
+    def __init__(self, embed_dim=768, patch_size=16, in_channels=3, dtype=tf.float32, **kwargs):
         """Initialize patch embedding layer."""
         super().__init__(**kwargs)
         self.embed_dim = embed_dim
@@ -84,14 +84,14 @@ class PatchEmbed(layers.Layer):
             kernel_size=patch_size,
             strides=patch_size,
             padding='valid',
-            dtype=tf.float16,
+            dtype=dtype,
             name='proj'
         )
         
     def call(self, x):
         """Forward pass."""
         # Handle NHWC format
-        x = tf.cast(x, tf.float16)  # Cast input to float16
+        x = tf.cast(x, self.dtype)  # Cast input to float16
         x = self.proj(x)  # Shape: [B, H', W', C]
         
         # Reshape to [B, H*W, C]
@@ -108,14 +108,14 @@ class PatchEmbed(layers.Layer):
 class FinalLayer(layers.Layer):
     """Final layer for image generation."""
     
-    def __init__(self, patch_size, in_channels, embed_dim, **kwargs):
+    def __init__(self, patch_size, in_channels, embed_dim, dtype=tf.float32, **kwargs):
         super().__init__(**kwargs)
         self.patch_size = patch_size
         self.in_channels = in_channels
         self.embed_dim = embed_dim
         
         # Initialize projection layer
-        self.proj = layers.Dense(patch_size * patch_size * in_channels, name="proj")
+        self.proj = layers.Dense(patch_size * patch_size * in_channels, dtype=dtype, name="proj")
         
     def call(self, x, time_emb):
         """Forward pass."""
@@ -143,6 +143,8 @@ class OmniGen(Model):
         **kwargs
     ):
         """Initialize model."""
+        # Set compute dtype to float16 for mixed precision
+        kwargs['dtype'] = tf.float16
         super().__init__(**kwargs)
         
         # Set default chunk size if not provided
@@ -156,31 +158,31 @@ class OmniGen(Model):
         self.transformer = Phi3Transformer(transformer_config)
         self.transformer_config = transformer_config
         
-        # Set model dtype to float16 for mixed precision
-        self.dtype = tf.float16
-        
         # Save configuration
         self.patch_size = patch_size
         self.in_channels = in_channels
         self.pe_interpolation = pe_interpolation
         self.pos_embed_max_size = pos_embed_max_size
         
-        # Initialize components
+        # Initialize components with float16
         self.x_embedder = PatchEmbed(
             patch_size=patch_size,
             in_channels=in_channels,
-            embed_dim=transformer_config.hidden_size
+            embed_dim=transformer_config.hidden_size,
+            dtype=tf.float16
         )
         
         # Replace TimeToken with TimestepEmbedder
         self.timestep_embedder = TimestepEmbedder(
-            hidden_size=transformer_config.hidden_size
+            hidden_size=transformer_config.hidden_size,
+            dtype=tf.float16
         )
         
         self.final_layer = FinalLayer(
             patch_size=patch_size,
             in_channels=in_channels,
-            embed_dim=transformer_config.hidden_size
+            embed_dim=transformer_config.hidden_size,
+            dtype=tf.float16
         )
         
         # Memory optimization flags
@@ -466,17 +468,17 @@ class OmniGen(Model):
         t = tf.fill([batch_size], timestep)
         time_embed = self.timestep_embedder(t)
         
-        # Cast all tensors to float16
-        x = tf.cast(x, tf.float16)
-        pos_embed = tf.cast(pos_embed, tf.float16)
-        time_embed = tf.cast(time_embed, tf.float16)
+        # Cast all tensors to model's dtype
+        x = tf.cast(x, self.dtype)
+        pos_embed = tf.cast(pos_embed, self.dtype)
+        time_embed = tf.cast(time_embed, self.dtype)
         
         # Combine embeddings with time embedding
         x = x + tf.expand_dims(time_embed, axis=1)  # Add time embedding to each position
         
         # Get text embeddings from input_ids and expand to match batch size
         text_embeds = self.transformer.wte(input_ids)  # Shape: [1, seq_len, hidden_size]
-        text_embeds = tf.cast(text_embeds, tf.float16)  # Cast text embeddings to float16
+        text_embeds = tf.cast(text_embeds, self.dtype)  # Cast text embeddings to model's dtype
         text_embeds = tf.repeat(text_embeds, batch_size, axis=0)  # Shape: [batch_size, seq_len, hidden_size]
         
         # Combine image and text embeddings
