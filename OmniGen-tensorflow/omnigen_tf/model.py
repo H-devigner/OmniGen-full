@@ -187,8 +187,28 @@ class OmniGen(Model):
         
         # Set up GPU device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {self.device}")
         
-        # Initialize TensorFlow components with float16
+        # Configure GPU memory settings
+        if torch.cuda.is_available():
+            # Set memory growth
+            for device in tf.config.list_physical_devices('GPU'):
+                try:
+                    tf.config.experimental.set_memory_growth(device, True)
+                except:
+                    pass
+            
+            # Enable TF32 for better performance
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            
+            # Set PyTorch to use the highest available compute capability
+            torch.backends.cuda.preferred_lms_size = 1024
+        
+        # Initialize TensorFlow components with mixed precision
+        tf.keras.mixed_precision.set_global_policy('mixed_float16')
+        
         self.x_embedder = PatchEmbed(
             patch_size=patch_size,
             in_channels=in_channels,
@@ -237,18 +257,12 @@ class OmniGen(Model):
         self.pytorch_transformer.to(self.device)
         self.pytorch_transformer.config.use_cache = False
         
-        # Enable mixed precision for both frameworks
-        tf.keras.mixed_precision.set_global_policy('mixed_float16')
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+        # Print model device placement
+        print(f"PyTorch Transformer device: {next(self.pytorch_transformer.parameters()).device}")
         
-        # Configure TensorFlow GPU memory growth
-        for device in tf.config.list_physical_devices('GPU'):
-            try:
-                tf.config.experimental.set_memory_growth(device, True)
-            except:
-                pass
-                
+        # Initialize weights
+        self._initialize_weights()
+        
     def _convert_to_pytorch(self, tensor):
         """Convert TensorFlow tensor to PyTorch tensor."""
         if tensor is None:

@@ -22,13 +22,33 @@ from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
 
-class Phi3Transformer(Phi3Model):
-    """
-    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`Phi3DecoderLayer`]
-    We only modified the attention mask
-    Args:
-        config: Phi3Config
-    """
+class Phi3Transformer(PreTrainedModel):
+    """Memory-efficient Phi3 transformer implementation."""
+    
+    def __init__(self, config):
+        super().__init__(config)
+        
+        # Set up GPU and memory config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        
+        # Initialize components and move to GPU
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size).to(self.device)
+        self.layers = nn.ModuleList([Phi3Layer(config) for _ in range(config.num_hidden_layers)]).to(self.device)
+        self.final_layernorm = nn.LayerNorm(config.hidden_size).to(self.device)
+        
+        # Enable gradient checkpointing if available
+        self.gradient_checkpointing = False
+        self._use_flash_attention_2 = config.use_flash_attention_2 if hasattr(config, 'use_flash_attention_2') else False
+        
+        # Initialize weights
+        self.post_init()
+        
+        # Move entire model to GPU
+        self.to(self.device)
+        
     def prefetch_layer(self, layer_idx: int, device: torch.device):
         "Starts prefetching the next layer cache"
         with torch.cuda.stream(self.prefetch_stream):
@@ -60,135 +80,168 @@ class Phi3Transformer(Phi3Model):
 
     def forward(
         self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        offload_model: Optional[bool] = False,
-    ) -> Union[Tuple, BaseModelOutputWithPast]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        offload_model=False,
+    ):
+        try:
+            output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+            output_hidden_states = (
+                output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            )
+            use_cache = use_cache if use_cache is not None else self.config.use_cache
+            return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+            # Move inputs to GPU and handle dtype
+            if input_ids is not None:
+                input_ids = input_ids.to(self.device)
+                input_shape = input_ids.size()
+                batch_size = input_ids.shape[0]
+            elif inputs_embeds is not None:
+                input_shape = inputs_embeds.size()[:-1]
+                batch_size = inputs_embeds.shape[0]
+                inputs_embeds = inputs_embeds.to(self.device)
+            else:
+                raise ValueError("You have to specify either input_ids or inputs_embeds")
 
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+            if position_ids is not None:
+                position_ids = position_ids.to(self.device)
 
-        if self.gradient_checkpointing and self.training:
-            if use_cache:
-                logger.warning_once(
-                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
-                )
-                use_cache = False
-
-        # kept for BC (non `Cache` `past_key_values` inputs)
-        return_legacy_cache = False
-        if use_cache and not isinstance(past_key_values, Cache):
-            return_legacy_cache = True
             if past_key_values is None:
-                past_key_values = DynamicCache()
+                past_length = 0
+                past_key_values = tuple([None] * len(self.layers))
             else:
-                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-                logger.warning_once(
-                    "We detected that you are passing `past_key_values` as a tuple of tuples. This is deprecated and "
-                    "will be removed in v4.47. Please convert your cache or use an appropriate `Cache` class "
-                    "(https://huggingface.co/docs/transformers/kv_cache#legacy-cache-format)"
+                past_length = past_key_values[0][0].size(-2)
+                past_key_values = tuple(
+                    tuple(p.to(self.device) if p is not None else None for p in layer_past)
+                    for layer_past in past_key_values
                 )
 
-        # if inputs_embeds is None:
-        #     inputs_embeds = self.embed_tokens(input_ids)
+            if position_ids is None:
+                device = input_ids.device if input_ids is not None else inputs_embeds.device
+                position_ids = torch.arange(
+                    past_length, input_shape[-1] + past_length, dtype=torch.long, device=device
+                )
+                position_ids = position_ids.unsqueeze(0)
 
-        # if cache_position is None:
-        #     past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-        #     cache_position = torch.arange(
-        #         past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-        #     )
-        # if position_ids is None:
-        #     position_ids = cache_position.unsqueeze(0)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.device)
+                if batch_size <= 0:
+                    raise ValueError("batch_size has to be defined and > 0")
+                attention_mask = self._prepare_decoder_attention_mask(
+                    attention_mask, input_shape, inputs_embeds, past_length
+                )
 
-        if attention_mask is not None and attention_mask.dim() == 3:
-            dtype = inputs_embeds.dtype
-            min_dtype = torch.finfo(dtype).min
-            attention_mask = (1 - attention_mask) * min_dtype
-            attention_mask = attention_mask.unsqueeze(1).to(inputs_embeds.dtype)
-        else:
-            raise Exception("attention_mask parameter was unavailable or invalid")
-            # causal_mask = self._update_causal_mask(
-            #     attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
-            # )
+            # Prepare head mask if needed
+            head_mask = [None] * self.config.num_hidden_layers
+            
+            if inputs_embeds is None:
+                with torch.cuda.amp.autocast():
+                    inputs_embeds = self.embed_tokens(input_ids)
 
-        hidden_states = inputs_embeds
+            hidden_states = inputs_embeds
 
-        # decoder layers
-        all_hidden_states = () if output_hidden_states else None
-        all_self_attns = () if output_attentions else None
-        next_decoder_cache = None
+            # Optimization: release memory of input tensors no longer needed
+            del input_ids, inputs_embeds
+            torch.cuda.empty_cache()
 
-        layer_idx = -1
-        for decoder_layer in self.layers:
-            layer_idx += 1
+            # Initialize variables for outputs
+            all_hidden_states = () if output_hidden_states else None
+            all_self_attns = () if output_attentions else None
+            next_decoder_cache = () if use_cache else None
 
+            # Process through transformer layers with memory optimization
+            layer_idx = -1
+            for idx, (decoder_layer, layer_past) in enumerate(zip(self.layers, past_key_values)):
+                layer_idx += 1
+
+                if output_hidden_states:
+                    all_hidden_states = all_hidden_states + (hidden_states,)
+
+                with torch.cuda.amp.autocast():
+                    if self.gradient_checkpointing and self.training:
+                        layer_outputs = self._gradient_checkpointing_func(
+                            decoder_layer.__call__,
+                            hidden_states,
+                            attention_mask,
+                            position_ids,
+                            layer_past,
+                            output_attentions,
+                            use_cache,
+                            None,
+                        )
+                    else:
+                        if offload_model and not self.training:
+                            self.get_offlaod_layer(layer_idx, device=inputs_embeds.device)
+                        layer_outputs = decoder_layer(
+                            hidden_states,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            past_key_value=layer_past,
+                            output_attentions=output_attentions,
+                            use_cache=use_cache,
+                        )
+
+                hidden_states = layer_outputs[0]
+
+                if use_cache:
+                    next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
+
+                if output_attentions:
+                    all_self_attns += (layer_outputs[1],)
+
+                # Clear layer outputs to free memory
+                del layer_outputs
+                torch.cuda.empty_cache()
+
+            # Final layer norm
+            with torch.cuda.amp.autocast():
+                hidden_states = self.final_layernorm(hidden_states)
+
+            # Add last hidden state
             if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+                all_hidden_states = all_hidden_states + (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    past_key_values,
-                    output_attentions,
-                    use_cache,
-                    cache_position,
-                )
-            else:
-                if offload_model and not self.training:
-                    self.get_offlaod_layer(layer_idx, device=inputs_embeds.device)
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                )
+            # Prepare output
+            next_cache = next_decoder_cache if use_cache else None
+            if not return_dict:
+                return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
 
-            hidden_states = layer_outputs[0]
+            return BaseModelOutputWithPast(
+                last_hidden_state=hidden_states,
+                past_key_values=next_cache,
+                hidden_states=all_hidden_states,
+                attentions=all_self_attns,
+            )
 
-            if use_cache:
-                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+        except Exception as e:
+            print(f"Error in transformer forward pass: {str(e)}")
+            torch.cuda.empty_cache()
+            raise
+        
+        finally:
+            # Final cleanup
+            if offload_model:
+                self.cpu()
+                torch.cuda.empty_cache()
 
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
-
-        hidden_states = self.norm(hidden_states)
-
-        # add hidden states from the last decoder layer
-        if output_hidden_states:
-            print('************')
-            all_hidden_states += (hidden_states,)
-
-        next_cache = next_decoder_cache if use_cache else None
-        if return_legacy_cache:
-            next_cache = next_cache.to_legacy_cache()
-
-        if not return_dict:
-            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
-        return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            past_key_values=next_cache,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attns,
-        )
-
+    def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_length):
+        # Create causal mask
+        batch_size, seq_length = input_shape
+        
+        if attention_mask is None:
+            attention_mask = torch.ones((batch_size, seq_length), device=self.device)
+            
+        # Convert mask to float and expand
+        attention_mask = attention_mask.to(dtype=inputs_embeds.dtype)
+        attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+        attention_mask = attention_mask.expand(batch_size, 1, seq_length, seq_length + past_length)
+        
+        return attention_mask
