@@ -52,6 +52,73 @@ class OmniGenPipeline:
         # Enable mixed precision
         tf.keras.mixed_precision.set_global_policy('mixed_float16')
         
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        """
+        Load pipeline from a pretrained model.
+        
+        Args:
+            pretrained_model_name_or_path (str): Path or name of pretrained model
+            **kwargs: Additional arguments to pass to components
+            
+        Returns:
+            OmniGenPipeline: Loaded pipeline instance
+        """
+        try:
+            # Configure device
+            device = kwargs.pop('device', None)
+            if device is None:
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            
+            print(f"Loading pipeline on device: {device}")
+            
+            # Enable mixed precision
+            tf.keras.mixed_precision.set_global_policy('mixed_float16')
+            
+            # Load tokenizer
+            tokenizer = AutoTokenizer.from_pretrained(
+                pretrained_model_name_or_path,
+                subfolder="tokenizer",
+                use_fast=True
+            )
+            
+            # Load scheduler
+            scheduler = OmniGenScheduler.from_pretrained(
+                pretrained_model_name_or_path,
+                subfolder="scheduler"
+            )
+            
+            # Load model
+            model = OmniGen.from_pretrained(
+                pretrained_model_name_or_path,
+                subfolder="model",
+                device=device
+            )
+            
+            # Initialize processor
+            processor = OmniGenProcessor(
+                tokenizer=tokenizer,
+                device=device
+            )
+            
+            # Create pipeline instance
+            pipeline = cls(
+                model=model,
+                tokenizer=tokenizer,
+                device=device,
+                **kwargs
+            )
+            
+            return pipeline
+            
+        except Exception as e:
+            print(f"Error loading pipeline: {str(e)}")
+            # Clean up on error
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            tf.keras.backend.clear_session()
+            raise
+
     def prepare_inputs(self, prompt, negative_prompt=None, input_images=None, height=1024, width=1024, num_inference_steps=50, guidance_scale=7.5, num_images_per_prompt=1, img_guidance_scale=1.5, seed=None, use_img_guidance=True):
         """Prepare inputs with memory optimization."""
         try:
