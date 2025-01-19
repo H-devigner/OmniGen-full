@@ -8,20 +8,22 @@ from .model import OmniGen
 from .processor import OmniGenProcessor
 from .scheduler import OmniGenScheduler
 from .pipeline import OmniGenPipeline
-from .utils import *  # Import all utility functions
-
-# TensorFlow-specific components
 from .transformer import Phi3Config, Phi3Transformer
-from .converter import WeightConverter
+from .utils import *
+
+__version__ = "1.0.0"
 
 __all__ = [
-    # Core components (matching PyTorch)
+    # Core components
     "OmniGen",
     "OmniGenProcessor",
     "OmniGenScheduler",
     "OmniGenPipeline",
-    # TensorFlow-specific components
+    
+    # Transformer components
     "Phi3Config",
     "Phi3Transformer",
-    "WeightConverter",
+    
+    # Version
+    "__version__",
 ]
