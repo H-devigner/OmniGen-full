@@ -286,234 +286,126 @@ class DDIMScheduler:
 
 
 class OmniGenScheduler:
-    """Scheduler for OmniGen model."""
+    """Memory-efficient scheduler for OmniGen."""
     
-    def __init__(
-        self,
-        num_train_timesteps=1000,
-        beta_start=0.00085,
-        beta_end=0.012,
-        beta_schedule="scaled_linear",
-        clip_sample=False,
-        set_alpha_to_one=False,
-        steps_offset=0,
-        prediction_type="epsilon",
-        **kwargs
-    ):
-        """Initialize scheduler."""
+    def __init__(self, num_train_timesteps=1000, beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", clip_sample=False):
+        """Initialize scheduler with optimized memory handling."""
         self.num_train_timesteps = num_train_timesteps
         self.beta_start = beta_start
         self.beta_end = beta_end
         self.beta_schedule = beta_schedule
         self.clip_sample = clip_sample
-        self.set_alpha_to_one = set_alpha_to_one
-        self.steps_offset = steps_offset
-        self.prediction_type = prediction_type
         
-        # Initialize betas and alphas
-        if beta_schedule == "linear":
-            self.betas = tf.linspace(beta_start, beta_end, num_train_timesteps)
-        elif beta_schedule == "scaled_linear":
-            # Scale the betas linearly
-            self.betas = tf.linspace(beta_start ** 0.5, beta_end ** 0.5, num_train_timesteps) ** 2
-        else:
-            raise ValueError(f"Unknown beta schedule: {beta_schedule}")
-            
-        self.alphas = 1.0 - self.betas
-        self.alphas_cumprod = tf.math.cumprod(self.alphas, axis=0)
+        # Initialize with float32 for better numerical stability
+        self.betas = None
+        self.alphas = None
+        self.alphas_cumprod = None
+        self.timesteps = None
+        self.sigmas = None
         
-        # Store for easy access
-        self.final_alpha_cumprod = self.alphas_cumprod[-1]
+        # Initialize beta schedule
+        self._init_beta_schedule()
         
-        # For noise prediction
-        self.init_noise_sigma = 1.0
-        
-    def set_timesteps(self, num_inference_steps):
-        """Set timesteps for inference."""
-        self.num_inference_steps = num_inference_steps
-        
-        # Create evenly spaced timesteps
-        timesteps = tf.linspace(
-            self.num_train_timesteps - 1,
-            0,
-            num_inference_steps
-        )
-        
-        # Add offset and cast to int
-        self.timesteps = tf.cast(timesteps + self.steps_offset, tf.int32)
-        self.sigmas = tf.zeros_like(timesteps)  # For compatibility
-        
-    def _get_variance(self, timestep, prev_timestep):
-        """Get variance for given timestep."""
-        alpha_prod_t = self.alphas_cumprod[timestep]
-        alpha_prod_t_prev = self.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.final_alpha_cumprod
-        beta_prod_t = 1 - alpha_prod_t
-        beta_prod_t_prev = 1 - alpha_prod_t_prev
-        
-        variance = (beta_prod_t_prev / beta_prod_t) * (1 - alpha_prod_t / alpha_prod_t_prev)
-        
-        return variance
-        
-    def scale_model_input(self, sample, timestep):
-        """Scale input sample for model."""
-        timestep = tf.cast(timestep, tf.int32)
-        
-        # Get step index
-        step_index = tf.where(self.timesteps == timestep)[0][0]
-        
-        # No scaling needed for DDPM
-        return sample
-        
-    def step(
-        self,
-        model_output,
-        timestep,
-        sample,
-        return_dict=True,
-        **kwargs
-    ):
-        """
-        Predict the previous noisy sample x_t -> x_t-1.
-        
-        Args:
-            model_output (Tensor): Predicted noise or sample from the model
-            timestep (Tensor): Current timestep
-            sample (Tensor): Current noisy sample
-            return_dict (bool): Whether to return a dictionary or tuple
-        
-        Returns:
-            Tensor or Dict: Denoised sample
-        """
-        # Debug print tensor shapes and dtypes
-        def debug_tensor_info(tensor, name):
-            print(f"{name} - Shape: {tensor.shape}, Dtype: {tensor.dtype}")
-        
-        debug_tensor_info(model_output, "model_output")
-        debug_tensor_info(timestep, "timestep")
-        debug_tensor_info(sample, "sample")
-        
-        # Ensure consistent precision and shape compatibility
-        model_output = tf.cast(model_output, tf.float32)
-        sample = tf.cast(sample, tf.float32)
-        timestep = tf.cast(timestep, tf.int32)
-        
-        # Ensure timestep is a scalar
-        timestep = tf.squeeze(timestep)
-        
-        # Compute noise schedule parameters
+    def _init_beta_schedule(self):
+        """Initialize beta schedule with memory optimization."""
         try:
-            alpha_prod_t = tf.cast(self.alphas_cumprod[timestep], tf.float32)
-            alpha_prod_t_prev = tf.cast(
-                self.alphas_cumprod[timestep - 1] if timestep > 0 else 1.0, 
-                tf.float32
-            )
+            # Use float32 for better numerical stability during initialization
+            if self.beta_schedule == "linear":
+                self.betas = tf.linspace(self.beta_start, self.beta_end, self.num_train_timesteps, dtype=tf.float32)
+            elif self.beta_schedule == "scaled_linear":
+                # Use more stable computation
+                betas = tf.linspace(tf.sqrt(self.beta_start), tf.sqrt(self.beta_end), self.num_train_timesteps, dtype=tf.float32)
+                self.betas = tf.square(betas)
+            else:
+                raise ValueError(f"Unknown beta schedule: {self.beta_schedule}")
+            
+            # Compute alphas and cumulative products
+            self.alphas = 1.0 - self.betas
+            self.alphas_cumprod = tf.math.cumprod(self.alphas, axis=0)
+            
+            # Convert to float16 for inference
+            self.betas = tf.cast(self.betas, tf.float16)
+            self.alphas = tf.cast(self.alphas, tf.float16)
+            self.alphas_cumprod = tf.cast(self.alphas_cumprod, tf.float16)
+            
+            # Clear intermediate tensors
+            tf.keras.backend.clear_session()
+            
         except Exception as e:
-            print(f"Error accessing alphas_cumprod: {e}")
-            print(f"Timestep value: {timestep}")
-            print(f"Alphas_cumprod shape: {self.alphas_cumprod.shape}")
+            print(f"Error initializing beta schedule: {str(e)}")
             raise
-        
-        # Compute beta product
-        beta_prod_t = 1 - alpha_prod_t
-        
-        # Ensure scalar values are broadcast compatible
-        alpha_prod_t = tf.broadcast_to(alpha_prod_t, sample.shape)
-        alpha_prod_t_prev = tf.broadcast_to(alpha_prod_t_prev, sample.shape)
-        beta_prod_t = tf.broadcast_to(beta_prod_t, sample.shape)
-        
-        # Compute predicted original sample
-        if self.prediction_type == "epsilon":
-            # Noise prediction
-            # Ensure compatible shapes for subtraction and division
-            sqrt_beta_prod_t = tf.sqrt(beta_prod_t)
-            sqrt_alpha_prod_t = tf.sqrt(alpha_prod_t)
             
-            # Ensure model_output is compatible with sample
-            if model_output.shape != sample.shape:
-                # Split into unconditional and conditional if batch dimension is different
-                if model_output.shape[0] == 2 and len(model_output.shape) == 3:
-                    model_output_uncond, model_output_text = tf.split(model_output, 2, axis=0)
-                    model_output_uncond = tf.reduce_mean(model_output_uncond, axis=1)
-                    model_output_text = tf.reduce_mean(model_output_text, axis=1)
-                    
-                    model_output_uncond = tf.reshape(
-                        model_output_uncond, 
-                        (1, sample.shape[1], sample.shape[2], -1)
-                    )
-                    model_output_text = tf.reshape(
-                        model_output_text, 
-                        (1, sample.shape[1], sample.shape[2], -1)
-                    )
-                    
-                    # Resize if needed
-                    if model_output_uncond.shape[-1] != sample.shape[-1]:
-                        model_output_uncond = tf.image.resize(
-                            model_output_uncond, 
-                            (sample.shape[1], sample.shape[2]), 
-                            method=tf.image.ResizeMethod.BILINEAR
-                        )
-                        model_output_text = tf.image.resize(
-                            model_output_text, 
-                            (sample.shape[1], sample.shape[2]), 
-                            method=tf.image.ResizeMethod.BILINEAR
-                        )
-                    
-                    # Recombine
-                    model_output = tf.concat([model_output_uncond, model_output_text], axis=0)
-                
-                # Fallback resize if still not matching
-                if model_output.shape != sample.shape:
-                    model_output = tf.image.resize(
-                        model_output, 
-                        (sample.shape[1], sample.shape[2]), 
-                        method=tf.image.ResizeMethod.BILINEAR
-                    )
-                
-                # Ensure last dimension matches
-                if model_output.shape[-1] != sample.shape[-1]:
-                    model_output = model_output[..., :sample.shape[-1]]
+    def set_timesteps(self, num_inference_steps):
+        """Set timesteps for inference with memory optimization."""
+        try:
+            # Compute timesteps efficiently
+            timesteps = tf.linspace(0, self.num_train_timesteps - 1, num_inference_steps)
+            timesteps = tf.cast(timesteps, tf.int32)
+            timesteps = tf.reverse(timesteps, axis=[0])
+            self.timesteps = timesteps
             
-            pred_original_sample = (
-                sample - sqrt_beta_prod_t * model_output
-            ) / sqrt_alpha_prod_t
-        elif self.prediction_type == "sample":
-            # Direct sample prediction
-            pred_original_sample = model_output
-        else:
-            raise ValueError(f"Unsupported prediction type: {self.prediction_type}")
-        
-        # Compute variance
-        variance = (
-            (1 - alpha_prod_t_prev) / (1 - alpha_prod_t) * 
-            (1 - alpha_prod_t / alpha_prod_t_prev)
-        ) ** 0.5
-        
-        # Compute standard deviation
-        std_dev = variance * model_output
-        
-        # Compute next sample
-        sqrt_alpha_prod_t_prev = tf.sqrt(alpha_prod_t_prev)
-        next_sample = (
-            pred_original_sample * sqrt_alpha_prod_t_prev + 
-            std_dev
-        )
-        
-        # Clip sample if needed
-        if self.clip_sample:
-            next_sample = tf.clip_by_value(next_sample, -1, 1)
-        
-        # Cast back to original dtype of sample
-        next_sample = tf.cast(next_sample, sample.dtype)
-        pred_original_sample = tf.cast(pred_original_sample, sample.dtype)
-        
-        # Return results
-        if return_dict:
-            return {
-                "prev_sample": next_sample,
-                "pred_original_sample": pred_original_sample,
-            }
-        return next_sample
-
+            # Compute sigmas for improved denoising
+            sigmas = tf.sqrt((1 - self.alphas_cumprod) / self.alphas_cumprod)
+            sigmas = tf.gather(sigmas, timesteps)
+            self.sigmas = tf.cast(sigmas, tf.float16)
+            
+            # Clear any intermediate tensors
+            tf.keras.backend.clear_session()
+            
+        except Exception as e:
+            print(f"Error setting timesteps: {str(e)}")
+            raise
+            
+    def step(self, model_output, timestep, sample, return_dict=True):
+        """Scheduler step with memory optimization."""
+        try:
+            # Convert inputs to float16
+            timestep = tf.cast(timestep, tf.int32)
+            t = timestep
+            
+            # Get alpha values for current timestep
+            alpha_prod_t = tf.gather(self.alphas_cumprod, t)
+            alpha_prod_t_prev = tf.gather(self.alphas_cumprod, tf.maximum(t - 1, 0))
+            beta_prod_t = 1 - alpha_prod_t
+            
+            # Compute variance
+            variance = (beta_prod_t / (1 - alpha_prod_t_prev)) * (1 - alpha_prod_t_prev / alpha_prod_t)
+            
+            # Compute predicted original sample
+            pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+            
+            # Clip predicted sample if needed
+            if self.clip_sample:
+                pred_original_sample = tf.clip_by_value(pred_original_sample, -1, 1)
+            
+            # Compute coefficient for previous sample
+            prev_sample_coef = (alpha_prod_t_prev / alpha_prod_t) ** (0.5) * (1 - alpha_prod_t / alpha_prod_t_prev)
+            
+            # Compute model mean
+            model_mean = prev_sample_coef * pred_original_sample + ((1 - alpha_prod_t_prev - variance) / (1 - alpha_prod_t)) ** (0.5) * model_output
+            
+            # Add noise for non-last step
+            if t > 0:
+                noise = tf.random.normal(tf.shape(sample), dtype=tf.float16)
+                prev_sample = model_mean + tf.sqrt(variance) * noise
+            else:
+                prev_sample = model_mean
+            
+            # Clear intermediate tensors
+            tf.keras.backend.clear_session()
+            
+            if return_dict:
+                return {"prev_sample": prev_sample}
+            return prev_sample
+            
+        except Exception as e:
+            print(f"Error in scheduler step: {str(e)}")
+            raise
+            
+        finally:
+            # Final cleanup
+            gc.collect()
+            
     @tf.function(jit_compile=True)
     def crop_kv_cache(self, past_key_values, num_tokens_for_img):
         """Crop key-value cache with XLA optimization."""
