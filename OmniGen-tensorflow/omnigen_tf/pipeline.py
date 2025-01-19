@@ -5,12 +5,12 @@ import tensorflow as tf
 import numpy as np
 from PIL import Image
 from huggingface_hub import snapshot_download
-from transformers import AutoTokenizer
+from transformers import T5Tokenizer
 import json
 import torch
 import gc
 
-from omnigen_tf.model import OmniGen
+from omnigen_tf.model import OmniGenModel
 from omnigen_tf.scheduler import OmniGenScheduler
 from omnigen_tf.processor import OmniGenProcessor
 
@@ -26,10 +26,12 @@ if gpus:
 class OmniGenPipeline:
     """Memory-efficient pipeline for OmniGen model."""
     
-    def __init__(self, model, tokenizer=None, device=None):
+    def __init__(self, model, tokenizer, scheduler, processor, device=None):
         """Initialize pipeline."""
         self.model = model
         self.tokenizer = tokenizer
+        self.scheduler = scheduler
+        self.processor = processor
         
         # Set up device
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -75,24 +77,22 @@ class OmniGenPipeline:
             # Enable mixed precision
             tf.keras.mixed_precision.set_global_policy('mixed_float16')
             
-            # Load tokenizer
-            tokenizer = AutoTokenizer.from_pretrained(
-                pretrained_model_name_or_path,
-                subfolder="tokenizer",
-                use_fast=True
-            )
+            # Load tokenizer directly from T5 base
+            tokenizer = T5Tokenizer.from_pretrained("t5-base")
             
-            # Load scheduler
-            scheduler = OmniGenScheduler.from_pretrained(
-                pretrained_model_name_or_path,
-                subfolder="scheduler"
+            # Load model weights from custom checkpoint
+            model = OmniGenModel(
+                device=device,
+                **kwargs
             )
+            model.load_weights(pretrained_model_name_or_path)
             
-            # Load model
-            model = OmniGen.from_pretrained(
-                pretrained_model_name_or_path,
-                subfolder="model",
-                device=device
+            # Initialize scheduler with default settings
+            scheduler = OmniGenScheduler(
+                num_train_timesteps=1000,
+                beta_start=0.00085,
+                beta_end=0.012,
+                beta_schedule="scaled_linear"
             )
             
             # Initialize processor
@@ -105,6 +105,8 @@ class OmniGenPipeline:
             pipeline = cls(
                 model=model,
                 tokenizer=tokenizer,
+                scheduler=scheduler,
+                processor=processor,
                 device=device,
                 **kwargs
             )
