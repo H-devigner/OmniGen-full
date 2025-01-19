@@ -4,6 +4,11 @@ This module provides the TensorFlow implementation of OmniGen, matching the PyTo
 version's functionality while leveraging TensorFlow-specific optimizations.
 """
 
+# Configure logging
+from .utils import setup_logging
+setup_logging()
+
+# Import components
 from .model import OmniGen
 from .processor import OmniGenProcessor
 from .scheduler import OmniGenScheduler

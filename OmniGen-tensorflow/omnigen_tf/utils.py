@@ -12,6 +12,79 @@ import tensorflow as tf
 import numpy as np
 from PIL import Image
 
+__all__ = [
+    'get_logger',
+    'setup_logging',
+    'convert_torch_to_tf',
+    'convert_tf_to_torch',
+    'update_ema',
+    'requires_grad',
+    'center_crop_arr',
+    'crop_arr',
+    'vae_encode',
+    'vae_encode_list',
+    'get_activation',
+    'build_position_ids',
+    'build_causal_attention_mask',
+    'get_shape_list',
+    'assert_rank',
+    'get_initializer',
+    'create_logger'
+]
+
+# Configure logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
+def get_logger(name: str) -> logging.Logger:
+    """Get a logger with the specified name.
+    
+    Args:
+        name: Name for the logger
+        
+    Returns:
+        logging.Logger: Configured logger instance
+    """
+    logger = logging.getLogger(name)
+    
+    # Only add handler if not already added to avoid duplicate handlers
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        
+        # Set level based on environment variable or default to INFO
+        log_level = os.getenv('OMNIGEN_LOG_LEVEL', 'INFO')
+        logger.setLevel(getattr(logging, log_level))
+    
+    return logger
+
+def setup_logging(
+    level: Optional[str] = None,
+    format: Optional[str] = None
+) -> None:
+    """Setup global logging configuration.
+    
+    Args:
+        level: Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+        format: Log format string
+    """
+    if level is None:
+        level = os.getenv('OMNIGEN_LOG_LEVEL', 'INFO')
+        
+    if format is None:
+        format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        
+    logging.basicConfig(
+        level=getattr(logging, level),
+        format=format
+    )
+
 
 @tf.function(jit_compile=True)
 def convert_torch_to_tf(
@@ -298,52 +371,4 @@ def get_initializer(
     return tf.keras.initializers.TruncatedNormal(
         stddev=initializer_range,
         seed=seed
-    )
-
-
-def get_logger(name: str) -> logging.Logger:
-    """Get a logger with the specified name.
-    
-    Args:
-        name: Name for the logger
-        
-    Returns:
-        logging.Logger: Configured logger instance
-    """
-    logger = logging.getLogger(name)
-    
-    # Only add handler if not already added to avoid duplicate handlers
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        )
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-        
-        # Set level based on environment variable or default to INFO
-        log_level = os.getenv('OMNIGEN_LOG_LEVEL', 'INFO')
-        logger.setLevel(getattr(logging, log_level))
-    
-    return logger
-
-def setup_logging(
-    level: Optional[str] = None,
-    format: Optional[str] = None
-) -> None:
-    """Setup global logging configuration.
-    
-    Args:
-        level: Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-        format: Log format string
-    """
-    if level is None:
-        level = os.getenv('OMNIGEN_LOG_LEVEL', 'INFO')
-        
-    if format is None:
-        format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        
-    logging.basicConfig(
-        level=getattr(logging, level),
-        format=format
     )
