@@ -4,6 +4,7 @@ import os
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Union
 import gc
+import logging
 
 import numpy as np
 import tensorflow as tf
@@ -15,9 +16,9 @@ from safetensors import safe_open
 from .model import OmniGen
 from .processor import OmniGenProcessor
 from .scheduler import OmniGenScheduler
-from .utils import logging
+from .utils import get_logger
 
-logger = logging.get_logger(__name__)
+logger = get_logger(__name__)
 
 EXAMPLE_DOC_STRING = """
     Examples:

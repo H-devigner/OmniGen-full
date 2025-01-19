@@ -299,3 +299,51 @@ def get_initializer(
         stddev=initializer_range,
         seed=seed
     )
+
+
+def get_logger(name: str) -> logging.Logger:
+    """Get a logger with the specified name.
+    
+    Args:
+        name: Name for the logger
+        
+    Returns:
+        logging.Logger: Configured logger instance
+    """
+    logger = logging.getLogger(name)
+    
+    # Only add handler if not already added to avoid duplicate handlers
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        
+        # Set level based on environment variable or default to INFO
+        log_level = os.getenv('OMNIGEN_LOG_LEVEL', 'INFO')
+        logger.setLevel(getattr(logging, log_level))
+    
+    return logger
+
+def setup_logging(
+    level: Optional[str] = None,
+    format: Optional[str] = None
+) -> None:
+    """Setup global logging configuration.
+    
+    Args:
+        level: Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+        format: Log format string
+    """
+    if level is None:
+        level = os.getenv('OMNIGEN_LOG_LEVEL', 'INFO')
+        
+    if format is None:
+        format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        
+    logging.basicConfig(
+        level=getattr(logging, level),
+        format=format
+    )
